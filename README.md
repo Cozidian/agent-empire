@@ -111,6 +111,14 @@ species get it in front of the mission. A ship keeps its role across upgrades an
 shows in the outliner, on its cards and in its hull: scouts, frigates (builders) and inspectors
 each have their own silhouette.
 
+The composer also lists the ships already on the world: **give it to** one of them and it takes
+the mission when it's next free (`⇥` steps through launch, each ship, and queue-for-anyone). If
+`PROVIDER_API_KEY` is set, **Advisor** (Provider's Advice model) suggests where the mission should go
+once you stop typing for a second: the ship whose work it continues, or a new ship and its role.
+The suggestion shows under the text and is marked `✦`; when Advisor is sure (60% or more) it's
+preselected, until you choose for yourself. Nothing is sent until you press `⏎`. Advisor sees the
+mission text and each ship's species, role, status, current task, turns and context use.
+
 In the mission composer, **drop screenshot files** onto the terminal or press **Ctrl+V** to
 attach a PNG image from the clipboard (`wl-paste` on Wayland, `xclip` on X11). File drops support
 PNG, JPEG, WebP and GIF, up to 8 images of 20 MiB each. If your terminal types a dropped path

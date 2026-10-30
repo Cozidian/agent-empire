@@ -50,6 +50,9 @@ pub enum Req {
         /// A newly launched ship's role (see `role::Role`), "" for none.
         #[serde(default)]
         role: String,
+        /// Queue it for this ship only (it takes it when it's next free).
+        #[serde(default)]
+        to: Option<u32>,
     },
     /// One order to many agents at once, followed as one fleet order.
     Broadcast { ids: Vec<u32>, text: String },

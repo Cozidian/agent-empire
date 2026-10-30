@@ -63,7 +63,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Confirm { id } => confirm(fb, app, *id, l),
         Mode::Ship { id, sel } => ship_card(fb, app, *id, *sel, l, t),
         Mode::Help => help(fb, l),
-        Mode::Brief { planet, text, kind, launch, role, attachments, sending } => brief(fb, app, planet, text, *kind, *launch, *role, attachments, *sending, l, t),
+        Mode::Brief { planet, text, kind, launch, role, to, attachments, sending } => brief(fb, app, planet, text, *kind, (*launch, *role, *to), attachments, *sending, l, t),
         Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
         Mode::Moon { planet, branch, kind } => moon(fb, app, planet, branch, *kind, l, t),
         Mode::Actions { planet, sel } => actions(fb, app, planet, *sel, l),
@@ -1658,13 +1658,14 @@ fn fleet_row(rows: &mut Rows, app: &App, agents: &[&Agent]) {
 
 #[allow(clippy::too_many_arguments)]
 /// The mission composer's frame, the height of its text, how many images it lists, and the
-/// row its launch/queue options start on.
-fn brief_box(l: &Lay, text: &Line, images: usize) -> ((i32, i32, i32, i32), i32, usize, i32) {
+/// row its options start on: launch, its role and what that means, a row per ship here, queue.
+fn brief_box(l: &Lay, text: &Line, images: usize, ships: usize) -> ((i32, i32, i32, i32), i32, usize, i32) {
     let w = 80.min(l.cols - 2);
+    let n = ships as i32;
     // the text grows to eight lines, then scrolls
-    let lines = (layout(&text.s, w - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 21).max(1));
-    let visible = images.min((l.rows - 18 - lines).max(1) as usize);
-    let (x, y, w, h) = centered(l, w, 16 + lines + visible as i32);
+    let lines = (layout(&text.s, w - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 21 - n).max(1));
+    let visible = images.min((l.rows - 18 - n - lines).max(1) as usize);
+    let (x, y, w, h) = centered(l, w, 16 + n + lines + visible as i32);
     ((x, y, w, h), lines, visible, y + lines + 6 + visible as i32)
 }
 
@@ -1681,33 +1682,62 @@ fn role_spans(x: i32) -> Vec<(usize, i32, i32)> {
 /// What a click on the mission composer lands on.
 pub enum BriefHit {
     Launch,
+    /// Give it to the i-th ship here.
+    Ship(usize),
     Queue,
     Role(usize),
 }
 
-pub fn brief_hit(l: &Lay, text: &Line, images: usize, c: i32, r: i32) -> Option<BriefHit> {
-    let ((x, _, w, _), _, _, row) = brief_box(l, text, images);
+pub fn brief_hit(l: &Lay, text: &Line, images: usize, ships: usize, c: i32, r: i32) -> Option<BriefHit> {
+    let ((x, _, w, _), _, _, row) = brief_box(l, text, images, ships);
     if c < x || c >= x + w {
         return None;
     }
-    match r - row {
+    match (r - row) as usize {
         0 | 2 => Some(BriefHit::Launch),
         1 => role_spans(x).into_iter().find(|&(_, a, b)| c >= a && c < b).map(|(i, ..)| BriefHit::Role(i)).or(Some(BriefHit::Launch)),
-        3 => Some(BriefHit::Queue),
+        k if (3..3 + ships).contains(&k) => Some(BriefHit::Ship(k - 3)),
+        k if k == 3 + ships => Some(BriefHit::Queue),
         _ => None,
     }
 }
 
+/// What Advisor suggests for the mission, under its text.
+fn advisor_line(fb: &mut Fb, app: &App, (x, y, w): (i32, i32, i32), t: f32) {
+    let advisor = &app.advisor;
+    let violet = v3(0.75, 0.65, 1.0);
+    let (msg, col) = if advisor.thinking {
+        ("✦ Advisor is weighing the fleet…".to_string(), violet * (0.5 + 0.3 * (t * 4.0).sin().abs()))
+    } else if let Some(p) = &advisor.pick {
+        let what = match p.ship.and_then(|id| app.agent(id)) {
+            Some(a) => format!("give it to {} #{}", a.kind, a.id),
+            None if p.ship.is_some() => "a ship that has left".into(),
+            None if p.role == Role::None || p.role_conf < ADVISOR_SURE => "launch a new ship".into(),
+            None => format!("launch a new {}", p.role.name()),
+        };
+        let sure = if p.ship_conf >= ADVISOR_SURE { String::new() } else { " · not sure".into() };
+        (format!("✦ Advisor: {what} ({:.0}%){sure}", p.ship_conf * 100.0), violet)
+    } else if let Some(e) = &advisor.err {
+        (format!("✦ Advisor unavailable: {e}"), DIM * 0.8)
+    } else {
+        return;
+    };
+    seg(fb, x, y, &clip(&msg, w as usize), w, col, Some(BOX));
+}
+
 #[allow(clippy::too_many_arguments)]
-fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch: bool, role: usize, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
-    let ((x, y, w, h), lines, visible, r) = brief_box(l, text, attachments.len());
+fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, (launch, role, to): (bool, usize, Option<u32>), attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
+    let ships = brief_ships(&app.agents, planet);
+    let ((x, y, w, h), lines, visible, r) = brief_box(l, text, attachments.len(), ships.len());
     let accent = v3(1.0, 0.85, 0.4);
     frame_box(fb, x, y, w, h, &format!("★ NEW MISSION FOR {}", base_name(planet).to_uppercase()), accent);
     seg(fb, x + 3, y + 2, "What should be done here?", w - 6, DIM, Some(BOX));
     seg(fb, x + 3, y + 4, "› ", 2, accent, Some(BOX));
     area(fb, (x + 5, y + 4, w - 8, lines), text, accent, t);
+    advisor_line(fb, app, (x + 5, y + lines + 4, w - 8), t);
     let crew = app.agents.iter().filter(|a| a.cwd == planet && a.dying.is_none()).count();
-    let (now, later) = if launch { (TEXT, DIM) } else { (DIM, TEXT) };
+    let queue = !launch && to.is_none_or(|id| !ships.contains(&id));
+    let (now, later) = if launch { (TEXT, DIM) } else if queue { (DIM, TEXT) } else { (DIM, DIM) };
     for (i, image) in attachments.iter().skip(attachments.len() - visible).enumerate() {
         let prefix = if i == 0 && visible < attachments.len() { format!("▧ {} total · ", attachments.len()) } else { "▧ ".into() };
         seg(fb, x + 3, y + lines + 5 + i as i32, &clip(&format!("{prefix}{}", image.name), (w - 7).max(1) as usize), w - 6, TEXT * 0.85, Some(BOX));
@@ -1738,12 +1768,35 @@ fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch:
         _ => picked.about().to_string(),
     };
     seg(fb, x + 13, r + 2, &clip(&about, (w - 16) as usize), w - 16, if launch { picked.color() * 0.8 } else { DIM * 0.6 }, Some(BOX));
+    // give it to one ship here: it takes it when it's next free
+    let suggested = app.advisor.pick.as_ref().and_then(|p| p.ship);
+    for (i, &id) in ships.iter().enumerate() {
+        let Some(a) = app.agent(id) else { continue };
+        let row = r + 3 + i as i32;
+        let me = !launch && to == Some(id);
+        let mut c = seg(fb, x + 3, row, if me { "● " } else { "○ " }, 2, accent, Some(BOX));
+        c = seg(fb, c, row, "give it to ", 11, if me { TEXT } else { DIM }, Some(BOX));
+        c = seg(fb, c, row, &format!("{} #{} ", a.kind, a.id), 16, kind_color(&a.kind), Some(BOX));
+        if a.role != Role::None {
+            c = seg(fb, c, row, &format!("{} ", a.role.name()), 10, a.role.color(), Some(BOX));
+        }
+        c = seg(fb, c, row, &format!("{} {} ", a.status.glyph(t), a.status.label()), 12, a.status.color(), Some(BOX));
+        let room = (x + w - 8 - c).max(0);
+        seg(fb, c, row, &clip(&a.title, room as usize), room, DIM, Some(BOX));
+        if suggested == Some(id) {
+            seg(fb, x + w - 7, row, "✦", 1, v3(0.75, 0.65, 1.0), Some(BOX));
+        }
+    }
+    if app.advisor.pick.as_ref().is_some_and(|p| p.ship.is_none()) {
+        seg(fb, x + w - 7, r, "✦", 1, v3(0.75, 0.65, 1.0), Some(BOX));
+    }
     // queue: the first free agent here takes it
-    let xx = seg(fb, x + 3, r + 3, if launch { "○ " } else { "● " }, 2, accent, Some(BOX));
+    let q = r + 3 + ships.len() as i32;
+    let xx = seg(fb, x + 3, q, if queue { "● " } else { "○ " }, 2, accent, Some(BOX));
     let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it for the first free one of the {crew} here") };
-    seg(fb, xx, r + 3, &note, w - 8, later, Some(BOX));
+    seg(fb, xx, q, &note, w - 8, later, Some(BOX));
     seg(fb, x + w - 5, r, "⇥", 1, DIM * 0.8, Some(BOX));
-    seg(fb, x + w - 5, r + 3, "⇥", 1, DIM * 0.8, Some(BOX));
+    seg(fb, x + w - 5, q, "⇥", 1, DIM * 0.8, Some(BOX));
     seg(fb, x + 3, y + h - 4, "Drop image · Ctrl+V clipboard · Ctrl+O attach path · Ctrl+X remove last", w - 6, DIM, Some(BOX));
     let hint = if sending { "Sending mission…" } else { "⏎ give orders · Alt+⏎ new line · ⇥ launch/queue · ⇧⇥ role · ↑↓ species · esc" };
     seg(fb, x + 3, y + h - 2, hint, w - 6, DIM, Some(BOX));

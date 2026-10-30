@@ -414,12 +414,40 @@ pub enum Mode {
     /// One order for every agent in a system or on a world.
     Fleet { target: Sel, text: Line },
     /// Writing a mission for a world: hand it to a new ship now, or queue it.
-    /// `role` is an index into `role::ROLES`, for a ship launched with it.
-    Brief { planet: String, text: Line, kind: usize, launch: bool, role: usize, attachments: Vec<Attachment>, sending: bool },
+    /// `role` is an index into `role::ROLES`, for a ship launched with it. When not
+    /// launching, `to` gives it to one ship here, or (`None`) to the first free one.
+    Brief { planet: String, text: Line, kind: usize, launch: bool, role: usize, to: Option<u32>, attachments: Vec<Attachment>, sending: bool },
     /// The situation log in full: filter it, read an entry's details. `id` is the selected entry
     /// (it stays put as news arrives); `typing` edits the search.
     Situation { id: u64, typing: bool },
     Help,
+}
+
+/// Asking Advisor which ship should take the mission being written: once the text has rested
+/// for a moment, and again only if it changes.
+#[derive(Default)]
+pub struct AdvisorState {
+    /// The world and text last seen, and since when.
+    seen: String,
+    seen_at: Option<Instant>,
+    /// What the pending or last answer was asked about.
+    asked: String,
+    pub thinking: bool,
+    pub pick: Option<crate::advisor::Pick>,
+    pub err: Option<String>,
+    /// The player chose for themselves; suggestions no longer move the selection.
+    touched: bool,
+}
+
+/// How sure Advisor must be before its pick is preselected (a starting point, not a measured threshold).
+pub const ADVISOR_SURE: f32 = 0.6;
+
+/// The ships on a world a mission can be given to, in the composer's order.
+pub fn brief_ships(agents: &[Agent], planet: &str) -> Vec<u32> {
+    let mut v: Vec<u32> = agents.iter().filter(|a| a.cwd == planet && a.dying.is_none() && a.status != Status::Exited).map(|a| a.id).collect();
+    v.sort();
+    v.truncate(5);
+    v
 }
 
 /// How the mission log is grouped.
@@ -522,6 +550,8 @@ pub struct App {
     pub scroll: usize,
     pub missions: Vec<Mission>,
     pub log_sort: LogSort,
+    /// Advisor's suggestion for the mission being written.
+    pub advisor: AdvisorState,
     pub trade_view: TradeView,
     pub prestige: Prestige,
     /// Worlds that just levelled up, waiting for their fanfare on the map.
@@ -698,7 +728,7 @@ impl App {
         }
         // queue it if someone's there to take it, otherwise send a ship
         let crewed = self.agents.iter().any(|a| a.cwd == row.path && a.dying.is_none());
-        self.mode = Mode::Brief { planet: row.path, text, kind: 0, launch: !crewed, role: 0, attachments: Vec::new(), sending: false };
+        self.mode = Mode::Brief { planet: row.path, text, kind: 0, launch: !crewed, role: 0, to: None, attachments: Vec::new(), sending: false };
     }
 
     fn open_trade_row(&mut self, w: &World, index: usize, client: &Client, t: f32) {
@@ -738,6 +768,7 @@ impl App {
             comms_at: Instant::now(),
             scroll: 0,
             log_sort: LogSort::Status,
+            advisor: AdvisorState::default(),
             trade_view: TradeView::All,
             pick: None,
             survey: survey::Snapshot::default(),
@@ -799,7 +830,7 @@ impl App {
                 // a free agent there takes it; with no one there, a ship is sent with it
                 let crewed = self.agents.iter().any(|a| a.cwd == key && a.dying.is_none() && a.status != Status::Exited);
                 let kind = self.kinds.first().cloned().unwrap_or_else(|| "claude".into());
-                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed, attachments: Vec::new(), draft: false, role: String::new() });
+                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed, attachments: Vec::new(), draft: false, role: String::new(), to: None });
                 self.mode = Mode::Galaxy;
                 self.toast(if crewed { format!("mission queued: {}", clip(&text, 40)) } else { format!("ship launched: {}", clip(&text, 40)) }, t);
             }
@@ -909,7 +940,7 @@ impl App {
         let cwd = a.cwd.clone();
         match act {
             ShipAct::Comms => self.open_comms(id, client, l),
-            ShipAct::Mission => self.mode = Mode::Brief { planet: cwd, text: Line::default(), kind: 0, launch: false, role: 0, attachments: Vec::new(), sending: false },
+            ShipAct::Mission => self.mode = Mode::Brief { planet: cwd, text: Line::default(), kind: 0, launch: false, role: 0, to: None, attachments: Vec::new(), sending: false },
             ShipAct::Priority => self.act(&cwd, Act::Priority(id), client, l, t),
             ShipAct::Decommission => self.mode = Mode::Confirm { id },
         }
@@ -1382,6 +1413,68 @@ impl App {
         self.agents.iter().filter(|a| a.cwd == planet && a.dying.is_none()).min_by_key(|a| (a.status, a.id)).map(|a| a.id)
     }
 
+    /// Ask Advisor about the mission being written once the text has rested for a second.
+    fn consult_advisor(&mut self, client: &Client) {
+        let Mode::Brief { planet, text, sending: false, .. } = &self.mode else {
+            if !matches!(self.mode, Mode::Brief { .. }) {
+                self.advisor = AdvisorState::default();
+            }
+            return;
+        };
+        let key = format!("{planet}\0{}", text.s.trim());
+        if key != self.advisor.seen {
+            self.advisor.seen = key;
+            self.advisor.seen_at = Some(Instant::now());
+            return;
+        }
+        let rested = self.advisor.seen_at.is_some_and(|at| at.elapsed() > Duration::from_millis(1000));
+        if !rested || key == self.advisor.asked || text.s.trim().chars().count() < 8 || !crate::advisor::available() {
+            return;
+        }
+        let ships = brief_ships(&self.agents, planet)
+            .into_iter()
+            .filter_map(|id| self.agent(id))
+            .map(|a| crate::advisor::Ship { id: a.id, kind: a.kind.clone(), role: a.role, status: a.status.label().to_string(), task: a.title.clone(), turns: a.turns, ctx: a.report.ctx })
+            .collect();
+        self.advisor.asked = key.clone();
+        self.advisor.thinking = true;
+        client.ask_advisor(key, text.s.trim().to_string(), base_name(planet), ships);
+    }
+
+    /// Advisor's answer: shown, and preselected when it's sure and the player hasn't chosen.
+    fn advisor_answered(&mut self, key: String, result: Result<crate::advisor::Pick, String>) {
+        if key != self.advisor.asked {
+            return; // the text has moved on
+        }
+        self.advisor.thinking = false;
+        match result {
+            Ok(pick) => {
+                self.advisor.err = None;
+                if !self.advisor.touched
+                    && pick.ship_conf >= ADVISOR_SURE
+                    && let Mode::Brief { planet, launch, role, to, .. } = &mut self.mode
+                {
+                    match pick.ship {
+                        Some(id) if brief_ships(&self.agents, planet).contains(&id) => {
+                            *launch = false;
+                            *to = Some(id);
+                        }
+                        Some(_) => {}
+                        None => {
+                            *launch = true;
+                            *to = None;
+                            if pick.role_conf >= ADVISOR_SURE {
+                                *role = ROLES.iter().position(|r| *r == pick.role).unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                self.advisor.pick = Some(pick);
+            }
+            Err(e) => self.advisor.err = Some(e),
+        }
+    }
+
     /// The agent whose terminal is on screen, in the chat popup or full screen.
     pub fn talking_to(&self) -> Option<u32> {
         match self.mode {
@@ -1773,6 +1866,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                         app.open_comms(id, client, &Lay::new(&fb, app.panel));
                     }
                 }
+                Msg::Advisor { key, result } => app.advisor_answered(key, result),
                 Msg::Docked { moon, result } => {
                     let at = app.agents.iter().find(|a| a.cwd == moon).map_or((0.0, 0.0), |a| a.wpos);
                     let name = app.survey.worlds.get(&moon).map(|w| w.branch.clone()).unwrap_or_else(|| base_name(&moon));
@@ -1884,6 +1978,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         {
             app.mode = Mode::Galaxy;
         }
+        app.consult_advisor(client);
 
         while event::poll(Duration::ZERO)? {
             let ev = event::read()?;
@@ -2117,17 +2212,26 @@ fn handle(
     // a click on the mission composer's options picks them
     if let Event::Mouse(me) = &ev
         && me.kind == MouseEventKind::Down(MouseButton::Left)
-        && let Mode::Brief { text, attachments, launch, role, sending: false, .. } = &mut app.mode
+        && let Mode::Brief { planet, text, attachments, launch, role, to, sending: false, .. } = &mut app.mode
     {
-        match draw::brief_hit(l, text, attachments.len(), me.column as i32, me.row as i32) {
+        let ships = brief_ships(&app.agents, planet);
+        match draw::brief_hit(l, text, attachments.len(), ships.len(), me.column as i32, me.row as i32) {
             Some(draw::BriefHit::Launch) => *launch = true,
-            Some(draw::BriefHit::Queue) => *launch = false,
+            Some(draw::BriefHit::Ship(i)) => {
+                *launch = false;
+                *to = ships.get(i).copied();
+            }
+            Some(draw::BriefHit::Queue) => {
+                *launch = false;
+                *to = None;
+            }
             Some(draw::BriefHit::Role(i)) => {
                 *role = i;
                 *launch = true;
             }
-            None => {}
+            None => return false,
         }
+        app.advisor.touched = true;
         return false;
     }
     let Event::Key(k) = ev else {
@@ -2322,7 +2426,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Brief { planet, text, kind, launch, role, attachments, sending } => {
+        Mode::Brief { planet, text, kind, launch, role, to, attachments, sending } => {
             if *sending { return false; }
             match k.code {
                 KeyCode::Esc => {
@@ -2359,16 +2463,26 @@ fn handle(
                         *kind = if up { (*kind + nk - 1) % nk } else { (*kind + 1) % nk };
                     }
                 }
-                KeyCode::Tab => *launch = !*launch,
+                // launch → each ship here → queue for the first free one → launch
+                KeyCode::Tab => {
+                    let ships = brief_ships(&app.agents, planet);
+                    let at = if *launch { 0 } else { to.and_then(|id| ships.iter().position(|&s| s == id)).map_or(ships.len() + 1, |i| i + 1) };
+                    let next = (at + 1) % (ships.len() + 2);
+                    *launch = next == 0;
+                    *to = if next >= 1 { ships.get(next - 1).copied() } else { None };
+                    app.advisor.touched = true;
+                }
                 // a role is for a new ship, so picking one means launching
                 KeyCode::BackTab => {
                     *role = (*role + 1) % ROLES.len();
                     *launch = true;
+                    app.advisor.touched = true;
                 }
                 KeyCode::Enter if !text.s.trim().is_empty() || !attachments.is_empty() => {
                     let prompt = if text.s.trim().is_empty() { "Review the attached screenshots." } else { text.s.trim() };
                     let role = if *launch { ROLES[*role].name().into() } else { String::new() };
-                    let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: app.kinds[*kind].clone(), launch: *launch, attachments: attachments.clone(), draft: true, role };
+                    let to = if *launch { None } else { *to };
+                    let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: app.kinds[*kind].clone(), launch: *launch, attachments: attachments.clone(), draft: true, role, to };
                     *sending = true;
                     client.send(cmd);
                 }
@@ -2565,7 +2679,7 @@ fn handle(
             Some(planet) => {
                 // queue it if someone's there to take it, otherwise send a ship
                 let crewed = app.agents.iter().any(|a| a.cwd == planet && a.dying.is_none());
-                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed, role: 0, attachments: Vec::new(), sending: false };
+                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed, role: 0, to: None, attachments: Vec::new(), sending: false };
             }
             None => app.toast("select a world to give it a mission", t),
         },
@@ -2836,7 +2950,7 @@ mod screenshot_tests {
         let attachments = (0..8).map(|i| Attachment { name: format!("screen-{i}.png"), path: format!("/saved/{i}.png") }).collect();
         let mut text = Line::default();
         text.set("Fix the spacing".into());
-        app.mode = Mode::Brief { planet: "/world".into(), text, kind: 0, launch: false, role: 0, attachments, sending: false };
+        app.mode = Mode::Brief { planet: "/world".into(), text, kind: 0, launch: false, role: 0, to: None, attachments, sending: false };
         let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
         let mut fb = Fb::new(80, 24);
         let layout = Lay::new(&fb, false);
@@ -2994,7 +3108,7 @@ mod station_tests {
 mod ship_card_tests {
     use super::*;
 
-    fn ship(id: u32, war: bool) -> Agent {
+    pub fn ship(id: u32, war: bool) -> Agent {
         Agent {
             id,
             kind: "claude".into(),
@@ -3173,7 +3287,7 @@ mod role_tests {
     #[test]
     fn composer_offers_roles_and_a_click_picks_one_and_launches() {
         let mut app = App::new();
-        app.mode = Mode::Brief { planet: "/world".into(), text: Line::default(), kind: 0, launch: false, role: 0, attachments: Vec::new(), sending: false };
+        app.mode = Mode::Brief { planet: "/world".into(), text: Line::default(), kind: 0, launch: false, role: 0, to: None, attachments: Vec::new(), sending: false };
         let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
         let mut fb = Fb::new(100, 30);
         let l = Lay::new(&fb, false);
@@ -3186,5 +3300,59 @@ mod role_tests {
         let mut drag = None;
         handle(&mut app, &world, &l, &client, None, Event::Mouse(click), 1.0, &mut drag);
         assert!(matches!(app.mode, Mode::Brief { launch: true, role, .. } if ROLES[role] == Role::Builder));
+    }
+}
+
+#[cfg(test)]
+mod advisor_tests {
+    use super::*;
+    use crate::advisor::Pick;
+
+    fn composer() -> (App, World, Lay) {
+        let mut app = App::new();
+        app.agents = vec![ship_card_tests::ship(4, false), ship_card_tests::ship(7, false)];
+        app.mode = Mode::Brief { planet: "/home/me/world".into(), text: Line::default(), kind: 0, launch: true, role: 0, to: None, attachments: Vec::new(), sending: false };
+        let fb = Fb::new(100, 34);
+        (app, World { systems: vec![], planets: vec![], lanes: vec![], station: None }, Lay::new(&fb, false))
+    }
+
+    fn choice(app: &App) -> (bool, Option<u32>, Role) {
+        match &app.mode {
+            Mode::Brief { launch, to, role, .. } => (*launch, *to, ROLES[*role]),
+            _ => panic!("composer closed"),
+        }
+    }
+
+    #[test]
+    fn tab_goes_launch_then_each_ship_then_queue() {
+        let (mut app, world, l) = composer();
+        let client = Client::isolated();
+        let tab = || Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            handle(&mut app, &world, &l, &client, None, tab(), 1.0, &mut None);
+            seen.push(choice(&app));
+        }
+        let picks: Vec<(bool, Option<u32>)> = seen.iter().map(|c| (c.0, c.1)).collect();
+        assert_eq!(picks, vec![(false, Some(4)), (false, Some(7)), (false, None), (true, None)]);
+    }
+
+    #[test]
+    fn a_sure_pick_is_preselected_until_the_player_chooses() {
+        let (mut app, ..) = composer();
+        app.advisor.asked = "k".into();
+        app.advisor_answered("k".into(), Ok(Pick { ship: Some(7), ship_conf: 0.9, role: Role::None, role_conf: 0.2 }));
+        assert_eq!(choice(&app), (false, Some(7), Role::None));
+        // a new ship, with the role it's sure of
+        app.advisor_answered("k".into(), Ok(Pick { ship: None, ship_conf: 0.8, role: Role::Scout, role_conf: 0.7 }));
+        assert_eq!(choice(&app), (true, None, Role::Scout));
+        // unsure picks, stale answers and the player's own choice leave it alone
+        app.advisor_answered("k".into(), Ok(Pick { ship: Some(4), ship_conf: 0.4, role: Role::None, role_conf: 0.0 }));
+        app.advisor_answered("old".into(), Ok(Pick { ship: Some(4), ship_conf: 0.99, role: Role::None, role_conf: 0.0 }));
+        assert_eq!(choice(&app), (true, None, Role::Scout));
+        app.advisor.touched = true;
+        app.advisor_answered("k".into(), Ok(Pick { ship: Some(4), ship_conf: 0.99, role: Role::None, role_conf: 0.0 }));
+        assert_eq!(choice(&app), (true, None, Role::Scout));
+        assert_eq!(app.advisor.pick.as_ref().and_then(|p| p.ship), Some(4)); // still shown
     }
 }

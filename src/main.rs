@@ -3,6 +3,7 @@ mod daemon;
 mod draw;
 mod game;
 mod gfx;
+mod advisor;
 mod octant;
 mod proto;
 mod role;
