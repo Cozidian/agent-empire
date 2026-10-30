@@ -125,10 +125,49 @@ impl Agent {
             "apply this change", "yes, and don't ask", "enter to confirm", "trust this folder",
         ];
         let text = self.parser.screen().contents().to_lowercase();
-        let line = text.lines().rev().filter(|l| !l.trim().is_empty()).take(8).find(|l| ASK.iter().any(|k| l.contains(k)))?;
-        let line = line.trim().to_string();
-        let count = text.lines().filter(|l| l.trim() == line).count();
+        let hits: Vec<&str> = text.lines().map(unbox).rev().filter(|l| !l.is_empty()).take(8).filter(|l| ASK.iter().any(|k| l.contains(k))).collect();
+        // the question itself, not one of its numbered answers (unless that's all there is)
+        let line = hits.iter().find(|l| option(l).is_none()).or(hits.first())?;
+        let line = line.to_string();
+        let count = text.lines().filter(|l| unbox(l) == line).count();
         Some((line, count))
+    }
+
+    /// The question being asked, with its context and choices, for answering from orbit.
+    fn ask(&self) -> Option<Ask> {
+        let (q, _) = self.question()?;
+        let lines: Vec<String> = self.parser.screen().contents().lines().map(|l| unbox(l).to_string()).collect();
+        let qi = lines.iter().rposition(|l| l.to_lowercase() == q)?;
+        let mut context = Vec::new();
+        let mut gaps = 0;
+        for l in lines[..qi].iter().rev() {
+            if l.is_empty() {
+                // one blank line inside the dialog is fine, two means we've left it
+                if !context.is_empty() {
+                    gaps += 1;
+                    if gaps > 1 {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if l.chars().all(|c| "─━═╭╮╰╯┌┐└┘".contains(c) || c == ' ') || context.len() == 5 {
+                break;
+            }
+            context.push(l.clone());
+        }
+        context.reverse();
+        let mut options = Vec::new();
+        for l in &lines[qi + 1..] {
+            if let Some((n, label)) = option(l) {
+                options.push(Choice { key: n.into(), label: label.into() });
+            }
+        }
+        if options.is_empty() && (q.contains("(y/n)") || q.contains("[y/n]")) {
+            options = vec![Choice { key: "y\r".into(), label: "Yes".into() }, Choice { key: "n\r".into(), label: "No".into() }];
+        }
+        let question = lines[qi].clone();
+        Some(Ask { question, context, options })
     }
 
     /// TUI agents print an interrupt hint only while they're busy.
@@ -219,6 +258,7 @@ impl Agent {
             age: (now - self.since).as_secs_f32(),
             turns: self.turns,
             report: self.report.clone(),
+            ask: if self.status == Status::Blocked { self.ask() } else { None },
         }
     }
 
@@ -265,6 +305,18 @@ impl Agent {
             alt: s.alternate_screen(),
         }
     }
+}
+
+/// `❯ 2. Yes, and don't ask again` → ("2", "Yes, and don't ask again")
+fn option(l: &str) -> Option<(&str, &str)> {
+    let t = l.trim_start_matches(['❯', '›', '>', '▶', '→', ' ']);
+    let (n, label) = t.split_once(". ")?;
+    (!n.is_empty() && n.len() <= 2 && n.chars().all(|c| c.is_ascii_digit())).then(|| (n, label.trim()))
+}
+
+/// A screen line without the box drawing around it.
+fn unbox(l: &str) -> &str {
+    l.trim().trim_matches(['│', '┃', '║', '|']).trim()
 }
 
 const DEFAULT_FG: [u8; 3] = [0xd8, 0xde, 0xe9];
@@ -441,6 +493,33 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                     Ok(()) => Resp::Ok,
                     Err(e) => Resp::Err { msg: e.to_string() },
                 }
+            }
+            None => missing(id),
+        },
+        Req::Answer { id, key } => match get(id) {
+            Some(a) => {
+                let mut g = a.lock().unwrap();
+                let before = g.question();
+                g.answered = before.clone();
+                if g.hook == Some(Status::Blocked) {
+                    g.hook = None;
+                }
+                g.last_in = Instant::now();
+                if let Err(e) = g.writer.write_all(key.as_bytes()) {
+                    return Resp::Err { msg: e.to_string() };
+                }
+                // some menus only move the cursor on a digit; confirm if it's still asking
+                if key.len() <= 2 && key.chars().all(|c| c.is_ascii_digit()) {
+                    let a = a.clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(600));
+                        let mut g = a.lock().unwrap();
+                        if g.question().is_some() && g.question().map(|q| q.0) == before.map(|q| q.0) {
+                            let _ = g.writer.write_all(b"\r");
+                        }
+                    });
+                }
+                Resp::Ok
             }
             None => missing(id),
         },

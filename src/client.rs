@@ -24,6 +24,7 @@ pub enum Cmd {
     Input(u32, String),
     Resize(u32, u16, u16),
     Seen(u32),
+    Answer(u32, String),
 }
 
 pub struct Client {
@@ -109,6 +110,7 @@ impl Client {
                     Cmd::Input(id, data) => (Req::Input { id, data }, None),
                     Cmd::Resize(id, cols, rows) => (Req::Resize { id, cols, rows }, None),
                     Cmd::Seen(id) => (Req::Seen { id }, None),
+                    Cmd::Answer(id, key) => (Req::Answer { id, key }, None),
                 };
                 let msg = match c.call(&req) {
                     Ok(Resp::Spawned { id }) => spawn.map(|(kind, cwd)| Msg::Spawned { id, kind, cwd }),

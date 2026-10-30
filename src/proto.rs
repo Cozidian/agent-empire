@@ -25,6 +25,8 @@ pub enum Req {
     Seen { id: u32 },
     /// Reported by agent hooks (e.g. Claude Code's) from inside the agent.
     Hook { id: u32, event: String, message: Option<String> },
+    /// Pick an option of the question an agent is asking (`key` as listed in its `Ask`).
+    Answer { id: u32, key: String },
     /// What an agent tells us about itself (Claude Code, through its statusline).
     Report { id: u32, report: Report },
     Shutdown,
@@ -45,6 +47,25 @@ pub struct AgentView {
     pub turns: u32,
     #[serde(default)]
     pub report: Report,
+    /// The question it's waiting on, when blocked.
+    #[serde(default)]
+    pub ask: Option<Ask>,
+}
+
+/// A question read off an agent's screen, answerable from the galaxy.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Ask {
+    pub question: String,
+    /// What it's about (the command, the file, …), a few lines above the question.
+    pub context: Vec<String>,
+    pub options: Vec<Choice>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Choice {
+    /// What to type to pick it.
+    pub key: String,
+    pub label: String,
 }
 
 /// Self-reported agent vitals; anything unknown stays `None`.
