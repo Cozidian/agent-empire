@@ -1,0 +1,84 @@
+# AGENT EMPIRE
+
+Run your coding agents like a 4X space empire. Every **folder is a planet**, its parent folder
+is a **star system**, and every agent (claude, codex, grok, …) is a **ship in orbit** around
+the folder it works in.
+
+```
+cargo build --release
+./target/release/empire
+```
+
+## How it works
+
+```
+empire (the galaxy UI)  ──unix socket──▶  empire daemon
+                                           owns every agent's terminal (PTY + emulator),
+                                           detects who's working / blocked / done
+```
+
+The daemon starts automatically the first time you open the galaxy. Agents live in the daemon,
+so **quitting the UI doesn't kill them**: reopen `empire` and your empire is still there.
+`empire stop` shuts the daemon down and recalls every agent.
+
+## Playing
+
+| key              | action                                                              |
+| ---------------- | ------------------------------------------------------------------- |
+| `n`              | **colonize**: launch an agent in a folder (pick one, or type a new path and it's created) |
+| `e`              | **deploy** another agent to the selected world                      |
+| `⏎` / click twice | **comms**: a live, interactive terminal with the agent             |
+| `Ctrl-]` / `F12` | leave comms, back to the galaxy                                     |
+| `⇥`              | jump to the next agent that needs you                               |
+| `x`              | **decommission** the selected agent (asks first)                    |
+| `↑↓` / `j k`     | move through the outliner                                           |
+| `wasd` / drag    | pan · `±` / wheel zoom · `z` fit galaxy · `f` focus selection        |
+| `o` `m` `?` `q`  | outliner · mute · fleet manual · leave                              |
+
+Inside comms every key, including Esc and Ctrl-C, goes straight to the agent. The mouse wheel
+(or `Shift-PgUp/PgDn`) scrolls back through the agent's history; agents that handle the mouse
+themselves get the wheel instead. Typing snaps back to live.
+Drag to select text, double-click for a word, triple-click for a line; letting go copies it
+(wl-copy, xclip or pbcopy, else the terminal's own clipboard via OSC 52).
+
+Sounds stay out of your way: one cue at a time, nothing for the agent you're already talking to,
+no "done" for turns shorter than a few seconds, and a blocked agent re-pings every 2 minutes.
+
+| status      | in the galaxy                                   | sound                 |
+| ----------- | ----------------------------------------------- | --------------------- |
+| working     | cyan ship with an orbiting satellite            | —                     |
+| **blocked** | flashing red ship, shockwaves, red planet ring  | robot "hm–hm?"        |
+| done        | green burst, green planet ring until you look   | "bee-boop"            |
+| launching   | blinking amber                                  | data burst on arrival |
+
+## Stats
+
+- **Resources** (top bar): how much of your Claude 5-hour / weekly and Codex allowance is used,
+  and when the tightest window refills. Claude's come from the statusline the daemon gives every
+  Claude it launches (your own statusline still shows inside it); Codex's from its session logs.
+  Claude's only appear after it has talked to the API at least once.
+- **Select a world** for its card: branch, ahead/behind, uncommitted files ("stability"),
+  commits, files and main language, population, turns finished, lines changed, spend, and how
+  full each Claude's context is.
+- **Select a system** for the totals across its worlds: capital, unrest (uncommitted work) and
+  trade (commits not pushed yet).
+
+## Status detection
+
+- **Claude Code** is launched with injected hooks (`--settings`) that call `empire hook …`, so
+  it reports working, done and needs-permission itself.
+- **Everything else** is read from the screen: a live `esc to interrupt` hint means working,
+  approval phrasing near the bottom ("Do you want to proceed?", "Would you like to run…",
+  "trust this folder") means blocked, and quiet after work means done. Agents whose idle
+  screen animates (codex) are judged by the hint only.
+
+## Files
+
+- `daemon.rs`: PTYs (`portable-pty`), terminal emulation (`vt100`) including answers to the
+  terminal queries TUIs block on (cursor position, device attributes, colours), status
+  detection, socket server, Claude hooks.
+- `proto.rs` / `client.rs`: JSON-lines protocol, plus background threads for the agent list,
+  live screen streaming and an ordered command queue.
+- `game.rs`: galaxy model, camera, input, colonize/deploy/decommission flows.
+- `draw.rs`: procedural dithered planets, ships, outliner, situation log, dialogs, comms.
+- `gfx.rs` / `octant.rs`: the octant renderer from mission-control. `sound.rs`: robot cues.
