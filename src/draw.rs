@@ -58,6 +58,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Deploy { planet, kind } => deploy(fb, app, planet, *kind, l),
         Mode::Confirm { id } => confirm(fb, app, *id, l),
         Mode::Help => help(fb, l),
+        Mode::Brief { planet, text, kind, launch } => brief(fb, app, planet, text, *kind, *launch, l, t),
         _ => {}
     }
     if !app.online {
@@ -585,6 +586,26 @@ fn planet_rows(app: &App, p: &Planet, t: f32) -> Rows {
     if !ctx.is_empty() {
         rows.push(("context", ctx));
     }
+    // the quest log: what's under way first, then what's waiting, then what's done
+    let mut ms: Vec<&crate::proto::Mission> = app.missions.iter().filter(|m| m.cwd == p.key).collect();
+    let rank = |m: &crate::proto::Mission| match m.state.as_str() {
+        "active" | "sent" => 0,
+        "queued" => 1,
+        _ => 2,
+    };
+    ms.sort_by_key(|m| (rank(m), std::cmp::Reverse(m.done_at.unwrap_or(m.at))));
+    for (i, m) in ms.iter().take(4).enumerate() {
+        let (g, c) = match m.state.as_str() {
+            "active" | "sent" => ("◆", v3(0.4, 0.85, 1.0)),
+            "queued" => ("○", DIM),
+            _ => ("★", v3(1.0, 0.85, 0.4)),
+        };
+        let row = vec![(format!("{g} "), c), (clip(&m.text, 38), if m.state == "done" { DIM } else { TEXT })];
+        rows.push((if i == 0 { "missions" } else { "" }, row));
+    }
+    if ms.len() > 4 {
+        rows.push(("", vec![(format!("+{} more", ms.len() - 4), DIM)]));
+    }
     rows
 }
 
@@ -697,8 +718,8 @@ fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {
         Some(_) => " · m mute",
     };
     let ctx = match &app.sel {
-        Some(Sel::Agent(_)) => "⏎ comms · e deploy here · x decommission · ",
-        Some(Sel::Planet(_)) => "⏎ comms · e deploy here · ",
+        Some(Sel::Agent(_)) => "⏎ comms · t mission · e deploy here · x decommission · ",
+        Some(Sel::Planet(_)) => "⏎ comms · t mission · e deploy here · ",
         Some(Sel::Sys(_)) => "⏎ zoom in · ",
         None => "",
     };
@@ -876,6 +897,38 @@ fn deploy(fb: &mut Fb, app: &App, planet: &str, kind: usize, l: &Lay) {
     seg(fb, x + 3, y + 2, &trunc(&tilde(planet), (w - 6) as usize), w - 6, DIM, Some(BOX));
     species(fb, app, x + 3, y + 4, kind);
     seg(fb, x + 3, y + h - 2, "⏎ deploy · ←→ species · esc cancel", w - 6, DIM, Some(BOX));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch: bool, l: &Lay, t: f32) {
+    let (x, y, w, h) = centered(l, 72, 13);
+    let accent = v3(1.0, 0.85, 0.4);
+    frame_box(fb, x, y, w, h, &format!("★ NEW MISSION FOR {}", base_name(planet).to_uppercase()), accent);
+    seg(fb, x + 3, y + 2, "What should be done here?", w - 6, DIM, Some(BOX));
+    let row = y + 4;
+    let x1 = seg(fb, x + 3, row, "› ", 2, accent, Some(BOX));
+    let room = (w - 8) as usize;
+    let chars: Vec<char> = text.s.chars().collect();
+    let start = text.cur.saturating_sub(room - 1);
+    for (k, ch) in chars.iter().enumerate().skip(start).take(room) {
+        fb.put_bg(x1 + (k - start) as i32, row, *ch, TEXT, Some(BOX));
+    }
+    if fract(t * 1.6) < 0.6 {
+        let ch = chars.get(text.cur).copied().unwrap_or(' ');
+        fb.put_bg(x1 + (text.cur - start) as i32, row, ch, BOX, Some(accent));
+    }
+    let crew = app.agents.iter().filter(|a| a.cwd == planet && a.dying.is_none()).count();
+    let (now, later) = if launch { (TEXT, DIM) } else { (DIM, TEXT) };
+    let r = y + 6;
+    let xx = seg(fb, x + 3, r, if launch { "● " } else { "○ " }, 2, accent, Some(BOX));
+    let xx = seg(fb, xx, r, "launch a new ship with it now", w - 6, now, Some(BOX));
+    if launch {
+        species(fb, app, xx + 2, r, kind);
+    }
+    let xx = seg(fb, x + 3, r + 1, if launch { "○ " } else { "● " }, 2, accent, Some(BOX));
+    let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it for the next free agent here ({crew} in orbit)") };
+    seg(fb, xx, r + 1, &note, w - 8, later, Some(BOX));
+    seg(fb, x + 3, y + h - 2, "⏎ give orders · ⇥ launch/queue · ↑↓ species · esc cancel", w - 6, DIM, Some(BOX));
 }
 
 fn confirm(fb: &mut Fb, app: &App, id: u32, l: &Lay) {

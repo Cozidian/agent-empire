@@ -32,6 +32,11 @@ pub enum Req {
     /// What an agent tells us about itself (Claude Code, through its statusline).
     Report { id: u32, report: Report },
     Shutdown,
+    /// A new mission for the world at `cwd`: launch a ship with it right away, or queue it
+    /// for the next agent there that's free.
+    Mission { cwd: String, text: String, kind: String, launch: bool },
+    /// Strike a mission from the log.
+    Scrub { id: u32 },
     /// Exec the binary on disk in place of the running daemon, keeping every agent.
     Upgrade,
 }
@@ -54,6 +59,20 @@ pub struct AgentView {
     /// The question it's waiting on, when blocked.
     #[serde(default)]
     pub ask: Option<Ask>,
+}
+
+/// A task written on a world, carried out by one of its agents.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Mission {
+    pub id: u32,
+    pub cwd: String,
+    pub text: String,
+    /// queued | sent | active | done
+    pub state: String,
+    pub agent: Option<u32>,
+    /// Unix time it was written, and finished.
+    pub at: u64,
+    pub done_at: Option<u64>,
 }
 
 /// A question read off an agent's screen, answerable from the galaxy.
@@ -124,7 +143,11 @@ pub struct ScreenView {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Resp {
     Pong { version: String },
-    Agents { agents: Vec<AgentView> },
+    Agents {
+        agents: Vec<AgentView>,
+        #[serde(default)]
+        missions: Vec<Mission>,
+    },
     Spawned { id: u32 },
     Screen { screen: ScreenView },
     Ok,

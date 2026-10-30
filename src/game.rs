@@ -6,7 +6,7 @@
 use crate::client::{Client, Cmd, Msg};
 use crate::draw;
 use crate::gfx::*;
-use crate::proto::{AgentView, Ask, Report, ScreenView};
+use crate::proto::{AgentView, Ask, Mission, Report, ScreenView};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crossterm::event::{
@@ -271,6 +271,8 @@ pub enum Mode {
     Colonize(Colonize),
     Deploy { planet: String, kind: usize },
     Confirm { id: u32 },
+    /// Writing a mission for a world: hand it to a new ship now, or queue it.
+    Brief { planet: String, text: Line, kind: usize, launch: bool },
     Help,
 }
 
@@ -301,6 +303,7 @@ pub struct App {
     pub comms_at: Instant,
     /// Lines scrolled back in the comms window (0 = live).
     pub scroll: usize,
+    pub missions: Vec<Mission>,
     /// Folder and usage stats from the survey thread.
     pub survey: survey::Snapshot,
     /// Text selection in the comms window.
@@ -462,8 +465,29 @@ impl App {
             scroll: 0,
             pick: None,
             survey: survey::Snapshot::default(),
+            missions: Vec::new(),
             click: ((-1, -1), Instant::now(), 0),
         }
+    }
+
+    /// New mission log from the daemon; announce what changed.
+    fn track(&mut self, missions: Vec<Mission>) {
+        if self.loaded && !self.missions.is_empty() {
+            for m in &missions {
+                let old = self.missions.iter().find(|o| o.id == m.id).map(|o| o.state.as_str());
+                if old == Some(m.state.as_str()) {
+                    continue;
+                }
+                let place = base_name(&m.cwd);
+                let what = clip(&m.text, 40);
+                match m.state.as_str() {
+                    "sent" | "active" if !matches!(old, Some("sent") | Some("active")) => self.say(format!("➤ mission to {place}: {what}"), v3(0.6, 0.85, 1.0)),
+                    "done" => self.say(format!("★ mission complete on {place}: {what}"), v3(1.0, 0.85, 0.4)),
+                    _ => {}
+                }
+            }
+        }
+        self.missions = missions;
     }
 
     /// The blocked agent whose question is on screen: the selected one if it's
@@ -934,6 +958,12 @@ fn key_bytes(k: &KeyEvent) -> Option<String> {
     Some(if alt { format!("\x1b{s}") } else { s })
 }
 
+/// `s`, cut to `n` chars with an ellipsis.
+pub fn clip(s: &str, n: usize) -> String {
+    let s = s.lines().next().unwrap_or("");
+    if s.chars().count() > n { format!("{}…", s.chars().take(n - 1).collect::<String>()) } else { s.to_string() }
+}
+
 /// Hand text to the system clipboard: wl-copy, xclip or pbcopy, else the
 /// terminal itself via OSC 52.
 fn copy_to_clipboard(text: &str) -> bool {
@@ -1026,7 +1056,10 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         let mut cues = Vec::new();
         while let Ok(m) = client.rx.try_recv() {
             match m {
-                Msg::Agents(list) => app.apply(list, t, &mut cues),
+                Msg::Agents(list, missions) => {
+                    app.apply(list, t, &mut cues);
+                    app.track(missions);
+                }
                 Msg::Down(e) => {
                     app.online = false;
                     app.err = e;
@@ -1205,6 +1238,25 @@ fn handle(
             app.mode = Mode::Galaxy;
             return false;
         }
+        Mode::Brief { planet, text, kind, launch } => {
+            match k.code {
+                KeyCode::Esc => app.mode = Mode::Galaxy,
+                KeyCode::Up => *kind = (*kind + nk - 1) % nk,
+                KeyCode::Down => *kind = (*kind + 1) % nk,
+                KeyCode::Tab => *launch = !*launch,
+                KeyCode::Enter if !text.s.trim().is_empty() => {
+                    let cmd = Cmd::Mission { cwd: planet.clone(), text: text.s.trim().to_string(), kind: app.kinds[*kind].clone(), launch: *launch };
+                    let msg = if *launch { "mission launched" } else { "mission queued" };
+                    client.send(cmd);
+                    app.mode = Mode::Galaxy;
+                    app.toast(msg, t);
+                }
+                _ => {
+                    text.key(&k);
+                }
+            }
+            return false;
+        }
         Mode::Deploy { planet, kind } => {
             match k.code {
                 KeyCode::Esc => app.mode = Mode::Galaxy,
@@ -1334,6 +1386,22 @@ fn handle(
             let kind = 0;
             let comps = complete(&path.s);
             app.mode = Mode::Colonize(Colonize { path, kind, comps, comp_i: 0, mkdir: false });
+        }
+        KeyCode::Char('t') => match app.sel_planet() {
+            Some(planet) => {
+                // queue it if someone's there to take it, otherwise send a ship
+                let crewed = app.agents.iter().any(|a| a.cwd == planet && a.dying.is_none());
+                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed };
+            }
+            None => app.toast("select a world to give it a mission", t),
+        },
+        KeyCode::Char('T') => {
+            // strike finished missions on the selected world from the log
+            if let Some(p) = app.sel_planet() {
+                for m in app.missions.iter().filter(|m| m.cwd == p && m.state == "done") {
+                    client.send(Cmd::Scrub(m.id));
+                }
+            }
         }
         KeyCode::Char('e') => match app.sel_planet() {
             Some(planet) => app.mode = Mode::Deploy { planet, kind: 0 },

@@ -401,6 +401,7 @@ struct Hub {
     next: u32,
     /// When a galaxy last asked for the agent list: while one is open, it does the alerting.
     watched: Option<Instant>,
+    missions: Vec<Mission>,
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -481,11 +482,14 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
 }
 
 /// Launch an agent in `cwd`, picking up its old session if we have one.
-fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>) -> anyhow::Result<u32> {
+fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>) -> anyhow::Result<u32> {
     let id = next_id(hub);
     let exe = exe_path().to_string_lossy().into_owned();
     let pty = native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })?;
-    let (prog, args) = command(kind, &exe, resume);
+    let (prog, mut args) = command(kind, &exe, resume);
+    if let Some(p) = prompt {
+        args.push(p.into()); // every species takes an opening prompt as its last argument
+    }
     let mut cmd = CommandBuilder::new(&prog);
     cmd.args(&args);
     cmd.cwd(cwd);
@@ -660,6 +664,75 @@ struct Saved {
     session: Option<String>,
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn missions_file() -> PathBuf {
+    dirs_state().join("missions.json")
+}
+
+/// Hand queued missions to free agents and follow the ones under way.
+fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
+    let agents: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
+    // (id, cwd, status, exited)
+    let roster: Vec<(u32, String, Status, bool)> = agents
+        .iter()
+        .map(|a| {
+            let g = a.lock().unwrap();
+            (g.id, g.cwd.clone(), g.status, g.exited.is_some())
+        })
+        .collect();
+    let mut h = hub.lock().unwrap();
+    let busy: HashSet<u32> = h.missions.iter().filter(|m| matches!(m.state.as_str(), "sent" | "active")).filter_map(|m| m.agent).collect();
+    let mut taken = HashSet::new();
+    for m in h.missions.iter_mut() {
+        let me = m.agent.and_then(|id| roster.iter().find(|r| r.0 == id));
+        match m.state.as_str() {
+            "queued" => {
+                let free = roster.iter().find(|(id, cwd, st, dead)| {
+                    *cwd == m.cwd && !dead && matches!(st, Status::Idle | Status::Done) && !busy.contains(id) && !taken.contains(id)
+                });
+                if let Some(&(id, ..)) = free
+                    && let Some(a) = agents.iter().find(|a| a.lock().unwrap().id == id)
+                {
+                    taken.insert(id);
+                    m.state = "sent".into();
+                    m.agent = Some(id);
+                    let (a, text) = (a.clone(), m.text.clone());
+                    thread::spawn(move || {
+                        // typed, then submitted separately, so TUIs don't take it as a pasted newline
+                        let _ = a.lock().unwrap().writer.write_all(text.as_bytes());
+                        thread::sleep(Duration::from_millis(150));
+                        let mut g = a.lock().unwrap();
+                        g.last_in = Instant::now();
+                        let _ = g.writer.write_all(b"\r");
+                    });
+                }
+            }
+            "sent" | "active" => match me {
+                None | Some((_, _, _, true)) => {
+                    // its agent is gone: back in the queue
+                    m.state = "queued".into();
+                    m.agent = None;
+                }
+                Some((_, _, Status::Working | Status::Blocked, _)) => m.state = "active".into(),
+                Some((_, _, Status::Done | Status::Idle, _)) if m.state == "active" => {
+                    m.state = "done".into();
+                    m.done_at = Some(unix_now());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if h.missions != *logged {
+        let _ = std::fs::create_dir_all(dirs_state());
+        let _ = std::fs::write(missions_file(), serde_json::to_string(&h.missions).unwrap_or_default());
+        *logged = h.missions.clone();
+    }
+}
+
 fn registry_file() -> PathBuf {
     dirs_state().join("agents.json")
 }
@@ -692,7 +765,7 @@ fn resurrect(hub: &Shared) {
         if std::path::Path::new(&a.cwd).is_dir() {
             // a claude that never got a prompt has nothing to resume
             let session = a.session.filter(|s| a.kind != "claude" || claude_transcript(s));
-            if let Err(e) = spawn(hub, &a.kind, &a.cwd, session.as_deref()) {
+            if let Err(e) = spawn(hub, &a.kind, &a.cwd, session.as_deref(), None) {
                 eprintln!("could not bring back {} in {}: {e}", a.kind, a.cwd);
             }
         }
@@ -797,7 +870,8 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             let list: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
             let mut agents: Vec<AgentView> = list.iter().map(|a| a.lock().unwrap().view(now)).collect();
             agents.sort_by_key(|a| a.id);
-            Resp::Agents { agents }
+            let missions = hub.lock().unwrap().missions.clone();
+            Resp::Agents { agents, missions }
         }
         Req::Upgrade => {
             let h = hub.clone();
@@ -809,7 +883,26 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             });
             Resp::Ok
         }
-        Req::Spawn { kind, cwd } => match spawn(hub, &kind, &cwd, None) {
+        Req::Mission { cwd, text, kind, launch } => {
+            let id = hub.lock().unwrap().missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
+            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), state: "queued".into(), agent: None, at: unix_now(), done_at: None };
+            if launch {
+                match spawn(hub, &kind, &cwd, None, Some(&text)) {
+                    Ok(aid) => {
+                        m.state = "sent".into();
+                        m.agent = Some(aid);
+                    }
+                    Err(e) => return Resp::Err { msg: e.to_string() },
+                }
+            }
+            hub.lock().unwrap().missions.push(m);
+            Resp::Ok
+        }
+        Req::Scrub { id } => {
+            hub.lock().unwrap().missions.retain(|m| m.id != id);
+            Resp::Ok
+        }
+        Req::Spawn { kind, cwd } => match spawn(hub, &kind, &cwd, None, None) {
             Ok(id) => Resp::Spawned { id },
             Err(e) => Resp::Err { msg: format!("could not launch {kind}: {e}") },
         },
@@ -963,6 +1056,17 @@ pub fn run() -> io::Result<()> {
     let listener = UnixListener::bind(&path)?;
     let hub: Shared = Arc::default();
     let _ = BUILD.set(build_id());
+    if let Ok(s) = std::fs::read_to_string(missions_file()) {
+        let mut ms: Vec<Mission> = serde_json::from_str(&s).unwrap_or_default();
+        // agent ids don't survive a restart; anything under way goes back in the queue
+        for m in ms.iter_mut().filter(|m| m.state != "done") {
+            if std::env::var_os("EMPIRE_HANDOFF").is_none() {
+                m.state = "queued".into();
+                m.agent = None;
+            }
+        }
+        hub.lock().unwrap().missions = ms;
+    }
     match std::env::var("EMPIRE_HANDOFF") {
         Ok(f) => {
             unsafe { std::env::remove_var("EMPIRE_HANDOFF") };
@@ -978,6 +1082,7 @@ pub fn run() -> io::Result<()> {
     let h = hub.clone();
     thread::spawn(move || {
         let mut saved = Vec::new();
+        let mut logged = Vec::new();
         let mut tick = 0u32;
         loop {
             tick += 1;
@@ -985,6 +1090,7 @@ pub fn run() -> io::Result<()> {
                 discover_sessions(&h);
                 save_registry(&h, &mut saved);
             }
+            dispatch(&h, &mut logged);
             let now = Instant::now();
             let list: Vec<(u32, Arc<Mutex<Agent>>)> = h.lock().unwrap().agents.iter().map(|(k, v)| (*k, v.clone())).collect();
             let mut dead = Vec::new();
@@ -1113,7 +1219,7 @@ fn alert(hub: &Shared, a: &Agent) {
 /// `empire status`: one line for a status bar (`--json`: waybar-style JSON).
 pub fn status(json: bool) {
     let agents = match call(&Req::Peek) {
-        Ok(Resp::Agents { agents }) => agents,
+        Ok(Resp::Agents { agents, .. }) => agents,
         _ => {
             if json {
                 println!(r#"{{"text":"","tooltip":"empire daemon offline","class":"offline"}}"#);
