@@ -32,6 +32,11 @@ Agents also survive the daemon itself:
 
 ## Playing
 
+Worlds, systems and ships have seeded procedural appearances: varied planetary palettes,
+surface patterns and axial tilts, tilted colony rings, stellar coronas and occasional asteroid
+belts, and four ship hull styles. Each folder or ship keeps its look across redraws and reopening
+the galaxy. Ship status colours and development indicators still show the same information.
+
 | key              | action                                                              |
 | ---------------- | ------------------------------------------------------------------- |
 | `n`              | **colonize**: launch an agent in a folder (pick one, or type a new path and it's created) |

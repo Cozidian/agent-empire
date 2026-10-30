@@ -156,23 +156,25 @@ fn fbm(x: f32, y: f32, s: u32) -> f32 {
 
 /// Surface of a planet type: (albedo, emission, atmosphere).
 fn terrain(kind: u8, lon: f32, lat: f32, seed: f32) -> (V3, V3, V3) {
-    let s = (seed * 1000.0) as u32;
-    let (x, y) = (lon.cos() * 1.8 + 10.0, lon.sin() * 1.8 + lat * 2.6);
+    let s = (seed * 1_000_000.0) as u32;
+    let scale = 1.2 + rnd(s ^ 71) * 1.8;
+    let (x, y) = (lon.cos() * scale + 10.0, lon.sin() * scale + lat * 2.6);
     let n = fbm(x, y, s);
-    match kind {
+    let (albedo, emission, atmosphere) = match kind {
         0 => {
             // terran
-            let land = smoothstep(0.5, 0.56, n);
+            let coast = 0.38 + rnd(s ^ 19) * 0.22;
+            let land = smoothstep(coast, coast + 0.06, n);
             let ground = mix(v3(0.22, 0.5, 0.22), v3(0.55, 0.45, 0.28), fbm(x * 2.0, y * 2.0, s + 9));
             let mut c = mix(v3(0.08, 0.22, 0.55) + s3(n * 0.08), ground, land);
-            if lat.abs() > 0.8 {
+            if lat.abs() > 0.68 + rnd(s ^ 23) * 0.24 {
                 c = v3(0.9, 0.95, 1.0);
             }
             (c, V3::default(), v3(0.4, 0.7, 1.0))
         }
         1 => (mix(v3(0.04, 0.18, 0.48), v3(0.25, 0.55, 0.85), smoothstep(0.55, 0.75, n)), V3::default(), v3(0.3, 0.6, 1.0)),
         2 => {
-            let b = (lat * 7.0 + n * 4.0).sin() * 0.5 + 0.5;
+            let b = (lat * (5.0 + rnd(s ^ 31) * 8.0) + n * 4.0).sin() * 0.5 + 0.5;
             (mix(v3(0.88, 0.62, 0.35), v3(0.58, 0.33, 0.18), b), V3::default(), v3(1.0, 0.7, 0.4))
         }
         3 => {
@@ -180,8 +182,10 @@ fn terrain(kind: u8, lon: f32, lat: f32, seed: f32) -> (V3, V3, V3) {
             (mix(v3(0.86, 0.93, 1.0), v3(0.5, 0.7, 0.86), n) - s3(crack * 0.3), V3::default(), v3(0.7, 0.9, 1.0))
         }
         4 => {
-            let b = (lat * 13.0 + n * 2.5).sin() * 0.5 + 0.5;
-            let storm = (-((lon - 1.0).powi(2) * 6.0 + (lat - 0.3).powi(2) * 40.0)).exp();
+            let b = (lat * (8.0 + rnd(s ^ 31) * 13.0) + n * 2.5).sin() * 0.5 + 0.5;
+            let storm_lon = rnd(s ^ 37) * TAU;
+            let storm_lat = rnd(s ^ 41) * 1.1 - 0.55;
+            let storm = (-((1.0 - (lon - storm_lon).cos()) * 12.0 + (lat - storm_lat).powi(2) * 40.0)).exp();
             let c = mix(v3(0.88, 0.72, 0.5), v3(0.55, 0.35, 0.62), b);
             (mix(c, v3(0.95, 0.45, 0.3), storm), V3::default(), v3(0.9, 0.7, 1.0))
         }
@@ -190,7 +194,11 @@ fn terrain(kind: u8, lon: f32, lat: f32, seed: f32) -> (V3, V3, V3) {
             (v3(0.14, 0.09, 0.09), v3(1.0, 0.35, 0.08) * crack * 1.6, v3(1.0, 0.4, 0.2))
         }
         _ => (mix(v3(0.62, 0.76, 0.2), v3(0.3, 0.45, 0.15), n), V3::default(), v3(0.7, 1.0, 0.3)),
-    }
+    };
+    // Keep each world's class legible while giving it its own mineral palette.
+    let tint = hsv(rnd(s ^ 53), 0.25 + rnd(s ^ 59) * 0.4, 1.0);
+    let palette = mix(s3(1.0), tint, 0.65);
+    (albedo * palette, emission * palette, atmosphere * palette)
 }
 
 /// A lit, rotating planet with an atmosphere rim, lit from `light` (toward the star).
@@ -200,6 +208,8 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
         v / (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
     };
     let e = r + 4.0;
+    let tilt = (rnd(p.seed.to_bits() ^ 83) - 0.5) * 1.4;
+    let (st, ct) = tilt.sin_cos();
     let (_, _, atm) = terrain(p.terrain, 0.0, 0.0, p.seed);
     for py in (cy - e).floor() as i32..=(cy + e).ceil() as i32 {
         for px in (cx - e).floor() as i32..=(cx + e).ceil() as i32 {
@@ -213,8 +223,9 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
                 continue;
             }
             let nz = (1.0 - d2).sqrt();
-            let lon = dx.atan2(nz) + t * 0.1 * (0.5 + p.seed);
-            let (alb, emit, atm) = terrain(p.terrain, lon, dy, p.seed);
+            let latitude = dx * st + dy * ct;
+            let lon = (dx * ct - dy * st).atan2(nz) + p.seed * TAU + t * 0.04 * (0.5 + p.seed);
+            let (alb, emit, atm) = terrain(p.terrain, lon, latitude, p.seed);
             let ndl = dx * l.x + dy * l.y + nz * l.z;
             let day = smoothstep(-0.12, 0.5, ndl);
             let mut c = alb * (0.035 + 1.05 * day) + emit * (1.0 - 0.6 * day) + atm * (1.0 - nz).powi(3) * 0.9 * day;
@@ -251,6 +262,30 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
     }
 }
 
+/// Seeded silhouettes, kept inside the existing ship selection radius.
+fn hull(fb: &mut Fb, (x, y): (f32, f32), s: f32, seed: u32, col: V3) {
+    let angle = rnd(seed ^ 101) * TAU;
+    let (sn, cs) = angle.sin_cos();
+    let width = 0.8 + rnd(seed ^ 103) * 0.35;
+    let point = |(u, v): (f32, f32)| {
+        (x + (u * cs - v * width * sn) * s, y + (u * sn + v * width * cs) * s)
+    };
+    let vertices: &[(f32, f32)] = match crate::gfx::hash(seed ^ 107) % 4 {
+        0 => &[(3.8, 0.0), (-2.5, -2.6), (-1.0, 0.0), (-2.5, 2.6)], // interceptor
+        1 => &[(3.5, 0.0), (0.0, -2.5), (-3.5, 0.0), (0.0, 2.5)], // scout
+        2 => &[(3.0, -1.2), (3.0, 1.2), (-2.8, 2.2), (-2.8, -2.2)], // frigate
+        _ => &[(3.7, 0.0), (-1.8, -3.0), (-0.5, -0.7), (-3.0, 0.0), (-0.5, 0.7), (-1.8, 3.0)],
+    };
+    for i in 0..vertices.len() {
+        let (ax, ay) = point(vertices[i]);
+        let (bx, by) = point(vertices[(i + 1) % vertices.len()]);
+        fb.line(ax, ay, bx, by, col * 0.65, col * 0.65);
+    }
+    let (ex, ey) = point((-2.8, 0.0));
+    let (tx, ty) = point((-4.3 - rnd(seed ^ 109), 0.0));
+    fb.line(ex, ey, tx, ty, col * 0.7, col * 0.05);
+}
+
 fn ship(fb: &mut Fb, a: &Agent, (x, y): (f32, f32), z: f32, t: f32) {
     let grow = smoothstep(a.born, a.born + 0.8, t) * a.dying.map_or(1.0, |d| 1.0 - smoothstep(d, d + 0.8, t));
     if grow <= 0.0 {
@@ -260,31 +295,48 @@ fn ship(fb: &mut Fb, a: &Agent, (x, y): (f32, f32), z: f32, t: f32) {
     let col = a.status.color();
     match a.status {
         Status::Working => {
-            orb(fb, x, y, 1.6 * s, col * (0.9 + 0.3 * (t * 6.0 + a.seed * 9.0).sin()));
+            orb(fb, x, y, 0.9 * s, col * (0.9 + 0.3 * (t * 6.0 + a.seed * 9.0).sin()));
             let ang = t * 2.5 + a.seed * TAU;
             fb.splat(x + ang.cos() * 4.5 * s, y + ang.sin() * 4.5 * s, col);
         }
         Status::Blocked => {
             let on = fract(t * 2.0 + a.seed) < 0.5;
-            orb(fb, x, y, 1.9 * s, col * if on { 1.8 } else { 0.5 });
+            orb(fb, x, y, 1.1 * s, col * if on { 1.8 } else { 0.5 });
             for k in 0..2 {
                 let p = fract(t / 1.3 + k as f32 * 0.5);
                 circle(fb, x, y, (2.5 + p * 14.0) * s, col * (1.0 - p) * 0.6);
             }
         }
         Status::Done => {
-            orb(fb, x, y, 1.7 * s, col);
+            orb(fb, x, y, 1.0 * s, col);
             let tw = rnd((t * 8.0) as u32 ^ (a.seed * 1e6) as u32);
             if tw > 0.7 {
                 let ang = tw * 40.0;
                 fb.splat(x + ang.cos() * 4.0 * s, y + ang.sin() * 4.0 * s, s3(0.9));
             }
         }
-        Status::Booting => orb(fb, x, y, 1.5 * s, col * if fract(t * 3.0) < 0.5 { 1.2 } else { 0.4 }),
-        Status::Idle => orb(fb, x, y, 1.4 * s, col * (0.55 + 0.12 * (t * 1.2 + a.seed * 6.0).sin())),
-        Status::Exited => orb(fb, x, y, 1.2 * s, col * 0.4),
+        Status::Booting => orb(fb, x, y, 0.9 * s, col * if fract(t * 3.0) < 0.5 { 1.2 } else { 0.4 }),
+        Status::Idle => orb(fb, x, y, 0.8 * s, col * (0.55 + 0.12 * (t * 1.2 + a.seed * 6.0).sin())),
+        Status::Exited => orb(fb, x, y, 0.7 * s, col * 0.4),
     }
-    circle(fb, x, y, 3.3 * s, kind_color(&a.kind) * 0.5 * grow);
+    hull(fb, (x, y), s, a.seed.to_bits(), mix(col, kind_color(&a.kind), 0.25) * grow);
+    // The agent provider remains a small, consistent navigation light.
+    fb.splat(x, y - 2.0 * s, kind_color(&a.kind) * grow);
+}
+
+fn star(fb: &mut Fb, (x, y): (f32, f32), r: f32, seed: u32, col: V3, t: f32) {
+    let core = r * (0.72 + rnd(seed ^ 113) * 0.28);
+    orb(fb, x, y, core, col * 1.5);
+    let rays = 5 + crate::gfx::hash(seed ^ 127) % 5;
+    let phase = rnd(seed ^ 131) * TAU;
+    for k in 0..rays {
+        let a = phase + k as f32 * TAU / rays as f32;
+        let reach = core * (1.5 + rnd(seed ^ k ^ 137) * 0.9);
+        let shimmer = 0.85 + 0.15 * (t * 0.6 + k as f32).sin();
+        fb.line(x + a.cos() * core, y + a.sin() * core,
+            x + a.cos() * reach, y + a.sin() * reach, col * 0.3 * shimmer, col * 0.015);
+    }
+    circle(fb, x, y, core * (1.5 + rnd(seed ^ 139) * 0.5), col * 0.1);
 }
 
 fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
@@ -305,8 +357,19 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
     for s in &w.systems {
         let (sx, sy) = scr(s.wpos);
+        let seed = s.key.bytes().fold(7u32, |h, b| h.wrapping_mul(31) ^ b as u32);
+        let orbit_col = mix(v3(0.03, 0.065, 0.085), s.star * 0.07, 0.45);
         for &r in &s.orbits {
-            ellipse(fb, sx, sy, r * z, r * 0.55 * z, v3(0.03, 0.065, 0.085));
+            ellipse(fb, sx, sy, r * z, r * 0.55 * z, orbit_col);
+        }
+        // Some systems have a quiet inner asteroid belt, clear of planet orbits.
+        if rnd(seed ^ 149) > 0.45 {
+            for k in 0..64 {
+                let a = rnd(seed ^ (k * 3 + 151)) * TAU;
+                let r = (38.0 + rnd(seed ^ (k * 3 + 152)) * 9.0) * z;
+                fb.splat(sx + a.cos() * r, sy + a.sin() * r * 0.55,
+                    mix(s3(0.12), s.star * 0.22, rnd(seed ^ (k * 3 + 153))));
+            }
         }
         let rs = (8.0 * z).max(2.2);
         if s.planets.iter().any(|&i| w.planets[i].level >= 3) {
@@ -317,8 +380,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 fb.splat(sx + a.cos() * rr, sy + a.sin() * rr * (0.35 + tilt), v3(1.0, 0.8, 0.35) * 0.8);
             }
         }
-        orb(fb, sx, sy, rs, s.star * 1.5);
-        circle(fb, sx, sy, rs * 1.9, s.star * 0.12);
+        star(fb, (sx, sy), rs, seed, s.star, t);
     }
 
     for (pi, p) in w.planets.iter().enumerate() {
@@ -340,6 +402,11 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 return;
             }
             let bands = if p.level >= 3 { 3 } else { p.level as usize };
+            let seed = p.seed.to_bits();
+            let tilt = (rnd(seed ^ 157) - 0.5) * 1.2;
+            let (st, ct) = tilt.sin_cos();
+            let flatten = 0.2 + rnd(seed ^ 163) * 0.22;
+            let tint = hsv(rnd(seed ^ 167), 0.3, 1.0);
             for b in 0..bands {
                 let rr = r * (1.55 + 0.22 * b as f32);
                 let n = (rr * 7.0) as usize + 24;
@@ -348,8 +415,9 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                     if (a.sin() > 0.0) != front {
                         continue;
                     }
-                    let (x, y) = (px + a.cos() * rr, py + a.sin() * rr * 0.28);
-                    let col = [v3(0.85, 0.75, 0.55), v3(0.7, 0.8, 0.95), v3(1.0, 0.85, 0.4)][b] * (0.35 + 0.15 * (k % 3) as f32);
+                    let (u, v) = (a.cos() * rr, a.sin() * rr * flatten);
+                    let (x, y) = (px + u * ct - v * st, py + u * st + v * ct);
+                    let col = [v3(0.85, 0.75, 0.55), v3(0.7, 0.8, 0.95), v3(1.0, 0.85, 0.4)][b] * tint * (0.35 + 0.15 * (k % 3) as f32);
                     fb.splat(x, y, col);
                 }
             }
@@ -403,7 +471,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
     // target reticle
     let target = match &app.sel {
-        Some(Sel::Agent(id)) => app.agent(*id).map(|a| (a.wpos, 7.0)),
+        Some(Sel::Agent(id)) => app.agent(*id).map(|a| (a.wpos, 6.0 * z.clamp(0.7, 2.2) + 2.0)),
         Some(Sel::Planet(k)) => w.planet(k).map(|p| (p.wpos, (p.r * z).max(2.5) + 6.0)),
         Some(Sel::Sys(k)) => w.systems.iter().find(|s| &s.key == k).map(|s| (s.wpos, (8.0 * z).max(2.2) + 8.0)),
         None => None,
@@ -1054,7 +1122,8 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
             Sel::Agent(id) => {
                 let Some(a) = app.agent(*id) else { continue };
                 let el = ago(t - a.since);
-                let mut x = seg(fb, c0 + 3, row, &format!("{} ", a.status.glyph(t)), 2, a.status.color(), Some(bg));
+                let indent = if w.planet(&a.cwd).is_some_and(|p| p.host.is_some()) { 5 } else { 3 };
+                let mut x = seg(fb, c0 + indent, row, &format!("{} ", a.status.glyph(t)), 2, a.status.color(), Some(bg));
                 x = seg(fb, x, row, &pad(&a.kind, 7), 7, kind_color(&a.kind), Some(bg)) + 1;
                 let room = (x0 + pw - 2 - el.len() as i32 - x).max(0);
                 seg(fb, x, row, &pad(&a.title, room as usize), room, if me { TEXT } else { DIM }, Some(bg));
