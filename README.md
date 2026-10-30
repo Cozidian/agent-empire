@@ -116,6 +116,13 @@ PR. Prestige develops a world, with a fanfare on every level: **outpost → colo
 **→ city world** (city lights on its night side, 12) **→ ecumenopolis** (25), whose star gets a
 Dyson swarm. The world card shows its development and how far the next level is.
 
+## Spectating
+
+`empire spectate` serves a read-only live web view of the empire (an animated galaxy, the fleet,
+questions waiting and missions) for someone watching along. It listens on localhost unless you pass
+`--bind ADDR` (`--port N`, default 7777), answers only requests with the token in the link it
+prints, and never shows an agent's screen.
+
 ## Answering from orbit
 
 When an agent asks something (a permission prompt, "trust this folder?", a y/n), an
@@ -160,4 +167,7 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
   live screen streaming and an ordered command queue.
 - `game.rs`: galaxy model, camera, input, colonize/deploy/decommission flows.
 - `draw.rs`: procedural dithered planets, ships, outliner, situation log, dialogs, comms.
+- `survey.rs`: background git survey of every world (status, size, worktrees, PRs via `gh`) and
+  Claude/Codex usage.
+- `spectate.rs`: the read-only web view.
 - `gfx.rs` / `octant.rs`: the octant renderer from mission-control. `sound.rs`: robot cues.
