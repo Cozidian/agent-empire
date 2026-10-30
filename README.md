@@ -44,6 +44,7 @@ Agents also survive the daemon itself:
 | `u`              | **moon**: found a git worktree off the selected world, with its own agent |
 | `D`              | **dock** the selected moon: merge its branch back in and retire it   |
 | `P`              | give the selected agent **priority** in a border conflict            |
+| `X`              | forget the selected dormant world                                   |
 | `T`              | strike finished missions on the selected world from its log         |
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
@@ -99,6 +100,13 @@ rivals trade laser fire and the card names the contested files. Claude reports e
 through a hook; for other agents the daemon reads "Edited src/a.rs" style lines off their screens.
 Select one of them and press `P` to give it **priority**: the others are told to leave those files
 alone.
+
+## Fog of war
+
+The galaxy remembers every world you've had agents on (the 40 most recent). Worlds with no one there
+stay on the map as **dormant** planets (◌ in the outliner), and the longer they're left alone (no
+agents, no commits) the more they grey out, until after a few weeks they're lost in a violet nebula.
+The map shows where your attention has been. `e` sends a ship back; `X` forgets a world.
 
 ## Answering from orbit
 

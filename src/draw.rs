@@ -214,7 +214,27 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
             let (alb, emit, atm) = terrain(p.terrain, lon, dy, p.seed);
             let ndl = dx * l.x + dy * l.y + nz * l.z;
             let day = smoothstep(-0.12, 0.5, ndl);
-            fb.px[i] = alb * (0.035 + 1.05 * day) + emit * (1.0 - 0.6 * day) + atm * (1.0 - nz).powi(3) * 0.9 * day;
+            let c = alb * (0.035 + 1.05 * day) + emit * (1.0 - 0.6 * day) + atm * (1.0 - nz).powi(3) * 0.9 * day;
+            // a neglected world goes grey and dim under the fog
+            let grey = s3((c.x + c.y + c.z) / 3.0);
+            fb.px[i] = mix(c, mix(grey, v3(0.35, 0.3, 0.5) * grey.x * 2.0, 0.5), p.fog) * (1.0 - 0.7 * p.fog);
+        }
+    }
+    // and the nebula closes in around it
+    if p.fog > 0.3 {
+        let e = r * 2.6 + 6.0;
+        for py in (cy - e).floor() as i32..=(cy + e).ceil() as i32 {
+            for px in (cx - e).floor() as i32..=(cx + e).ceil() as i32 {
+                let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                let d = (dx * dx + dy * dy).sqrt() / e;
+                if d >= 1.0 {
+                    continue;
+                }
+                let Some(i) = fb.idx(px, py) else { continue };
+                let n = fbm(px as f32 * 0.045 + t * 0.03, py as f32 * 0.06, p.seed.to_bits());
+                let haze = smoothstep(0.35, 0.8, n) * (1.0 - d * d) * (p.fog - 0.3) * 0.5;
+                fb.px[i] = mix(fb.px[i], v3(0.22, 0.14, 0.34), haze);
+            }
         }
     }
 }
@@ -378,7 +398,8 @@ fn ago(secs: f32) -> String {
     match s {
         0..60 => format!("{s}s"),
         60..3600 => format!("{}m", s / 60),
-        _ => format!("{}h{:02}", s / 3600, (s / 60) % 60),
+        3600..172_800 => format!("{}h{:02}", s / 3600, (s / 60) % 60),
+        _ => format!("{}d", s / 86_400),
     }
 }
 
@@ -523,7 +544,7 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
             continue;
         }
         let name = if p.host.is_some() { format!("☾ {}", p.name) } else { p.name.clone() };
-        c = seg(fb, c, r, &name, len + 2, if selected { s3(1.0) } else { TEXT }, None);
+        c = seg(fb, c, r, &name, len + 2, if selected { s3(1.0) } else { TEXT * (1.0 - 0.65 * p.fog) }, None);
         for (s, col) in parts {
             c = seg(fb, c + 1, r, &s, 8, col, None);
         }
@@ -712,6 +733,11 @@ fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
         }
         Some(_) => rows.push(("dock", vec![("no git — uncharted territory".into(), DIM)])),
         None => rows.push(("dock", vec![("surveying…".into(), DIM)])),
+    }
+    if p.dormant && p.host.is_none() {
+        let age = ago((survey::now() as u64).saturating_sub(p.last_seen) as f32);
+        let txt = if p.fog > 0.8 { "lost in the nebula" } else if p.fog > 0.5 { "fading" } else { "dormant" };
+        rows.push(("status", vec![(format!("{txt} · quiet for {age}"), v3(0.6, 0.5, 0.85)), ("  e deploy · X forget".into(), DIM)]));
     }
     economy(&mut rows, &agents, t);
     let ctx: Vec<(String, V3)> = agents
@@ -932,8 +958,14 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 let Some(p) = w.planet(key) else { continue };
                 let parts = tally(p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none()), t);
                 let tw: usize = parts.iter().map(|(s, _)| s.chars().count() + 1).sum();
-                let (glyph, indent) = if p.host.is_some() { ("☾ ", 3) } else { ("● ", 1) };
-                let x = seg(fb, c0 + indent, row, glyph, 2, planet_color(p), Some(bg));
+                let (glyph, indent) = if p.host.is_some() { ("☾ ", 3) } else if p.dormant { ("◌ ", 1) } else { ("● ", 1) };
+                let x = seg(fb, c0 + indent, row, glyph, 2, planet_color(p) * (1.0 - 0.6 * p.fog), Some(bg));
+                if p.dormant && p.host.is_none() {
+                    let age = ago((survey::now() as u64).saturating_sub(p.last_seen) as f32);
+                    seg(fb, x, row, &pad(&p.name, inner.saturating_sub(4 + age.len())), pw, DIM * (1.1 - 0.5 * p.fog), Some(bg));
+                    seg(fb, x0 + pw - 1 - age.len() as i32, row, &age, 8, DIM * 0.7, Some(bg));
+                    continue;
+                }
                 seg(fb, x, row, &pad(&p.name, inner.saturating_sub(2 + indent as usize + tw)), pw, TEXT, Some(bg));
                 let mut x = x0 + pw - 1 - tw as i32;
                 for (s, c) in parts {

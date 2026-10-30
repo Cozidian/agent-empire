@@ -27,6 +27,7 @@ const NAG: f32 = 120.0;
 /// A turn shorter than this finishing is not worth a sound.
 const SHORT_TURN: f32 = 6.0;
 const FPS: u64 = 30;
+const DIM_LOG: V3 = v3(0.5, 0.55, 0.65);
 /// Default names for new moons (they become branch names).
 const MOONS: [&str; 12] = ["luna", "phobos", "deimos", "io", "europa", "ganymede", "callisto", "titan", "rhea", "triton", "charon", "oberon"];
 /// Radius of a system's first planetary orbit, and the gap between orbits.
@@ -144,6 +145,12 @@ pub struct Planet {
     /// A moon (git worktree) orbits this planet instead of a star.
     pub host: Option<usize>,
     pub moons: Vec<usize>,
+    /// No agents here now: a world from the empire's history.
+    pub dormant: bool,
+    /// 0 (lively) … 1 (forgotten, lost in the nebula), from how long it's been left alone.
+    pub fog: f32,
+    /// Unix time of the last sign of life (agents or commits).
+    pub last_seen: u64,
 }
 
 pub struct System {
@@ -319,6 +326,9 @@ pub struct App {
     /// Lines scrolled back in the comms window (0 = live).
     pub scroll: usize,
     pub missions: Vec<Mission>,
+    /// Every world ever colonized, and when it last had agents.
+    pub history: HashMap<String, u64>,
+    history_saved: Instant,
     /// Folder and usage stats from the survey thread.
     pub survey: survey::Snapshot,
     /// Text selection in the comms window.
@@ -481,8 +491,21 @@ impl App {
             pick: None,
             survey: survey::Snapshot::default(),
             missions: Vec::new(),
+            history: std::fs::read_to_string(history_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+            history_saved: Instant::now(),
             click: ((-1, -1), Instant::now(), 0),
         }
+    }
+
+    /// How long a world has been left alone: (dormant, fog, last sign of life).
+    fn fog(&self, key: &str, live: usize, now: u64) -> (bool, f32, u64) {
+        if live > 0 {
+            return (false, 0.0, now);
+        }
+        let commit = self.survey.worlds.get(key).and_then(|w| w.last_commit).unwrap_or(0).max(0) as u64;
+        let last = self.history.get(key).copied().unwrap_or(0).max(commit);
+        let days = now.saturating_sub(last) as f32 / 86_400.0;
+        (true, 0.25 + 0.75 * smoothstep(2.0, 21.0, days), last)
     }
 
     /// Rings and sparks: docking, collisions.
@@ -719,6 +742,26 @@ impl App {
         for (i, a) in self.agents.iter().enumerate() {
             pmap.entry(a.cwd.clone()).or_default().push(i);
         }
+        // the empire remembers: worlds with no one there now stay on the map, dormant
+        let now = survey::now().max(0) as u64;
+        for a in self.agents.iter().filter(|a| a.dying.is_none()) {
+            if self.survey.worlds.get(&a.cwd).is_some_and(|w| w.host.is_none()) || !self.survey.worlds.contains_key(&a.cwd) {
+                self.history.insert(a.cwd.clone(), now);
+            }
+        }
+        if self.history_saved.elapsed() > Duration::from_secs(10) {
+            self.history_saved = Instant::now();
+            let _ = std::fs::create_dir_all(crate::daemon::dirs_state());
+            let _ = std::fs::write(history_file(), serde_json::to_string(&self.history).unwrap_or_default());
+        }
+        let mut past: Vec<(&String, &u64)> = self.history.iter().filter(|(k, _)| !pmap.contains_key(*k)).collect();
+        past.sort_by_key(|(_, t)| std::cmp::Reverse(**t));
+        let past: Vec<String> = past.into_iter().take(HISTORY_WORLDS).map(|(k, _)| k.clone()).filter(|k| Path::new(k).is_dir()).collect();
+        for k in past {
+            if !self.survey.worlds.get(&k).is_some_and(|w| w.host.is_some()) {
+                pmap.entry(k).or_default();
+            }
+        }
         // worktrees are moons of the world they were split from (which shows up even if empty)
         let host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
         for h in host_of.values() {
@@ -769,7 +812,8 @@ impl App {
                 }
                 sys.orbits.push(orbit);
                 sys.planets.push(planets.len());
-                planets.push(Planet { key: pkey.clone(), name: base_name(pkey), agents: members, terrain: (h >> 8) as u8 % 7, seed, wpos, r, host: None, moons: Vec::new() });
+                let (dormant, fog, last_seen) = self.fog(pkey, live, now);
+                planets.push(Planet { key: pkey.clone(), name: base_name(pkey), agents: members, terrain: (h >> 8) as u8 % 7, seed, wpos, r, host: None, moons: Vec::new(), dormant, fog, last_seen });
             }
             systems.push(sys);
         }
@@ -799,7 +843,7 @@ impl App {
             let idx = planets.len();
             planets[hi].moons.push(idx);
             // moons are grey, cratered rock
-            planets.push(Planet { key: mkey.clone(), name, agents: members, terrain: 3, seed, wpos, r, host: Some(hi), moons: Vec::new() });
+            planets.push(Planet { key: mkey.clone(), name, agents: members, terrain: 3, seed, wpos, r, host: Some(hi), moons: Vec::new(), dormant: live == 0, fog: 0.0, last_seen: now });
         }
         let mut lanes = Vec::new();
         for i in 0..systems.len() {
@@ -1075,6 +1119,13 @@ fn key_bytes(k: &KeyEvent) -> Option<String> {
     };
     Some(if alt { format!("\x1b{s}") } else { s })
 }
+
+fn history_file() -> PathBuf {
+    crate::daemon::dirs_state().join("worlds.json")
+}
+
+/// The most worlds kept on the map from history.
+const HISTORY_WORLDS: usize = 40;
 
 /// `s`, cut to `n` chars with an ellipsis.
 pub fn clip(s: &str, n: usize) -> String {
@@ -1611,6 +1662,15 @@ fn handle(
         KeyCode::Char('D') => match app.sel_planet() {
             Some(p) if app.moon_host(&p).is_some() => app.mode = Mode::Dock { moon: p },
             _ => app.toast("select a moon to dock it", t),
+        },
+        KeyCode::Char('X') => match app.sel_planet() {
+            Some(p) if w.planet(&p).is_some_and(|p| p.dormant) => {
+                app.history.remove(&p);
+                let _ = std::fs::write(history_file(), serde_json::to_string(&app.history).unwrap_or_default());
+                app.say(format!("◌ {} forgotten", base_name(&p)), DIM_LOG);
+                app.sel = None;
+            }
+            _ => app.toast("select a dormant world (no agents) to forget it", t),
         },
         KeyCode::Char('P') => match app.sel {
             Some(Sel::Agent(id)) if app.agent(id).is_some_and(|a| !a.war.is_empty()) => {
