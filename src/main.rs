@@ -15,6 +15,8 @@ const HELP: &str = "empire — a galaxy of coding agents
 
   empire           open the galaxy (starts the daemon if needed)
   empire daemon    run the agent host in the foreground
+  empire status    one line for a status bar: ▲ blocked ✔ done ◆ working ○ idle
+                   (--json: waybar-style {text, tooltip, class})
   empire upgrade   swap a running daemon for this build, keeping every agent
                    (the galaxy does this by itself when it starts)
   empire stop      shut down the daemon and every agent in it (they won't come back)
@@ -30,6 +32,10 @@ fn main() -> io::Result<()> {
         }
         Some("statusline") => {
             daemon::statusline();
+            Ok(())
+        }
+        Some("status") => {
+            daemon::status(args.iter().any(|a| a == "--json"));
             Ok(())
         }
         Some("upgrade") => {
