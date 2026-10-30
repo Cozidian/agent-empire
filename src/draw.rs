@@ -267,6 +267,10 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         fb.splat(mixf(a.0, b.0, s), mixf(a.1, b.1, s), v3(0.3, 0.8, 1.0) * 0.6);
     }
 
+    if let Some(st) = w.station {
+        trade(fb, app, w, scr(st), &scr, z, t);
+    }
+
     for s in &w.systems {
         let (sx, sy) = scr(s.wpos);
         for &r in &s.orbits {
@@ -386,6 +390,78 @@ fn tally<'a>(agents: impl Iterator<Item = &'a Agent>, t: f32) -> Vec<(String, V3
     v
 }
 
+fn ci_color(ci: &str) -> V3 {
+    match ci {
+        "fail" => v3(1.0, 0.3, 0.25),
+        "pending" => v3(1.0, 0.75, 0.3),
+        "pass" => v3(0.35, 1.0, 0.55),
+        _ => v3(0.55, 0.65, 0.8),
+    }
+}
+
+/// Every PR across the empire, with the world it's from.
+fn all_prs(app: &App) -> Vec<(&String, &survey::Pr)> {
+    let mut v: Vec<(&String, &survey::Pr)> = app.survey.worlds.iter().flat_map(|(k, w)| w.prs.iter().map(move |p| (k, p))).collect();
+    v.sort_by_key(|(k, p)| ((*k).clone(), p.number));
+    v
+}
+
+/// Trade routes to the GitHub station: freighters with unpushed commits on the way,
+/// PRs docked around it in their CI colours.
+fn trade(fb: &mut Fb, app: &App, w: &World, (sx, sy): (f32, f32), scr: &dyn Fn((f32, f32)) -> (f32, f32), z: f32, t: f32) {
+    for p in w.planets.iter().filter(|p| p.host.is_none()) {
+        let Some(s) = app.survey.worlds.get(&p.key).filter(|s| s.github) else { continue };
+        let (px, py) = scr(p.wpos);
+        // a dotted route
+        let n = (((sx - px).powi(2) + (sy - py).powi(2)).sqrt() / 6.0) as usize;
+        for i in 0..n {
+            let f = i as f32 / n.max(1) as f32;
+            if (i + (t * 3.0) as usize) % 3 == 0 {
+                fb.splat(mixf(px, sx, f), mixf(py, sy, f), v3(0.15, 0.3, 0.4) * 0.5);
+            }
+        }
+        // freighters: one per unpushed commit (up to 5), drifting toward the station
+        let k = s.ahead.min(5);
+        for i in 0..k {
+            let f = fract(t * 0.06 + i as f32 / k as f32 + rnd(p.seed.to_bits()) * 0.3);
+            let (x, y) = (mixf(px, sx, f), mixf(py, sy, f));
+            orb(fb, x, y, 1.6 * z.clamp(0.8, 1.5), v3(1.0, 0.8, 0.35));
+        }
+    }
+    let prs = all_prs(app);
+    let worst = if prs.iter().any(|(_, p)| p.ci == "fail") {
+        "fail"
+    } else if prs.iter().any(|(_, p)| p.ci == "pending") {
+        "pending"
+    } else if prs.iter().any(|(_, p)| p.ci == "pass") {
+        "pass"
+    } else {
+        "none"
+    };
+    let glow = ci_color(worst);
+    let r = (13.0 * z).max(5.0);
+    // a ring station: a hub, a slowly turning ring with lit windows
+    circle(fb, sx, sy, r * 2.2, glow * 0.08);
+    orb(fb, sx, sy, r * 0.45, v3(0.7, 0.8, 0.9));
+    for i in 0..24 {
+        let a = i as f32 / 24.0 * TAU + t * 0.25;
+        let lit = (i + (t * 2.0) as usize) % 4 != 0;
+        fb.splat(sx + a.cos() * r, sy + a.sin() * r * 0.55, if lit { glow * 0.9 } else { v3(0.25, 0.3, 0.35) });
+    }
+    for i in 0..4 {
+        let a = i as f32 * PI * 0.5 + t * 0.25;
+        fb.line(sx, sy, sx + a.cos() * r, sy + a.sin() * r * 0.55, v3(0.3, 0.35, 0.4), v3(0.3, 0.35, 0.4));
+    }
+    // docked PRs
+    let n = prs.len().max(1) as f32;
+    for (i, (_, pr)) in prs.iter().enumerate() {
+        let a = i as f32 / n * TAU - t * 0.12;
+        let (x, y) = (sx + a.cos() * r * 1.7, sy + a.sin() * r * 1.7 * 0.55);
+        let blink = if pr.ci == "fail" { 0.5 + 0.5 * (t * 5.0).sin().abs() } else { 1.0 };
+        orb(fb, x, y, 1.8 * z.clamp(0.8, 1.6), ci_color(pr.ci) * blink);
+    }
+}
+
 fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     let cam = &app.cam;
     let z = cam.z;
@@ -398,6 +474,22 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         let (c, r) = ((sx / 2.0) as i32 - len / 2, ((sy - (8.0 * z).max(2.2) - 6.0) / 4.0) as i32);
         if in_view(c, r) && in_view(c + len - 1, r) {
             fb.text(c, r, &name, s.star * 0.75);
+        }
+    }
+    if let Some(st) = w.station {
+        let (sx, sy) = l.to_screen(cam, st);
+        let prs = all_prs(app);
+        let fails = prs.iter().filter(|(_, p)| p.ci == "fail").count();
+        let mut s = format!("◇ GITHUB · {} PR{}", prs.len(), if prs.len() == 1 { "" } else { "s" });
+        if fails > 0 {
+            s.push_str(&format!(" · ✖{fails}"));
+        }
+        let len = s.chars().count() as i32;
+        let (c, r) = ((sx / 2.0) as i32 - len / 2, ((sy + (13.0 * z).max(5.0) * 1.3 + 8.0) / 4.0) as i32);
+        // slide it back into view rather than lose it at the edge of the map
+        let c = c.min(cw - len - 1);
+        if in_view(c, r) && (sx / 2.0) < cw as f32 {
+            fb.text(c, r, &s, if fails > 0 { v3(1.0, 0.45, 0.4) } else { v3(0.6, 0.75, 0.9) });
         }
     }
     for p in &w.planets {
@@ -551,7 +643,7 @@ fn economy(rows: &mut Rows, agents: &[&Agent], t: f32) {
     }
 }
 
-fn planet_rows(app: &App, p: &Planet, t: f32) -> Rows {
+fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
     let mut rows: Rows = Vec::new();
     let agents: Vec<&Agent> = p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none()).collect();
     let s = app.survey.worlds.get(&p.key);
@@ -572,6 +664,26 @@ fn planet_rows(app: &App, p: &Planet, t: f32) -> Rows {
             let col = strain(100.0 - stab);
             let note = if g.dirty == 0 { "  all committed".to_string() } else { format!("  {} uncommitted", g.dirty) };
             rows.push(("stability", vec![(meter(stab / 100.0, 8), col), (note, if g.dirty == 0 { DIM } else { v3(1.0, 0.75, 0.3) })]));
+            if g.github || g.ahead > 0 {
+                let mut tr = Vec::new();
+                if g.ahead > 0 {
+                    tr.push((format!("{} unpushed  ", g.ahead), v3(1.0, 0.8, 0.35)));
+                }
+                let prs = p.host.map(|h| &w.planets[h].key).and_then(|k| app.survey.worlds.get(k)).map_or(&g.prs, |h| &h.prs);
+                for pr in prs.iter().take(4) {
+                    let mark = match pr.ci {
+                        "fail" => "✖",
+                        "pending" => "◌",
+                        "pass" => "✔",
+                        _ => "·",
+                    };
+                    tr.push((format!("#{}{mark} ", pr.number), ci_color(pr.ci)));
+                }
+                if tr.is_empty() {
+                    tr.push(("no open PRs".into(), DIM));
+                }
+                rows.push(("trade", tr));
+            }
             if g.files > 0 {
                 let mut d = vec![(format!("{} commits · {} files", num(g.commits), num(g.files)), TEXT)];
                 if !g.lang.is_empty() {
@@ -650,10 +762,10 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     let (title, sub, accent, rows) = if let Some(p) = planet_key.as_deref().and_then(|k| w.planet(k)) {
         if let Some(h) = p.host {
             let sub = format!("moon of {} · worktree at {}", w.planets[h].name, tilde(&p.key));
-            (format!("☾ {}", p.name.to_uppercase()), sub, planet_color(p), planet_rows(app, p, t))
+            (format!("☾ {}", p.name.to_uppercase()), sub, planet_color(p), planet_rows(app, w, p, t))
         } else {
             let class = CLASSES[p.terrain as usize % CLASSES.len()];
-            (format!("◉ {}", p.name.to_uppercase()), format!("{class} world · {}", tilde(&p.key)), planet_color(p), planet_rows(app, p, t))
+            (format!("◉ {}", p.name.to_uppercase()), format!("{class} world · {}", tilde(&p.key)), planet_color(p), planet_rows(app, w, p, t))
         }
     } else if let Some(Sel::Sys(k)) = &app.sel
         && let Some(s) = w.systems.iter().find(|s| &s.key == k)

@@ -158,6 +158,8 @@ pub struct World {
     pub systems: Vec<System>,
     pub planets: Vec<Planet>,
     pub lanes: Vec<(usize, usize)>,
+    /// The GitHub trade station, when any world has a GitHub remote.
+    pub station: Option<(f32, f32)>,
 }
 
 impl World {
@@ -802,7 +804,17 @@ impl App {
                 }
             }
         }
-        World { systems, planets, lanes }
+        // the trade station keeps to the edge of known space, up and to the right
+        let traders = planets.iter().any(|p| self.survey.worlds.get(&p.key).is_some_and(|w| w.github));
+        let station = (traders && !systems.is_empty()).then(|| {
+            let maxx = systems.iter().map(|s| s.wpos.0).fold(f32::MIN, f32::max);
+            let miny = systems.iter().map(|s| s.wpos.1).fold(f32::MAX, f32::min);
+            let target = (maxx + spacing * 0.75, miny - spacing * 0.35);
+            let p = self.sys_pos.entry("\0station".into()).or_insert(target);
+            *p = (mixf(p.0, target.0, k), mixf(p.1, target.1, k));
+            *p
+        });
+        World { systems, planets, lanes, station }
     }
 
     /// Outliner order: systems, their planets, their agents (most urgent first).
@@ -853,6 +865,9 @@ impl App {
             x1 = x1.max(s.wpos.0 + r);
             y0 = y0.min(s.wpos.1 - r * 0.55);
             y1 = y1.max(s.wpos.1 + r * 0.55);
+        }
+        if let Some((x, y)) = w.station {
+            (x0, x1, y0, y1) = (x0.min(x - 40.0), x1.max(x + 40.0), y0.min(y - 30.0), y1.max(y + 30.0));
         }
         self.cam.tx = (x0 + x1) * 0.5;
         self.cam.ty = (y0 + y1) * 0.5;
@@ -1213,7 +1228,24 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         }
         if surveyed.elapsed() > Duration::from_millis(500) {
             survey.watch(world.planets.iter().map(|p| p.key.clone()).collect());
-            app.survey = survey.snapshot();
+            let snap = survey.snapshot();
+            for (path, w) in &snap.worlds {
+                for pr in &w.prs {
+                    let before = app.survey.worlds.get(path).and_then(|o| o.prs.iter().find(|p| p.number == pr.number)).map(|p| p.ci);
+                    match (before, pr.ci) {
+                        (Some(b), "fail") if b != "fail" => {
+                            app.say(format!("✖ CI failed on #{} ({}): {}", pr.number, base_name(path), clip(&pr.title, 30)), v3(1.0, 0.4, 0.3));
+                            cues.push(Cue::Blocked);
+                        }
+                        (Some(b), "pass") if b != "pass" => app.say(format!("✔ CI green on #{} ({})", pr.number, base_name(path)), v3(0.4, 0.95, 0.6)),
+                        (None, _) if app.survey.worlds.contains_key(path) && app.survey.worlds[path].github => {
+                            app.say(format!("⛴ PR #{} docked at the station ({})", pr.number, base_name(path)), v3(0.6, 0.85, 1.0))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            app.survey = snap;
             surveyed = Instant::now();
         }
         // a comms target that's gone for good drops you back to the galaxy
