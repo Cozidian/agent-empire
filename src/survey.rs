@@ -26,6 +26,18 @@ pub struct World {
     pub lang: String,
     /// For a linked worktree (a moon): the main worktree it belongs to.
     pub host: Option<String>,
+    /// Has a GitHub remote, so it trades with the station.
+    pub github: bool,
+    /// Your open pull requests there.
+    pub prs: Vec<Pr>,
+}
+
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Pr {
+    pub number: u32,
+    pub title: String,
+    /// pass | fail | pending | none
+    pub ci: &'static str,
 }
 
 /// One usage window of one provider, e.g. claude's 5-hour window.
@@ -54,6 +66,8 @@ pub struct Survey {
 const QUICK: Duration = Duration::from_secs(8);
 const SLOW: Duration = Duration::from_secs(120);
 const USAGE: Duration = Duration::from_secs(15);
+/// GitHub is asked about pull requests this often per world.
+const TRADE: Duration = Duration::from_secs(150);
 
 impl Survey {
     pub fn start() -> Self {
@@ -63,13 +77,14 @@ impl Survey {
         thread::spawn(move || {
             let mut quick: HashMap<String, Instant> = HashMap::new();
             let mut slow: HashMap<String, Instant> = HashMap::new();
+            let mut trade: HashMap<String, Instant> = HashMap::new();
             let mut usage: Option<Instant> = None;
             loop {
                 let want = p.lock().unwrap().clone();
                 for path in &want {
                     let due = |m: &HashMap<String, Instant>, every| m.get(path).is_none_or(|t| t.elapsed() > every);
                     let (q, s) = (due(&quick, QUICK), due(&slow, SLOW));
-                    if !q && !s {
+                    if !q && !s && !due(&trade, TRADE) {
                         continue;
                     }
                     let mut w = d.lock().unwrap().worlds.get(path).cloned().unwrap_or_default();
@@ -80,6 +95,11 @@ impl Survey {
                     if s {
                         size(path, &mut w);
                         slow.insert(path.clone(), Instant::now());
+                    }
+                    // moons share their world's pull requests; ask once per repo
+                    if w.github && w.host.is_none() && due(&trade, TRADE) {
+                        w.prs = prs(path);
+                        trade.insert(path.clone(), Instant::now());
                     }
                     d.lock().unwrap().worlds.insert(path.clone(), w);
                 }
@@ -146,6 +166,7 @@ fn size(path: &str, w: &mut World) {
     if !w.git {
         return;
     }
+    w.github = git(path, &["remote", "get-url", "origin"]).is_some_and(|u| u.contains("github.com"));
     w.commits = git(path, &["rev-list", "--count", "HEAD"]).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let Some(files) = git(path, &["ls-files"]) else { return };
     let mut by: HashMap<&str, u32> = HashMap::new();
@@ -157,6 +178,36 @@ fn size(path: &str, w: &mut World) {
         }
     }
     w.lang = by.into_iter().max_by_key(|&(l, n)| (n, l)).map(|(l, _)| l.to_string()).unwrap_or_default();
+}
+
+/// Your open PRs in the repo at `path`, with their CI verdict.
+fn prs(path: &str) -> Vec<Pr> {
+    let Ok(out) = Command::new("gh")
+        .args(["pr", "list", "--author", "@me", "--limit", "8", "--json", "number,title,statusCheckRollup"])
+        .current_dir(path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let checks: Vec<&serde_json::Value> = p["statusCheckRollup"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+            let word = |c: &serde_json::Value| c["conclusion"].as_str().or(c["state"].as_str()).unwrap_or("").to_uppercase();
+            let ci = if checks.is_empty() {
+                "none"
+            } else if checks.iter().any(|c| matches!(word(c).as_str(), "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED")) {
+                "fail"
+            } else if checks.iter().any(|c| matches!(word(c).as_str(), "" | "PENDING" | "EXPECTED") || c["status"].as_str().is_some_and(|s| s != "COMPLETED")) {
+                "pending"
+            } else {
+                "pass"
+            };
+            Pr { number: p["number"].as_u64().unwrap_or(0) as u32, title: p["title"].as_str().unwrap_or("").into(), ci }
+        })
+        .collect()
 }
 
 fn lang(ext: &str) -> Option<&'static str> {

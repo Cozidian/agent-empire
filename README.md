@@ -83,6 +83,14 @@ with its own ships. Worktrees you made yourself show up as moons too. `D` docks 
 merged back with `--no-ff`, its agents are recalled and the worktree removed. Both sides must be
 committed; a merge conflict is a **collision**: the merge is called off and nothing changes.
 
+## Trade routes
+
+Worlds with a GitHub remote trade with the **GitHub station** at the edge of the galaxy. Unpushed
+commits are freighters on their way to it; your open pull requests (`gh pr list --author @me`, every
+couple of minutes) are docked around it, coloured by CI: green, amber while running, blinking red when
+failing. The station glows the colour of its worst PR, CI turning red or green is reported in the
+situation log, and world cards list unpushed commits and PRs under **trade**.
+
 ## Answering from orbit
 
 When an agent asks something (a permission prompt, "trust this folder?", a y/n), an
