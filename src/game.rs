@@ -6,6 +6,7 @@
 use crate::client::{Client, Cmd, Msg};
 use crate::draw;
 use crate::gfx::*;
+use crate::role::{ROLES, Role};
 use crate::proto::{AgentView, Ask, Mission, Report, ScreenView, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
@@ -185,6 +186,7 @@ pub struct Agent {
     pub report: Report,
     pub ask: Option<Ask>,
     pub war: Vec<War>,
+    pub role: Role,
     pub wpos: (f32, f32),
     /// In front of its planet (drawn after it).
     pub front: bool,
@@ -412,7 +414,8 @@ pub enum Mode {
     /// One order for every agent in a system or on a world.
     Fleet { target: Sel, text: Line },
     /// Writing a mission for a world: hand it to a new ship now, or queue it.
-    Brief { planet: String, text: Line, kind: usize, launch: bool, attachments: Vec<Attachment>, sending: bool },
+    /// `role` is an index into `role::ROLES`, for a ship launched with it.
+    Brief { planet: String, text: Line, kind: usize, launch: bool, role: usize, attachments: Vec<Attachment>, sending: bool },
     /// The situation log in full: filter it, read an entry's details. `id` is the selected entry
     /// (it stays put as news arrives); `typing` edits the search.
     Situation { id: u64, typing: bool },
@@ -695,7 +698,7 @@ impl App {
         }
         // queue it if someone's there to take it, otherwise send a ship
         let crewed = self.agents.iter().any(|a| a.cwd == row.path && a.dying.is_none());
-        self.mode = Mode::Brief { planet: row.path, text, kind: 0, launch: !crewed, attachments: Vec::new(), sending: false };
+        self.mode = Mode::Brief { planet: row.path, text, kind: 0, launch: !crewed, role: 0, attachments: Vec::new(), sending: false };
     }
 
     fn open_trade_row(&mut self, w: &World, index: usize, client: &Client, t: f32) {
@@ -796,7 +799,7 @@ impl App {
                 // a free agent there takes it; with no one there, a ship is sent with it
                 let crewed = self.agents.iter().any(|a| a.cwd == key && a.dying.is_none() && a.status != Status::Exited);
                 let kind = self.kinds.first().cloned().unwrap_or_else(|| "claude".into());
-                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed, attachments: Vec::new(), draft: false });
+                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed, attachments: Vec::new(), draft: false, role: String::new() });
                 self.mode = Mode::Galaxy;
                 self.toast(if crewed { format!("mission queued: {}", clip(&text, 40)) } else { format!("ship launched: {}", clip(&text, 40)) }, t);
             }
@@ -906,7 +909,7 @@ impl App {
         let cwd = a.cwd.clone();
         match act {
             ShipAct::Comms => self.open_comms(id, client, l),
-            ShipAct::Mission => self.mode = Mode::Brief { planet: cwd, text: Line::default(), kind: 0, launch: false, attachments: Vec::new(), sending: false },
+            ShipAct::Mission => self.mode = Mode::Brief { planet: cwd, text: Line::default(), kind: 0, launch: false, role: 0, attachments: Vec::new(), sending: false },
             ShipAct::Priority => self.act(&cwd, Act::Priority(id), client, l, t),
             ShipAct::Decommission => self.mode = Mode::Confirm { id },
         }
@@ -1071,7 +1074,9 @@ impl App {
                     if self.talking_to() != Some(v.id) {
                         cues.push(Cue::Spawn);
                     }
-                    self.say(Ev::Agent, format!("✦ {} arrived at {}", v.kind, base_name(&v.cwd)), kind_color(&v.kind)).on(&v.cwd).by(v.id);
+                    let role = Role::parse(&v.role);
+                    let what = if role == Role::None { v.kind.clone() } else { format!("{} {}", v.kind, role.name()) };
+                    self.say(Ev::Agent, format!("✦ {what} arrived at {}", base_name(&v.cwd)), kind_color(&v.kind)).on(&v.cwd).by(v.id);
                 }
                 self.agents.push(Agent {
                     id: v.id,
@@ -1089,6 +1094,7 @@ impl App {
                     report: v.report.clone(),
                     ask: v.ask.clone(),
                     war: v.war.clone(),
+                    role: Role::parse(&v.role),
                     wpos: (0.0, 0.0),
                     front: true,
                 });
@@ -2108,6 +2114,22 @@ fn handle(
         if activate { app.open_trade_row(w, selected, client, t); }
         return false;
     }
+    // a click on the mission composer's options picks them
+    if let Event::Mouse(me) = &ev
+        && me.kind == MouseEventKind::Down(MouseButton::Left)
+        && let Mode::Brief { text, attachments, launch, role, sending: false, .. } = &mut app.mode
+    {
+        match draw::brief_hit(l, text, attachments.len(), me.column as i32, me.row as i32) {
+            Some(draw::BriefHit::Launch) => *launch = true,
+            Some(draw::BriefHit::Queue) => *launch = false,
+            Some(draw::BriefHit::Role(i)) => {
+                *role = i;
+                *launch = true;
+            }
+            None => {}
+        }
+        return false;
+    }
     let Event::Key(k) = ev else {
         if let Event::Mouse(me) = ev
             && !matches!(app.mode, Mode::Brief { .. })
@@ -2300,7 +2322,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Brief { planet, text, kind, launch, attachments, sending } => {
+        Mode::Brief { planet, text, kind, launch, role, attachments, sending } => {
             if *sending { return false; }
             match k.code {
                 KeyCode::Esc => {
@@ -2338,9 +2360,15 @@ fn handle(
                     }
                 }
                 KeyCode::Tab => *launch = !*launch,
+                // a role is for a new ship, so picking one means launching
+                KeyCode::BackTab => {
+                    *role = (*role + 1) % ROLES.len();
+                    *launch = true;
+                }
                 KeyCode::Enter if !text.s.trim().is_empty() || !attachments.is_empty() => {
                     let prompt = if text.s.trim().is_empty() { "Review the attached screenshots." } else { text.s.trim() };
-                    let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: app.kinds[*kind].clone(), launch: *launch, attachments: attachments.clone(), draft: true };
+                    let role = if *launch { ROLES[*role].name().into() } else { String::new() };
+                    let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: app.kinds[*kind].clone(), launch: *launch, attachments: attachments.clone(), draft: true, role };
                     *sending = true;
                     client.send(cmd);
                 }
@@ -2537,7 +2565,7 @@ fn handle(
             Some(planet) => {
                 // queue it if someone's there to take it, otherwise send a ship
                 let crewed = app.agents.iter().any(|a| a.cwd == planet && a.dying.is_none());
-                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed, attachments: Vec::new(), sending: false };
+                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed, role: 0, attachments: Vec::new(), sending: false };
             }
             None => app.toast("select a world to give it a mission", t),
         },
@@ -2808,7 +2836,7 @@ mod screenshot_tests {
         let attachments = (0..8).map(|i| Attachment { name: format!("screen-{i}.png"), path: format!("/saved/{i}.png") }).collect();
         let mut text = Line::default();
         text.set("Fix the spacing".into());
-        app.mode = Mode::Brief { planet: "/world".into(), text, kind: 0, launch: false, attachments, sending: false };
+        app.mode = Mode::Brief { planet: "/world".into(), text, kind: 0, launch: false, role: 0, attachments, sending: false };
         let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
         let mut fb = Fb::new(80, 24);
         let layout = Lay::new(&fb, false);
@@ -2983,6 +3011,7 @@ mod ship_card_tests {
             report: Default::default(),
             ask: None,
             war: if war { vec![crate::proto::War { rival: 9, files: vec!["src/a.rs".into()] }] } else { vec![] },
+            role: Role::None,
             wpos: (0.0, 0.0),
             front: true,
         }
@@ -3134,5 +3163,28 @@ mod multiline_tests {
     fn wrapped_text_places_the_cursor_after_breaks_and_wraps() {
         let pos = draw::layout("abcd\nef", 3);
         assert_eq!(pos, vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)]);
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn composer_offers_roles_and_a_click_picks_one_and_launches() {
+        let mut app = App::new();
+        app.mode = Mode::Brief { planet: "/world".into(), text: Line::default(), kind: 0, launch: false, role: 0, attachments: Vec::new(), sending: false };
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let mut fb = Fb::new(100, 30);
+        let l = Lay::new(&fb, false);
+        crate::draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let rows: Vec<String> = fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+        let (r, line) = rows.iter().enumerate().find(|(_, r)| r.contains("scout · builder")).expect("role row");
+        let c = line.chars().position(|ch| ch == 'b').unwrap() as u16; // "builder"
+        let click = event::MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: c, row: r as u16, modifiers: KeyModifiers::NONE };
+        let client = Client::isolated();
+        let mut drag = None;
+        handle(&mut app, &world, &l, &client, None, Event::Mouse(click), 1.0, &mut drag);
+        assert!(matches!(app.mode, Mode::Brief { launch: true, role, .. } if ROLES[role] == Role::Builder));
     }
 }

@@ -2,6 +2,7 @@
 //! out who is busy, and serves the game over a unix socket. Agents live as long
 //! as the daemon does, so the game UI can come and go.
 
+use crate::role::Role;
 use crate::proto::*;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -159,6 +160,7 @@ struct Agent {
     /// The last thing it was asked to do, and what's being typed to it now.
     task: String,
     typed: String,
+    role: Role,
 }
 
 impl Agent {
@@ -376,6 +378,7 @@ impl Agent {
             cwd: self.cwd.clone(),
             title: self.parser.callbacks().title.clone(),
             task: self.task.clone(),
+            role: self.role.name().into(),
             status: self.status.name().into(),
             age: (now - self.since).as_secs_f32(),
             turns: self.turns,
@@ -553,6 +556,7 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         worked_at: None,
         task: String::new(),
         typed: String::new(),
+        role: Role::None,
         status: Status::Booting,
         since: now,
         exited: None,
@@ -560,13 +564,14 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
 }
 
 /// Launch an agent in `cwd`, picking up its old session if we have one.
-fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>) -> anyhow::Result<u32> {
+fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>, role: Role) -> anyhow::Result<u32> {
     let id = next_id(hub);
     let exe = exe_path().to_string_lossy().into_owned();
     let pty = native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })?;
-    let (prog, mut args) = command(kind, &exe, resume);
+    let (prog, args) = command(kind, &exe, resume);
+    let mut args = [role.args(kind), args].concat();
     if let Some(p) = prompt {
-        args.push(p.into()); // every species takes an opening prompt as its last argument
+        args.push(role.prompt(kind, p)); // every species takes an opening prompt as its last argument
     }
     let mut cmd = CommandBuilder::new(&prog);
     cmd.args(&args);
@@ -591,6 +596,7 @@ fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Opti
     drop(pty.master);
     let mut agent = new_agent(id, kind, cwd, Pty { master, pid }, ROWS, COLS);
     agent.session = resume.map(String::from);
+    agent.role = role;
     agent.note_task(prompt.unwrap_or(""));
     watch(hub, agent)?;
     Ok(id)
@@ -664,6 +670,8 @@ struct Handoff {
     title: String,
     #[serde(default)]
     task: String,
+    #[serde(default)]
+    role: String,
     status: String,
     age: f32,
     turns: u32,
@@ -697,6 +705,7 @@ fn upgrade(hub: &Shared) -> io::Result<()> {
             screen,
             title: g.parser.callbacks().title.clone(),
             task: g.task.clone(),
+            role: g.role.name().into(),
             status: g.status.name().into(),
             age: (now - g.since).as_secs_f32(),
             turns: g.turns,
@@ -731,6 +740,7 @@ fn adopt(hub: &Shared, file: &str) -> anyhow::Result<()> {
         a.started = now.checked_sub(Duration::from_secs(60)).unwrap_or(now); // long past booting
         a.turns = h.turns;
         a.task = h.task;
+        a.role = Role::parse(&h.role);
         a.report = h.report;
         a.session = h.session;
         watch(hub, a)?;
@@ -745,6 +755,8 @@ struct Saved {
     kind: String,
     cwd: String,
     session: Option<String>,
+    #[serde(default)]
+    role: String,
 }
 
 fn unix_now() -> u64 {
@@ -852,7 +864,7 @@ fn launch_moon(hub: &Shared, cwd: &str, branch: &str, kind: &str) -> Result<u32,
     let p = path.to_string_lossy().into_owned();
     // the moon is still there (its crew left): just send a ship back
     if path.is_dir() && git(&p, &["rev-parse", "--git-dir"]).is_ok() {
-        return spawn(hub, kind, &p, None, None).map_err(|e| e.to_string());
+        return spawn(hub, kind, &p, None, None, Role::None).map_err(|e| e.to_string());
     }
     let exists = git(&top, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
     if exists {
@@ -860,7 +872,7 @@ fn launch_moon(hub: &Shared, cwd: &str, branch: &str, kind: &str) -> Result<u32,
     } else {
         git(&top, &["worktree", "add", "-b", branch, &p])?;
     }
-    spawn(hub, kind, &p, None, None).map_err(|e| e.to_string())
+    spawn(hub, kind, &p, None, None, Role::None).map_err(|e| e.to_string())
 }
 
 /// Merge a moon's branch into its world, then recall its agents and remove it.
@@ -910,7 +922,7 @@ fn save_registry(hub: &Shared, last: &mut Vec<Saved>) {
         .values()
         .filter_map(|a| {
             let g = a.lock().unwrap();
-            g.exited.is_none().then(|| (g.id, Saved { kind: g.kind.clone(), cwd: g.cwd.clone(), session: g.session.clone() }))
+            g.exited.is_none().then(|| (g.id, Saved { kind: g.kind.clone(), cwd: g.cwd.clone(), session: g.session.clone(), role: g.role.name().into() }))
         })
         .collect();
     now.sort_by_key(|(id, _)| *id);
@@ -930,7 +942,7 @@ fn resurrect(hub: &Shared) {
         if std::path::Path::new(&a.cwd).is_dir() {
             // a claude that never got a prompt has nothing to resume
             let session = a.session.filter(|s| a.kind != "claude" || claude_transcript(s));
-            if let Err(e) = spawn(hub, &a.kind, &a.cwd, session.as_deref(), None) {
+            if let Err(e) = spawn(hub, &a.kind, &a.cwd, session.as_deref(), None, Role::parse(&a.role)) {
                 eprintln!("could not bring back {} in {}: {e}", a.kind, a.cwd);
             }
         }
@@ -1069,13 +1081,13 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             });
             Resp::Ok
         }
-        Req::Mission { cwd, text, kind, launch, attachments } => {
+        Req::Mission { cwd, text, kind, launch, attachments, role } => {
             if let Err(msg) = crate::screenshots::validate(&attachments) { return Resp::Err { msg }; }
             let id = hub.lock().unwrap().missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
             let prompt = crate::screenshots::prompt(&text, &attachments);
             let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: None, at: unix_now(), done_at: None, fleet: None };
             if launch {
-                match spawn(hub, &kind, &cwd, None, Some(&prompt)) {
+                match spawn(hub, &kind, &cwd, None, Some(&prompt), Role::parse(&role)) {
                     Ok(aid) => {
                         m.state = "sent".into();
                         m.agent = Some(aid);
@@ -1124,7 +1136,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             hub.lock().unwrap().missions.retain(|m| m.id != id);
             Resp::Ok
         }
-        Req::Spawn { kind, cwd } => match spawn(hub, &kind, &cwd, None, None) {
+        Req::Spawn { kind, cwd } => match spawn(hub, &kind, &cwd, None, None, Role::None) {
             Ok(id) => Resp::Spawned { id },
             Err(e) => Resp::Err { msg: format!("could not launch {kind}: {e}") },
         },
@@ -1584,7 +1596,7 @@ mod screenshot_tests {
         std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
         let attachments = vec![crate::screenshots::Attachment { name: "screenshot.png".into(), path: path.to_str().unwrap().into() }];
         let hub = Shared::default();
-        let request = Req::Mission { cwd: "/world".into(), text: "Fix this".into(), kind: "codex".into(), launch: false, attachments: attachments.clone() };
+        let request = Req::Mission { cwd: "/world".into(), text: "Fix this".into(), kind: "codex".into(), launch: false, attachments: attachments.clone(), role: String::new() };
         assert!(matches!(handle(&hub, request.clone()), Resp::Ok));
         assert_eq!(hub.lock().unwrap().missions[0].attachments, attachments);
         std::fs::remove_file(path).unwrap();

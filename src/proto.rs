@@ -47,6 +47,9 @@ pub enum Req {
         cwd: String, text: String, kind: String, launch: bool,
         #[serde(default)]
         attachments: Vec<crate::screenshots::Attachment>,
+        /// A newly launched ship's role (see `role::Role`), "" for none.
+        #[serde(default)]
+        role: String,
     },
     /// One order to many agents at once, followed as one fleet order.
     Broadcast { ids: Vec<u32>, text: String },
@@ -69,6 +72,9 @@ pub struct AgentView {
     /// The last prompt it was given (typed in comms, a mission, a fleet order).
     #[serde(default)]
     pub task: String,
+    /// What it's for (see `role::Role`), "" for none.
+    #[serde(default)]
+    pub role: String,
     /// booting | working | blocked | done | idle | exited
     pub status: String,
     /// Seconds since the status last changed.
