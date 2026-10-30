@@ -66,6 +66,14 @@ When an agent asks something (a permission prompt, "trust this folder?", a y/n),
 **incoming transmission** pops up over the galaxy with what it's about and the choices.
 Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one waiting.
 
+## When the galaxy is closed
+
+- **Desktop notifications** (`notify-send`) when an agent is blocked, or finishes a turn longer than
+  15 seconds. A question's choices become buttons on the notification: answer without opening
+  anything. They pause while a galaxy is open, which does its own alerting.
+- **`empire status`** prints one line for a status bar (`▲1 ✔2 ◆3`); `empire status --json` gives
+  waybar-style `{text, tooltip, class}` with every agent in the tooltip.
+
 ## Stats
 
 - **Resources** (top bar): how much of your Claude 5-hour / weekly and Codex allowance is used,

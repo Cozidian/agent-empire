@@ -11,6 +11,8 @@ use std::time::Duration;
 pub enum Req {
     Ping,
     List,
+    /// The agent list, for onlookers (status bars) that shouldn't count as a galaxy being open.
+    Peek,
     Spawn { kind: String, cwd: String },
     Kill { id: u32 },
     Input { id: u32, data: String },

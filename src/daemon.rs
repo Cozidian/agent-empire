@@ -24,6 +24,8 @@ const BOOT: f32 = 4.0;
 const ECHO: f32 = 0.4;
 /// Lines of history kept per agent for scrolling back in comms.
 const HISTORY: usize = 5000;
+/// Turns shorter than this finishing aren't worth a desktop notification.
+const DESKTOP_TURN: u64 = 15;
 /// The build this daemon was started from (see `build_id`).
 static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -144,6 +146,10 @@ struct Agent {
     exited: Option<Instant>,
     turns: u32,
     report: Report,
+    /// The status we last told the desktop about.
+    told: Status,
+    /// When the current turn started.
+    worked_at: Option<Instant>,
 }
 
 impl Agent {
@@ -151,6 +157,9 @@ impl Agent {
         if self.status != s {
             if s == Status::Done {
                 self.turns += 1;
+            }
+            if s == Status::Working && self.status != Status::Blocked {
+                self.worked_at = Some(Instant::now());
             }
             self.status = s;
             self.since = Instant::now();
@@ -390,6 +399,8 @@ fn rgb(c: vt100::Color, bold: bool) -> Option<[u8; 3]> {
 struct Hub {
     agents: HashMap<u32, Arc<Mutex<Agent>>>,
     next: u32,
+    /// When a galaxy last asked for the agent list: while one is open, it does the alerting.
+    watched: Option<Instant>,
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -461,6 +472,8 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         answered: None,
         turns: 0,
         report: Report::default(),
+        told: Status::Booting,
+        worked_at: None,
         status: Status::Booting,
         since: now,
         exited: None,
@@ -627,6 +640,7 @@ fn adopt(hub: &Shared, file: &str) -> anyhow::Result<()> {
         a.parser.callbacks_mut().title = h.title;
         a.parser.callbacks_mut().replies.clear();
         a.status = Status::parse(&h.status);
+        a.told = a.status;
         a.since = now.checked_sub(Duration::from_secs_f32(h.age)).unwrap_or(now);
         a.started = now.checked_sub(Duration::from_secs(60)).unwrap_or(now); // long past booting
         a.turns = h.turns;
@@ -775,8 +789,11 @@ fn handle(hub: &Shared, req: Req) -> Resp {
     let missing = |id: u32| Resp::Err { msg: format!("no agent #{id}") };
     match req {
         Req::Ping => Resp::Pong { version: BUILD.get().cloned().unwrap_or_default() },
-        Req::List => {
+        Req::List | Req::Peek => {
             let now = Instant::now();
+            if matches!(req, Req::List) {
+                hub.lock().unwrap().watched = Some(now);
+            }
             let list: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
             let mut agents: Vec<AgentView> = list.iter().map(|a| a.lock().unwrap().view(now)).collect();
             agents.sort_by_key(|a| a.id);
@@ -971,9 +988,17 @@ pub fn run() -> io::Result<()> {
             let now = Instant::now();
             let list: Vec<(u32, Arc<Mutex<Agent>>)> = h.lock().unwrap().agents.iter().map(|(k, v)| (*k, v.clone())).collect();
             let mut dead = Vec::new();
+            let watched = h.lock().unwrap().watched.is_some_and(|w| now - w < Duration::from_secs(3));
             for (id, a) in list {
                 let mut g = a.lock().unwrap();
                 g.update(now);
+                if g.status != g.told {
+                    g.told = g.status;
+                    let long = g.worked_at.is_some_and(|w| now - w > Duration::from_secs(DESKTOP_TURN));
+                    if !watched && (g.status == Status::Blocked || (g.status == Status::Done && long)) {
+                        alert(&h, &g);
+                    }
+                }
                 if g.exited.is_some_and(|e| now - e > Duration::from_secs(6)) {
                     dead.push(id);
                 }
@@ -1050,6 +1075,72 @@ pub fn statusline() {
             let _ = child.wait();
         }
     }
+}
+
+/// A desktop notification for an agent that needs you. A question's choices
+/// become buttons, so it can be answered right from the notification.
+fn alert(hub: &Shared, a: &Agent) {
+    let place = crate::game::base_name(&a.cwd);
+    let (title, body, urgency, ask) = if a.status == Status::Blocked {
+        let ask = a.ask();
+        let body = ask.as_ref().map(|q| q.context.iter().chain([&q.question]).cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default();
+        (format!("▲ {} on {place} awaits orders", a.kind), body, "critical", ask)
+    } else {
+        let title = a.parser.callbacks().title.clone();
+        (format!("✔ {} finished on {place}", a.kind), title, "normal", None)
+    };
+    let (id, hub) = (a.id, hub.clone());
+    thread::spawn(move || {
+        let mut cmd = std::process::Command::new("notify-send");
+        cmd.args(["-a", "Agent Empire", "-u", urgency, &title, &body]);
+        let options = ask.map(|q| q.options).unwrap_or_default();
+        for (i, o) in options.iter().take(3).enumerate() {
+            cmd.arg(format!("--action={i}={}", o.label));
+        }
+        let Ok(out) = cmd.stderr(std::process::Stdio::null()).output() else { return };
+        // a button was pressed: answer the agent, if it's still asking
+        let Ok(i) = String::from_utf8_lossy(&out.stdout).trim().parse::<usize>() else { return };
+        let (Some(o), Some(a)) = (options.get(i), hub.lock().unwrap().agents.get(&id).cloned()) else { return };
+        let mut g = a.lock().unwrap();
+        if g.status == Status::Blocked {
+            g.answered = g.question();
+            g.hook = None;
+            let _ = g.writer.write_all(o.key.as_bytes());
+        }
+    });
+}
+
+/// `empire status`: one line for a status bar (`--json`: waybar-style JSON).
+pub fn status(json: bool) {
+    let agents = match call(&Req::Peek) {
+        Ok(Resp::Agents { agents }) => agents,
+        _ => {
+            if json {
+                println!(r#"{{"text":"","tooltip":"empire daemon offline","class":"offline"}}"#);
+            }
+            return;
+        }
+    };
+    let n = |s: &str| agents.iter().filter(|a| a.status == s).count();
+    let parts: Vec<String> = [("blocked", "▲"), ("done", "✔"), ("working", "◆"), ("idle", "○")]
+        .iter()
+        .filter(|(s, _)| n(s) > 0)
+        .map(|(s, g)| format!("{g}{}", n(s)))
+        .collect();
+    let text = parts.join(" ");
+    if !json {
+        println!("{text}");
+        return;
+    }
+    let tip: Vec<String> = agents
+        .iter()
+        .map(|a| {
+            let what = a.ask.as_ref().map(|q| q.question.clone()).unwrap_or_else(|| a.title.clone());
+            format!("{} {} @ {} — {what}", a.status, a.kind, crate::game::base_name(&a.cwd))
+        })
+        .collect();
+    let class = ["blocked", "done", "working"].into_iter().find(|s| n(s) > 0).unwrap_or("idle");
+    println!("{}", serde_json::json!({ "text": text, "tooltip": tip.join("\n"), "class": class, "alt": class }));
 }
 
 /// Make sure the running daemon is this build, upgrading it in place (agents and
