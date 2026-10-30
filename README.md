@@ -108,6 +108,14 @@ stay on the map as **dormant** planets (◌ in the outliner), and the longer the
 agents, no commits) the more they grey out, until after a few weeks they're lost in a violet nebula.
 The map shows where your attention has been. `e` sends a ship back; `X` forgets a world.
 
+## Victory and development
+
+Worlds earn **prestige** for real progress: +2 for every completed mission, +1 when the work tree
+goes from dirty to all committed (with agents there), +1 when a PR's CI turns green, +5 for a merged
+PR. Prestige develops a world, with a fanfare on every level: **outpost → colony** (rings, at 4)
+**→ city world** (city lights on its night side, 12) **→ ecumenopolis** (25), whose star gets a
+Dyson swarm. The world card shows its development and how far the next level is.
+
 ## Answering from orbit
 
 When an agent asks something (a permission prompt, "trust this folder?", a y/n), an

@@ -214,7 +214,16 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
             let (alb, emit, atm) = terrain(p.terrain, lon, dy, p.seed);
             let ndl = dx * l.x + dy * l.y + nz * l.z;
             let day = smoothstep(-0.12, 0.5, ndl);
-            let c = alb * (0.035 + 1.05 * day) + emit * (1.0 - 0.6 * day) + atm * (1.0 - nz).powi(3) * 0.9 * day;
+            let mut c = alb * (0.035 + 1.05 * day) + emit * (1.0 - 0.6 * day) + atm * (1.0 - nz).powi(3) * 0.9 * day;
+            // a city world glitters on its night side
+            if p.level >= 2 && day < 0.35 {
+                let cell = ((lon * 16.0).floor() as i32, (dy * 12.0).floor() as i32);
+                let lit = rnd((cell.0 as u32).wrapping_mul(73_856_093) ^ (cell.1 as u32).wrapping_mul(19_349_663) ^ p.seed.to_bits());
+                let density = if p.level >= 3 { 0.45 } else { 0.72 };
+                if lit > density && fract(lon * 16.0) < 0.5 && fract(dy * 12.0) < 0.5 {
+                    c += v3(1.0, 0.75, 0.35) * (0.35 - day) * 2.2;
+                }
+            }
             // a neglected world goes grey and dim under the fog
             let grey = s3((c.x + c.y + c.z) / 3.0);
             fb.px[i] = mix(c, mix(grey, v3(0.35, 0.3, 0.5) * grey.x * 2.0, 0.5), p.fog) * (1.0 - 0.7 * p.fog);
@@ -297,6 +306,14 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
             ellipse(fb, sx, sy, r * z, r * 0.55 * z, v3(0.03, 0.065, 0.085));
         }
         let rs = (8.0 * z).max(2.2);
+        if s.planets.iter().any(|&i| w.planets[i].level >= 3) {
+            for k in 0..36 {
+                let a = k as f32 / 36.0 * TAU + t * 0.4 * if k % 2 == 0 { 1.0 } else { -0.7 };
+                let tilt = (k % 3) as f32 * 0.35;
+                let rr = rs * (2.3 + 0.25 * (k % 3) as f32);
+                fb.splat(sx + a.cos() * rr, sy + a.sin() * rr * (0.35 + tilt), v3(1.0, 0.8, 0.35) * 0.8);
+            }
+        }
         orb(fb, sx, sy, rs, s.star * 1.5);
         circle(fb, sx, sy, rs * 1.9, s.star * 0.12);
     }
@@ -315,8 +332,29 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 }
             }
         };
+        let rings = |front: bool, fb: &mut Fb| {
+            if p.level == 0 || p.dormant && p.fog > 0.6 {
+                return;
+            }
+            let bands = if p.level >= 3 { 3 } else { p.level as usize };
+            for b in 0..bands {
+                let rr = r * (1.55 + 0.22 * b as f32);
+                let n = (rr * 7.0) as usize + 24;
+                for k in 0..n {
+                    let a = k as f32 / n as f32 * TAU;
+                    if (a.sin() > 0.0) != front {
+                        continue;
+                    }
+                    let (x, y) = (px + a.cos() * rr, py + a.sin() * rr * 0.28);
+                    let col = [v3(0.85, 0.75, 0.55), v3(0.7, 0.8, 0.95), v3(1.0, 0.85, 0.4)][b] * (0.35 + 0.15 * (k % 3) as f32);
+                    fb.splat(x, y, col);
+                }
+            }
+        };
         ships(false, fb);
+        rings(false, fb);
         sphere(fb, px, py, r, p, (lx / ll, ly / ll), t);
+        rings(true, fb);
         let live = || p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none());
         if live().any(|a| a.status == Status::Blocked) {
             circle(fb, px, py, r + 3.5, Status::Blocked.color() * (0.4 + 0.4 * (t * 4.0).sin().abs()));
@@ -728,11 +766,22 @@ fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
                 if !g.lang.is_empty() {
                     d.push((format!(" · {}", g.lang), v3(0.8, 0.7, 1.0)));
                 }
-                rows.push(("development", d));
+                rows.push(("size", d));
             }
         }
         Some(_) => rows.push(("dock", vec![("no git — uncharted territory".into(), DIM)])),
         None => rows.push(("dock", vec![("surveying…".into(), DIM)])),
+    }
+    if p.host.is_none() {
+        let pts = app.prestige.worlds.get(&p.key).copied().unwrap_or(0);
+        let lv = level_of(pts) as usize;
+        let mut row = vec![(format!("★ {} ", LEVELS[lv].1), v3(1.0, 0.85, 0.4)), (format!("{pts} prestige"), TEXT)];
+        if let Some((need, next)) = LEVELS.get(lv + 1) {
+            let lo = LEVELS[lv].0;
+            row.push((format!("  {} ", meter((pts - lo) as f32 / (need - lo) as f32, 6)), v3(1.0, 0.85, 0.4)));
+            row.push((format!("{next} at {need}"), DIM));
+        }
+        rows.push(("development", row));
     }
     if p.dormant && p.host.is_none() {
         let age = ago((survey::now() as u64).saturating_sub(p.last_seen) as f32);
@@ -1140,7 +1189,7 @@ fn dock(fb: &mut Fb, app: &App, moon: &str, l: &Lay) {
     let s = app.survey.worlds.get(moon);
     let branch = s.map_or(String::new(), |s| s.branch.clone());
     let host = s.and_then(|s| s.host.clone()).map(|h| base_name(&h)).unwrap_or_default();
-    frame_box(fb, x, y, w, h, &format!("⚓ DOCK MOON {}", branch.to_uppercase()), accent);
+    frame_box(fb, x, y, w, h, &format!("⊕ DOCK MOON {}", branch.to_uppercase()), accent);
     seg(fb, x + 3, y + 2, &format!("Merge branch {branch} into {host}, then recall the moon's"), w - 6, TEXT, Some(BOX));
     seg(fb, x + 3, y + 3, "agents and remove its worktree.", w - 6, TEXT, Some(BOX));
     seg(fb, x + 3, y + 5, "Both need to be committed. A merge conflict is a collision:", w - 6, DIM, Some(BOX));
