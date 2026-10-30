@@ -43,7 +43,11 @@ pub enum Req {
     Shutdown,
     /// A new mission for the world at `cwd`: launch a ship with it right away, or queue it
     /// for the next agent there that's free.
-    Mission { cwd: String, text: String, kind: String, launch: bool },
+    Mission {
+        cwd: String, text: String, kind: String, launch: bool,
+        #[serde(default)]
+        attachments: Vec<crate::screenshots::Attachment>,
+    },
     /// One order to many agents at once, followed as one fleet order.
     Broadcast { ids: Vec<u32>, text: String },
     /// Found a moon: a git worktree of the world at `cwd` on `branch`, with an agent on it.
@@ -92,6 +96,8 @@ pub struct Mission {
     pub id: u32,
     pub cwd: String,
     pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<crate::screenshots::Attachment>,
     /// queued | sent | active | done
     pub state: String,
     pub agent: Option<u32>,
@@ -221,4 +227,29 @@ impl Conn {
 /// One-shot request on a fresh connection.
 pub fn call(req: &Req) -> io::Result<Resp> {
     Conn::open()?.call(req)
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[test]
+    fn old_requests_and_saved_missions_remain_readable() {
+        let request: Req = serde_json::from_str(r#"{"op":"mission","cwd":"/world","text":"fix it","kind":"codex","launch":false}"#).unwrap();
+        assert!(matches!(request, Req::Mission { attachments, .. } if attachments.is_empty()));
+        let mission: Mission = serde_json::from_str(r#"{"id":1,"cwd":"/world","text":"fix it","state":"queued","agent":null,"at":0,"done_at":null}"#).unwrap();
+        assert!(mission.attachments.is_empty());
+    }
+
+    #[test]
+    fn attachment_references_survive_mission_persistence() {
+        let mission = Mission {
+            text: "Fix the screenshot".into(),
+            attachments: vec![crate::screenshots::Attachment { name: "screenshot.png".into(), path: "/saved/123.png".into() }],
+            ..Mission::default()
+        };
+        let restored: Mission = serde_json::from_str(&serde_json::to_string(&mission).unwrap()).unwrap();
+        assert_eq!(restored, mission);
+        assert!(crate::screenshots::prompt(&restored.text, &restored.attachments).contains("/saved/123.png"));
+    }
 }

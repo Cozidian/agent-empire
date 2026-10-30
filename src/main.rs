@@ -6,6 +6,7 @@ mod gfx;
 mod octant;
 mod proto;
 mod sound;
+mod screenshots;
 mod survey;
 
 use proto::{Req, call};

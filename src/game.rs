@@ -9,6 +9,7 @@ use crate::gfx::*;
 use crate::proto::{AgentView, Ask, Mission, Report, ScreenView, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
+use crate::screenshots::{self, Attachment};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode,
     KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -199,6 +200,16 @@ pub struct Line {
 }
 
 impl Line {
+    fn paste(&mut self, text: &str) {
+        let clean: String = text.chars().filter_map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' { Some(' ') }
+            else if c.is_control() { None } else { Some(c) }
+        }).collect();
+        let byte = self.byte(self.cur);
+        self.s.insert_str(byte, &clean);
+        self.cur += clean.chars().count();
+    }
+
     fn byte(&self, i: usize) -> usize {
         self.s.char_indices().nth(i).map_or(self.s.len(), |(b, _)| b)
     }
@@ -300,7 +311,7 @@ pub enum Mode {
     /// One order for every agent in a system or on a world.
     Fleet { target: Sel, text: Line },
     /// Writing a mission for a world: hand it to a new ship now, or queue it.
-    Brief { planet: String, text: Line, kind: usize, launch: bool },
+    Brief { planet: String, text: Line, kind: usize, launch: bool, attachments: Vec<Attachment>, sending: bool },
     Help,
 }
 
@@ -587,7 +598,7 @@ impl App {
                 // a free agent there takes it; with no one there, a ship is sent with it
                 let crewed = self.agents.iter().any(|a| a.cwd == key && a.dying.is_none() && a.status != Status::Exited);
                 let kind = self.kinds.first().cloned().unwrap_or_else(|| "claude".into());
-                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed });
+                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed, attachments: Vec::new(), draft: false });
                 self.mode = Mode::Galaxy;
                 self.toast(if crewed { format!("mission queued: {}", clip(&text, 40)) } else { format!("ship launched: {}", clip(&text, 40)) }, t);
             }
@@ -1429,6 +1440,19 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         let mut cues = Vec::new();
         while let Ok(m) = client.rx.try_recv() {
             match m {
+                Msg::MissionResult(result) => {
+                    match result {
+                        Ok(()) => {
+                            let launched = matches!(app.mode, Mode::Brief { launch: true, .. });
+                            app.mode = Mode::Galaxy;
+                            app.toast(if launched { "mission launched" } else { "mission queued" }, t);
+                        }
+                        Err(e) => {
+                            if let Mode::Brief { sending, .. } = &mut app.mode { *sending = false; }
+                            app.toast(e, t);
+                        }
+                    }
+                }
                 Msg::Agents(list, missions) => {
                     app.apply(list, t, &mut cues);
                     app.track(missions, &mut cues);
@@ -1588,6 +1612,23 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
     }
 }
 
+fn attach_paths(attachments: &mut Vec<Attachment>, paths: &[PathBuf], dir: &Path) -> Result<(), String> {
+    if attachments.len() + paths.len() > screenshots::MAX_ATTACHMENTS {
+        return Err("Attach up to 8 screenshots per mission".into());
+    }
+    attachments.extend(screenshots::import(paths, dir)?);
+    Ok(())
+}
+
+fn paste_brief(text: &mut Line, attachments: &mut Vec<Attachment>, pasted: &str, dir: &Path) -> Result<(), String> {
+    if let Some(paths) = screenshots::dropped_paths(pasted) {
+        attach_paths(attachments, &paths, dir)
+    } else {
+        text.paste(pasted);
+        Ok(())
+    }
+}
+
 /// Handle one input event. Returns true to quit.
 #[allow(clippy::too_many_arguments)]
 fn handle(
@@ -1649,8 +1690,18 @@ fn handle(
         return false;
     }
 
+    if let Event::Paste(pasted) = &ev {
+        if let Mode::Brief { text, attachments, sending: false, .. } = &mut app.mode {
+            if let Err(e) = paste_brief(text, attachments, pasted, &screenshots::directory()) {
+                app.toast(e, t);
+            }
+        }
+        return false;
+    }
     let Event::Key(k) = ev else {
-        if let Event::Mouse(me) = ev {
+        if let Event::Mouse(me) = ev
+            && !matches!(app.mode, Mode::Brief { .. })
+        {
             mouse(app, w, l, client, me, drag);
         }
         return false;
@@ -1740,7 +1791,9 @@ fn handle(
                 }
                 KeyCode::Right | KeyCode::Char('l') => open.extend(log.get(s).map(|m| m.0)),
                 KeyCode::Left | KeyCode::Char('h') => {
-                    log.get(s).map(|m| open.remove(&m.0));
+                    if let Some((id, _)) = log.get(s) {
+                        open.remove(id);
+                    }
                 }
                 KeyCode::Char('e') => {
                     if open.len() < log.len() {
@@ -1806,18 +1859,41 @@ fn handle(
             }
             return false;
         }
-        Mode::Brief { planet, text, kind, launch } => {
+        Mode::Brief { planet, text, kind, launch, attachments, sending } => {
+            if *sending { return false; }
             match k.code {
-                KeyCode::Esc => app.mode = Mode::Galaxy,
+                KeyCode::Esc => {
+                    screenshots::discard(attachments);
+                    app.mode = Mode::Galaxy;
+                }
+                KeyCode::Char('v') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let result = if attachments.len() >= screenshots::MAX_ATTACHMENTS {
+                        Err("Attach up to 8 screenshots per mission".into())
+                    } else { screenshots::clipboard(&screenshots::directory()) };
+                    match result {
+                        Ok(image) => attachments.push(image),
+                        Err(e) => app.toast(e, t),
+                    }
+                }
+                KeyCode::Char('x') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(image) = attachments.pop() { screenshots::discard(&[image]); }
+                }
+                KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(paths) = screenshots::dropped_paths(&text.s) {
+                        match attach_paths(attachments, &paths, &screenshots::directory()) {
+                            Ok(()) => *text = Line::default(),
+                            Err(e) => app.toast(e, t),
+                        }
+                    } else { app.toast("Type an image file path, then Ctrl+O to attach it", t); }
+                }
                 KeyCode::Up => *kind = (*kind + nk - 1) % nk,
                 KeyCode::Down => *kind = (*kind + 1) % nk,
                 KeyCode::Tab => *launch = !*launch,
-                KeyCode::Enter if !text.s.trim().is_empty() => {
-                    let cmd = Cmd::Mission { cwd: planet.clone(), text: text.s.trim().to_string(), kind: app.kinds[*kind].clone(), launch: *launch };
-                    let msg = if *launch { "mission launched" } else { "mission queued" };
+                KeyCode::Enter if !text.s.trim().is_empty() || !attachments.is_empty() => {
+                    let prompt = if text.s.trim().is_empty() { "Review the attached screenshots." } else { text.s.trim() };
+                    let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: app.kinds[*kind].clone(), launch: *launch, attachments: attachments.clone(), draft: true };
+                    *sending = true;
                     client.send(cmd);
-                    app.mode = Mode::Galaxy;
-                    app.toast(msg, t);
                 }
                 _ => {
                     text.key(&k);
@@ -2006,7 +2082,7 @@ fn handle(
             Some(planet) => {
                 // queue it if someone's there to take it, otherwise send a ship
                 let crewed = app.agents.iter().any(|a| a.cwd == planet && a.dying.is_none());
-                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed };
+                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed, attachments: Vec::new(), sending: false };
             }
             None => app.toast("select a world to give it a mission", t),
         },
@@ -2108,4 +2184,53 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
     let planets = w.planets.iter().map(|p| (dist(p.wpos), (p.r * z).max(4.0) + 3.0, Sel::Planet(p.key.clone()))).collect();
     let stars = w.systems.iter().map(|s| (dist(s.wpos), (9.0 * z).max(4.0) + 4.0, Sel::Sys(s.key.clone()))).collect();
     nearest(ships).or_else(|| nearest(planets)).or_else(|| nearest(stars))
+}
+
+#[cfg(test)]
+mod screenshot_tests {
+    use super::*;
+
+    #[test]
+    fn mission_paste_keeps_text_and_imports_dropped_images() {
+        let dir = std::env::temp_dir().join(format!("empire-mission-paste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("screen shot.png");
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let mut text = Line::default();
+        text.set("Fix æ layout".into());
+        text.cur = 5;
+        let mut images = Vec::new();
+        paste_brief(&mut text, &mut images, "new\n", &dir.join("stored")).unwrap();
+        assert_eq!(text.s, "Fix ænew  layout");
+        paste_brief(&mut text, &mut images, &format!("'{}'", source.display()), &dir.join("stored")).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(text.s, "Fix ænew  layout");
+        assert_ne!(images[0].path, source.to_str().unwrap());
+        let original = images.clone();
+        assert!(paste_brief(&mut text, &mut images, "/missing/shot.png", &dir).is_err());
+        assert_eq!(images, original);
+        screenshots::discard(&images);
+        assert!(!Path::new(&images[0].path).exists());
+        assert!(source.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mission_composer_keeps_controls_visible_with_eight_images() {
+        let mut app = App::new();
+        let attachments = (0..8).map(|i| Attachment { name: format!("screen-{i}.png"), path: format!("/saved/{i}.png") }).collect();
+        let mut text = Line::default();
+        text.set("Fix the spacing".into());
+        app.mode = Mode::Brief { planet: "/world".into(), text, kind: 0, launch: false, attachments, sending: false };
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let mut fb = Fb::new(80, 24);
+        let layout = Lay::new(&fb, false);
+        crate::draw::frame(&mut fb, &mut app, &world, &layout, 1.0, None);
+        let rows: Vec<String> = fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+        assert!(rows.iter().any(|r| r.contains("8 total")));
+        assert!(rows.iter().any(|r| r.contains("screen-7.png")));
+        assert!(rows.iter().any(|r| r.contains("queue it")));
+        assert!(rows.iter().any(|r| r.contains("Ctrl+V") && r.contains("Ctrl+X")));
+        assert!(rows.iter().any(|r| r.contains("give orders")));
+    }
 }

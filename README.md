@@ -84,8 +84,22 @@ under way (◆), waiting (○) and done (★). Missions survive restarts.
 A mission goes to **one** agent: the first free one on that world. To give every agent there the
 same order, use a fleet order.
 
+In the mission composer, **drop screenshot files** onto the terminal or press **Ctrl+V** to
+attach a PNG image from the clipboard (`wl-paste` on Wayland, `xclip` on X11). File drops support
+PNG, JPEG, WebP and GIF, up to 8 images of 20 MiB each. If your terminal types a dropped path
+instead of pasting it, press **Ctrl+O** to attach the path from the prompt field. **Ctrl+X** removes
+the last attachment; Esc discards the draft and its image copies.
+
+Empire saves private copies under `$XDG_STATE_HOME/empire/screenshots` (normally
+`~/.local/state/empire/screenshots`), so queued missions can use them after the originals move or
+disappear. The agent receives local image paths with instructions to inspect them; it needs image
+viewing tools to use them. Submitted images are retained, and their names appear in the expanded
+mission log.
+
 `L` opens the **mission log**: what's under way (and who's on it), what's queued and in what order,
-and what's done. `⏎` opens comms with a mission's agent, `x` calls a queued one off.
+and what's done. `⏎` opens comms with a mission's agent, `x` calls a queued one off. `␣` expands a
+mission to its full text, its world, fleet order, agent and times (`e` expands them all), and `s`
+groups the log by status, world, solar system or fleet order.
 
 ## Needs and quick actions
 
