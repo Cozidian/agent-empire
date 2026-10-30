@@ -21,6 +21,15 @@ The daemon starts automatically the first time you open the galaxy. Agents live 
 so **quitting the UI doesn't kill them**: reopen `empire` and your empire is still there.
 `empire stop` shuts the daemon down and recalls every agent.
 
+Agents also survive the daemon itself:
+
+- **New build?** Opening the galaxy (or `empire upgrade`) swaps the running daemon for the new
+  binary *in place*: it `exec`s itself with the same pid, so every agent stays its child, their
+  terminals carry over, and their screens are replayed. Nothing restarts.
+- **Reboot or crash?** The daemon keeps a list of running agents and their session ids, and on its
+  next start brings them back with `claude --resume`, `codex resume` or `grok --resume`.
+  `empire stop` clears that list, so a deliberate stop stays stopped.
+
 ## Playing
 
 | key              | action                                                              |
