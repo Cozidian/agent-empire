@@ -6,7 +6,6 @@ mod gfx;
 mod octant;
 mod proto;
 mod sound;
-mod spectate;
 mod survey;
 
 use proto::{Req, call};
@@ -18,8 +17,6 @@ const HELP: &str = "empire — a galaxy of coding agents
   empire daemon    run the agent host in the foreground
   empire status    one line for a status bar: ▲ blocked ✔ done ◆ working ○ idle
                    (--json: waybar-style {text, tooltip, class})
-  empire spectate  a read-only live web view for someone watching along (localhost
-                   unless --bind ADDR; --port N, default 7777; needs the printed link)
   empire upgrade   swap a running daemon for this build, keeping every agent
                    (the galaxy does this by itself when it starts)
   empire stop      shut down the daemon and every agent in it (they won't come back)
@@ -37,7 +34,6 @@ fn main() -> io::Result<()> {
             daemon::statusline();
             Ok(())
         }
-        Some("spectate") => spectate::run(&args[1..]),
         Some("status") => {
             daemon::status(args.iter().any(|a| a == "--json"));
             Ok(())

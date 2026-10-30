@@ -45,6 +45,8 @@ Agents also survive the daemon itself:
 | `D`              | **dock** the selected moon: merge its branch back in and retire it   |
 | `P`              | give the selected agent **priority** in a border conflict            |
 | `X`              | forget the selected dormant world                                   |
+| `r`              | what the selected world **needs**, as quick actions                |
+| `L`              | the **mission log**: under way, queued (in order), done             |
 | `T`              | strike finished missions on the selected world from its log         |
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
@@ -73,6 +75,20 @@ Every world keeps a quest log. Press `t` on a world and write what should happen
 ship launches with it as its opening prompt, or it waits in the queue and the next agent there that
 is free gets it. A mission is complete when its agent finishes the turn; the world card lists what's
 under way (◆), waiting (○) and done (★). Missions survive restarts.
+
+A mission goes to **one** agent: the first free one on that world. To give every agent there the
+same order, use a fleet order.
+
+`L` opens the **mission log**: what's under way (and who's on it), what's queued and in what order,
+and what's done. `⏎` opens comms with a mission's agent, `x` calls a queued one off.
+
+## Needs and quick actions
+
+Every world shows what it needs from you right under its name on the map: `✖#42` failing CI, `±7`
+uncommitted files, `↑2` unpushed, `↓3` behind upstream, `⚔` a border conflict, plus `★` missions
+under way and `☆` queued. The world card lists them in full. `r` opens them as **quick actions**:
+one key sends the orders (as a mission for a free agent there, or a new ship if there's no one),
+opens comms with an agent that's waiting, or settles a conflict.
 
 A **fleet order** (`b` on a system or world) goes to every ship there at once (except ones waiting
 on an answer). The cards show its progress, and the situation log reports when the whole fleet is done.
@@ -115,13 +131,6 @@ goes from dirty to all committed (with agents there), +1 when a PR's CI turns gr
 PR. Prestige develops a world, with a fanfare on every level: **outpost → colony** (rings, at 4)
 **→ city world** (city lights on its night side, 12) **→ ecumenopolis** (25), whose star gets a
 Dyson swarm. The world card shows its development and how far the next level is.
-
-## Spectating
-
-`empire spectate` serves a read-only live web view of the empire (an animated galaxy, the fleet,
-questions waiting and missions) for someone watching along. It listens on localhost unless you pass
-`--bind ADDR` (`--port N`, default 7777), answers only requests with the token in the link it
-prints, and never shows an agent's screen.
 
 ## Answering from orbit
 
@@ -169,5 +178,4 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
 - `draw.rs`: procedural dithered planets, ships, outliner, situation log, dialogs, comms.
 - `survey.rs`: background git survey of every world (status, size, worktrees, PRs via `gh`) and
   Claude/Codex usage.
-- `spectate.rs`: the read-only web view.
 - `gfx.rs` / `octant.rs`: the octant renderer from mission-control. `sound.rs`: robot cues.
