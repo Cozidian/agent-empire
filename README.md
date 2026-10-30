@@ -87,6 +87,11 @@ ship launches with it as its opening prompt, or it waits in the queue and the ne
 is free gets it. A mission is complete when its agent finishes the turn; the world card lists what's
 under way (◆), waiting (○) and done (★). Missions survive restarts.
 
+A mission can span several lines: `Shift+⏎` or `Alt+⏎` starts a new one (`Ctrl+J` in terminals
+that send the same thing for `Shift+⏎` as for `⏎`), and pasted text keeps its line breaks. The text
+wraps and grows to eight lines, then scrolls; `↑↓` move between its lines, and past the first or
+last they pick the species.
+
 A mission goes to **one** agent: the first free one on that world. To give every agent there the
 same order, use a fleet order.
 
