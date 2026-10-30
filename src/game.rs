@@ -781,7 +781,8 @@ impl App {
         }
         for v in &list {
             let st = Status::parse(&v.status);
-            let title = clean_title(&v.title);
+            // what it was last asked to do; the window title often stays on its first prompt
+            let title = if v.task.is_empty() { clean_title(&v.title) } else { v.task.clone() };
             if let Some(i) = self.agents.iter().position(|a| a.id == v.id && a.dying.is_none()) {
                 let old = self.agents[i].status;
                 if old != st {
