@@ -55,7 +55,7 @@ fn main() -> io::Result<()> {
             for c in sound::ALL {
                 println!("{c:?}");
                 s.play(c);
-                std::thread::sleep(std::time::Duration::from_millis(1600));
+                std::thread::sleep(std::time::Duration::from_millis(3200));
             }
             Ok(())
         }

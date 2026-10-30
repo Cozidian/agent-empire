@@ -41,7 +41,7 @@ the galaxy. Ship status colours and development indicators still show the same i
 | ---------------- | ------------------------------------------------------------------- |
 | `n`              | **colonize**: launch an agent in a folder (pick one, or type a new path and it's created) |
 | `e`              | **deploy** another agent to the selected world                      |
-| `⏎` / click twice | **comms**: a live, interactive terminal with the agent             |
+| `⏎` / click twice | **comms**: a chat popup with the agent's live terminal; `⇥` goes full screen |
 | `Ctrl-]` / `F12` | leave comms, back to the galaxy                                     |
 | `⇥`              | jump to the next agent that needs you                               |
 | `t`              | **mission**: write a task for the selected world (launch a ship with it, or queue it) |
@@ -53,12 +53,18 @@ the galaxy. Ship status colours and development indicators still show the same i
 | `r`              | what the selected world **needs**, as quick actions                |
 | `L`              | the selected world's **mission log**: under way, queued, done       |
 | `T`              | strike finished missions on the selected world from its log         |
+| `S`              | the **situation log** in full: filter it, read an entry's details   |
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
 | `wasd` / drag    | pan · `±` / wheel zoom · `z` fit galaxy · `f` focus selection        |
 | `o` `m` `?` `q`  | outliner · mute · fleet manual · leave                              |
 
-Inside comms every key, including Esc and Ctrl-C, goes straight to the agent. The mouse wheel
+Comms opens as a **chat popup** over the galaxy: the agent's terminal, fitted to the popup, and a
+line to write in underneath. `⏎` sends what you wrote (or, with nothing written, presses Enter for
+the agent); when it's waiting on a question, `1`–`9` and `↑↓` answer it. `PgUp/PgDn` or the wheel
+scroll back, `Esc` or a click outside closes it, and `⇥` takes you to the full-screen terminal.
+
+In the full-screen terminal every key, including Esc and Ctrl-C, goes straight to the agent. The mouse wheel
 (or `Shift-PgUp/PgDn`) scrolls back through the agent's history; agents that handle the mouse
 themselves get the wheel instead. Typing snaps back to live.
 Drag to select text, double-click for a word, triple-click for a line; letting go copies it
@@ -101,6 +107,13 @@ mission log.
 mission to its full text, its world, fleet order, agent and times (`e` expands them all), and `s`
 groups the log by status, world or moon, or fleet order.
 
+`S` (or a click on the side panel's **situation log**) opens it in full: the last 500 entries,
+newest first. `0`–`7` or `f` show one kind of news (alerts, missions, agents, trade, prestige,
+worlds, errors), `w` narrows to the selected entry's world and its moons, and `/` searches the text;
+`x` clears the filters. The pane below the list spells out the selected entry: its full text, when it
+happened, its world and the agent involved, if that agent is still around. `⏎` goes to that agent or world,
+and `c` opens comms with the agent.
+
 ## Needs and quick actions
 
 Every world shows what it needs from you right under its name on the map: `✖#42` failing CI, `±7`
@@ -128,13 +141,17 @@ couple of minutes) are docked around it, coloured by CI: green, amber while runn
 failing. The station glows the colour of its worst PR, CI turning red or green is reported in the
 situation log, and world cards list unpushed commits and PRs under **trade**.
 
-Click the **GitHub station or its label** to browse projects in the current galaxy and your open
-PRs. It also appears in the outliner for keyboard selection. Projects with failing checks appear
-first; each project shows its unpushed commits, followed by PR titles and CI status. Use arrows or
+Click the **GitHub station or its label** to browse projects in the current galaxy and their open
+PRs. It also appears in the outliner for keyboard selection. `⇥` switches between **all open PRs**,
+those **waiting on your review**, and **your PRs**. Projects with failing checks of yours come
+first, then those with reviews waiting on you; each lists your PRs, then reviews asked of you
+(marked ◆, with the author), then everyone else's, with CI status. Use arrows or
 the mouse wheel to scroll, and Enter (or a second click on a selected row) to focus a project or
 open a PR in your browser. Esc returns to the galaxy.
 
-The station uses `gh` to refresh up to 100 of **your** open PRs per project every 150 seconds.
+The station uses `gh` to refresh up to 100 of your open PRs, and up to 100 of everyone else's,
+per project every 150 seconds; only your own PRs dock at the station and count toward needs and
+prestige.
 It shows when results were last checked and keeps cached PRs visible if GitHub is unavailable.
 Projects outside the current galaxy are not included.
 

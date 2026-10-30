@@ -30,6 +30,8 @@ pub struct World {
     pub github: bool,
     /// Your open pull requests there.
     pub prs: Vec<Pr>,
+    /// Everyone else's open pull requests there.
+    pub others: Vec<Pr>,
     pub prs_checked: Option<i64>,
     pub prs_error: Option<String>,
     /// PRs seen merged since the galaxy opened (number, title), oldest first.
@@ -42,6 +44,11 @@ pub struct Pr {
     pub title: String,
     /// pass | fail | pending | none
     pub ci: &'static str,
+    /// Login of who opened it.
+    pub author: String,
+    /// Your review is requested (directly or through a team).
+    pub asks_you: bool,
+    pub draft: bool,
 }
 
 /// One usage window of one provider, e.g. claude's 5-hour window.
@@ -114,6 +121,10 @@ impl Survey {
                                 w.prs_checked = Some(self::now());
                                 w.prs_error = None;
                             }
+                            Err(e) => w.prs_error = Some(e),
+                        }
+                        match others_prs(path) {
+                            Ok(o) => w.others = o,
                             Err(e) => w.prs_error = Some(e),
                         }
                         trade.insert(path.clone(), Instant::now());
@@ -199,8 +210,23 @@ fn size(path: &str, w: &mut World) {
 
 /// Your open PRs in the repo at `path`, with their CI verdict.
 fn prs(path: &str) -> Result<Vec<Pr>, String> {
+    pr_list(path, &["--author", "@me"])
+}
+
+/// Everyone else's open PRs in the repo at `path`, marking those that want your review.
+fn others_prs(path: &str) -> Result<Vec<Pr>, String> {
+    let mut v = pr_list(path, &["--search", "-author:@me"])?;
+    let asks = pr_list(path, &["--search", "review-requested:@me"])?;
+    for p in &mut v {
+        p.asks_you = asks.iter().any(|a| a.number == p.number);
+    }
+    Ok(v)
+}
+
+fn pr_list(path: &str, filter: &[&str]) -> Result<Vec<Pr>, String> {
     let Ok(out) = Command::new("gh")
-        .args(["pr", "list", "--author", "@me", "--limit", "100", "--json", "number,title,statusCheckRollup"])
+        .args(["pr", "list", "--limit", "100", "--json", "number,title,statusCheckRollup,author,isDraft"])
+        .args(filter)
         .current_dir(path)
         .output()
     else {
@@ -222,7 +248,14 @@ fn prs(path: &str) -> Result<Vec<Pr>, String> {
             } else {
                 "pass"
             };
-            Pr { number: p["number"].as_u64().unwrap_or(0) as u32, title: p["title"].as_str().unwrap_or("").into(), ci }
+            Pr {
+                number: p["number"].as_u64().unwrap_or(0) as u32,
+                title: p["title"].as_str().unwrap_or("").into(),
+                ci,
+                author: p["author"]["login"].as_str().unwrap_or("").into(),
+                asks_you: false,
+                draft: p["isDraft"].as_bool().unwrap_or(false),
+            }
         })
         .collect())
 }

@@ -25,6 +25,8 @@ pub enum Cmd {
     Spawn { kind: String, cwd: String },
     Kill(u32),
     Input(u32, String),
+    /// A chat message: pasted, then submitted on its own so it isn't taken as a newline.
+    Say(u32, String),
     Resize(u32, u16, u16),
     Seen(u32),
     Answer(u32, String),
@@ -131,6 +133,11 @@ impl Client {
                     Cmd::Spawn { kind, cwd } => (Req::Spawn { kind: kind.clone(), cwd: cwd.clone() }, Some((kind, cwd))),
                     Cmd::Kill(id) => (Req::Kill { id }, None),
                     Cmd::Input(id, data) => (Req::Input { id, data }, None),
+                    Cmd::Say(id, text) => {
+                        let _ = c.call(&Req::Input { id, data: format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")) });
+                        thread::sleep(Duration::from_millis(150));
+                        (Req::Input { id, data: "\r".into() }, None)
+                    }
                     Cmd::Resize(id, cols, rows) => (Req::Resize { id, cols, rows }, None),
                     Cmd::Seen(id) => (Req::Seen { id }, None),
                     Cmd::Answer(id, key) => (Req::Answer { id, key }, None),
