@@ -66,6 +66,9 @@ pub struct AgentView {
     pub kind: String,
     pub cwd: String,
     pub title: String,
+    /// The last prompt it was given (typed in comms, a mission, a fleet order).
+    #[serde(default)]
+    pub task: String,
     /// booting | working | blocked | done | idle | exited
     pub status: String,
     /// Seconds since the status last changed.

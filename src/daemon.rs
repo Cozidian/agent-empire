@@ -156,9 +156,50 @@ struct Agent {
     told: Status,
     /// When the current turn started.
     worked_at: Option<Instant>,
+    /// The last thing it was asked to do, and what's being typed to it now.
+    task: String,
+    typed: String,
 }
 
 impl Agent {
+    /// Remember a prompt as what it's working on: its first line, unless it's a slash
+    /// command or too short to be one (a menu pick, a y/n).
+    fn note_task(&mut self, text: &str) {
+        let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        if line.chars().count() >= 3 && !line.starts_with('/') {
+            self.task = line.to_string();
+        }
+    }
+
+    /// Follow keystrokes from comms, so a prompt typed there becomes the task once it's sent.
+    fn keys(&mut self, data: &str) {
+        let mut cs = data.chars().peekable();
+        while let Some(c) = cs.next() {
+            match c {
+                // escape sequences: arrows and the like are skipped, a paste's brackets kept out
+                '\x1b' => {
+                    if cs.peek() == Some(&'[') {
+                        cs.next();
+                        while cs.next().is_some_and(|c| !('@'..='~').contains(&c)) {}
+                    } else if cs.next() == Some('O') {
+                        cs.next(); // SS3: arrows and F1-F4 on some terminals
+                    }
+                }
+                '\r' => {
+                    let typed = std::mem::take(&mut self.typed);
+                    self.note_task(&typed);
+                }
+                '\x7f' | '\x08' => {
+                    self.typed.pop();
+                }
+                '\x15' | '\x03' => self.typed.clear(), // ^U, ^C
+                '\n' => self.typed.push(' '),
+                c if !c.is_control() => self.typed.push(c),
+                _ => {}
+            }
+        }
+    }
+
     fn set(&mut self, s: Status) {
         if self.status != s {
             if s == Status::Done {
@@ -334,6 +375,7 @@ impl Agent {
             kind: self.kind.clone(),
             cwd: self.cwd.clone(),
             title: self.parser.callbacks().title.clone(),
+            task: self.task.clone(),
             status: self.status.name().into(),
             age: (now - self.since).as_secs_f32(),
             turns: self.turns,
@@ -509,6 +551,8 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         edits_seen: HashSet::new(),
         told: Status::Booting,
         worked_at: None,
+        task: String::new(),
+        typed: String::new(),
         status: Status::Booting,
         since: now,
         exited: None,
@@ -547,6 +591,7 @@ fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Opti
     drop(pty.master);
     let mut agent = new_agent(id, kind, cwd, Pty { master, pid }, ROWS, COLS);
     agent.session = resume.map(String::from);
+    agent.note_task(prompt.unwrap_or(""));
     watch(hub, agent)?;
     Ok(id)
 }
@@ -617,6 +662,8 @@ struct Handoff {
     cols: u16,
     screen: String,
     title: String,
+    #[serde(default)]
+    task: String,
     status: String,
     age: f32,
     turns: u32,
@@ -649,6 +696,7 @@ fn upgrade(hub: &Shared) -> io::Result<()> {
             cols: cols.get(),
             screen,
             title: g.parser.callbacks().title.clone(),
+            task: g.task.clone(),
             status: g.status.name().into(),
             age: (now - g.since).as_secs_f32(),
             turns: g.turns,
@@ -682,6 +730,7 @@ fn adopt(hub: &Shared, file: &str) -> anyhow::Result<()> {
         a.since = now.checked_sub(Duration::from_secs_f32(h.age)).unwrap_or(now);
         a.started = now.checked_sub(Duration::from_secs(60)).unwrap_or(now); // long past booting
         a.turns = h.turns;
+        a.task = h.task;
         a.report = h.report;
         a.session = h.session;
         watch(hub, a)?;
@@ -733,6 +782,7 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
                     taken.insert(id);
                     m.state = "sent".into();
                     m.agent = Some(id);
+                    a.lock().unwrap().note_task(&m.text);
                     order(a.clone(), crate::screenshots::prompt(&m.text, &m.attachments));
                 }
             }
@@ -1044,11 +1094,12 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             for id in ids {
                 let Some(a) = h.agents.get(&id).cloned() else { continue };
                 let cwd = {
-                    let g = a.lock().unwrap();
+                    let mut g = a.lock().unwrap();
                     // a blocked agent would take the order as an answer to its question
                     if g.exited.is_some() || g.status == Status::Blocked {
                         continue;
                     }
+                    g.note_task(&text);
                     g.cwd.clone()
                 };
                 h.missions.push(Mission { id: next, cwd, text: text.clone(), attachments: Vec::new(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet) });
@@ -1096,6 +1147,9 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                     if g.hook == Some(Status::Blocked) {
                         g.hook = None; // answered: let the next hook/heuristic decide
                     }
+                    g.typed.clear(); // an answer to its question, not a new task
+                } else {
+                    g.keys(&data);
                 }
                 match g.writer.write_all(data.as_bytes()) {
                     Ok(()) => Resp::Ok,
@@ -1553,5 +1607,23 @@ mod screenshot_tests {
         let mut bytes = vec![0; expected.len()];
         rx.read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, expected.as_bytes());
+    }
+
+    #[test]
+    fn the_last_prompt_typed_in_comms_becomes_the_task() {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let writer = Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 };
+        let mut a = new_agent(1, "claude", "/world", writer, 40, 120);
+        a.note_task("Build the trade routes\nwith details");
+        assert_eq!(a.task, "Build the trade routes");
+        // typed with a typo, an arrow key and a paste, then sent
+        a.keys("Fix the logx");
+        a.keys("\x7f\x7fgs\x1b[D\x1b[C \x1b[200~sorting~\x1b[201~");
+        assert_eq!(a.task, "Build the trade routes");
+        a.keys("\r");
+        assert_eq!(a.task, "Fix the logs sorting~");
+        // slash commands and menu picks aren't tasks
+        a.keys("/clear\r1\r");
+        assert_eq!(a.task, "Fix the logs sorting~");
     }
 }
