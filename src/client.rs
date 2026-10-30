@@ -19,6 +19,8 @@ pub enum Msg {
     Error(String),
     /// A docking attempt: `Err` holds why it failed.
     Docked { moon: String, result: Result<(), String> },
+    /// Jev's suggestion for the mission being written; `key` says which text it was for.
+    Jev { key: String, result: Result<crate::jev::Pick, String> },
 }
 
 pub enum Cmd {
@@ -30,7 +32,7 @@ pub enum Cmd {
     Resize(u32, u16, u16),
     Seen(u32),
     Answer(u32, String),
-    Mission { cwd: String, text: String, kind: String, launch: bool, attachments: Vec<crate::screenshots::Attachment>, draft: bool, role: String },
+    Mission { cwd: String, text: String, kind: String, launch: bool, attachments: Vec<crate::screenshots::Attachment>, draft: bool, role: String, to: Option<u32> },
     Scrub(u32),
     Broadcast(Vec<u32>, String),
     Moon { cwd: String, branch: String, kind: String },
@@ -141,7 +143,7 @@ impl Client {
                     Cmd::Resize(id, cols, rows) => (Req::Resize { id, cols, rows }, None),
                     Cmd::Seen(id) => (Req::Seen { id }, None),
                     Cmd::Answer(id, key) => (Req::Answer { id, key }, None),
-                    Cmd::Mission { cwd, text, kind, launch, attachments, role, .. } => (Req::Mission { cwd, text, kind, launch, attachments, role }, None),
+                    Cmd::Mission { cwd, text, kind, launch, attachments, role, to, .. } => (Req::Mission { cwd, text, kind, launch, attachments, role, to }, None),
                     Cmd::Scrub(id) => (Req::Scrub { id }, None),
                     Cmd::Broadcast(ids, text) => (Req::Broadcast { ids, text }, None),
                     Cmd::Moon { cwd, branch, kind } => (Req::Moon { cwd, branch: branch.clone(), kind: kind.clone() }, Some((kind, format!("moon {branch}")))),
@@ -178,6 +180,15 @@ impl Client {
         });
 
         Self { rx, tx, events, watch, scroll }
+    }
+
+    /// Ask Jev which ship should take a mission, in the background.
+    pub fn ask_jev(&self, key: String, mission: String, world: String, ships: Vec<crate::jev::Ship>) {
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let result = crate::jev::ask(&mission, &world, &ships);
+            let _ = events.send(Msg::Jev { key, result });
+        });
     }
 
     pub fn open_pr(&self, path: String, number: u32) {

@@ -785,8 +785,12 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
         let me = m.agent.and_then(|id| roster.iter().find(|r| r.0 == id));
         match m.state.as_str() {
             "queued" => {
+                // a mission given to one ship waits for it; if it's gone, anyone here may take it
+                if m.agent.is_some() && me.is_none_or(|r| r.3) {
+                    m.agent = None;
+                }
                 let free = roster.iter().find(|(id, cwd, st, dead)| {
-                    *cwd == m.cwd && !dead && matches!(st, Status::Idle | Status::Done) && !busy.contains(id) && !taken.contains(id)
+                    *cwd == m.cwd && !dead && matches!(st, Status::Idle | Status::Done) && !busy.contains(id) && !taken.contains(id) && m.agent.is_none_or(|a| a == *id)
                 });
                 if let Some(&(id, ..)) = free
                     && let Some(a) = agents.iter().find(|a| a.lock().unwrap().id == id)
@@ -1081,11 +1085,11 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             });
             Resp::Ok
         }
-        Req::Mission { cwd, text, kind, launch, attachments, role } => {
+        Req::Mission { cwd, text, kind, launch, attachments, role, to } => {
             if let Err(msg) = crate::screenshots::validate(&attachments) { return Resp::Err { msg }; }
             let id = hub.lock().unwrap().missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
             let prompt = crate::screenshots::prompt(&text, &attachments);
-            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: None, at: unix_now(), done_at: None, fleet: None };
+            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: to.filter(|_| !launch), at: unix_now(), done_at: None, fleet: None };
             if launch {
                 match spawn(hub, &kind, &cwd, None, Some(&prompt), Role::parse(&role)) {
                     Ok(aid) => {
@@ -1596,7 +1600,7 @@ mod screenshot_tests {
         std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
         let attachments = vec![crate::screenshots::Attachment { name: "screenshot.png".into(), path: path.to_str().unwrap().into() }];
         let hub = Shared::default();
-        let request = Req::Mission { cwd: "/world".into(), text: "Fix this".into(), kind: "codex".into(), launch: false, attachments: attachments.clone(), role: String::new() };
+        let request = Req::Mission { cwd: "/world".into(), text: "Fix this".into(), kind: "codex".into(), launch: false, attachments: attachments.clone(), role: String::new(), to: None };
         assert!(matches!(handle(&hub, request.clone()), Resp::Ok));
         assert_eq!(hub.lock().unwrap().missions[0].attachments, attachments);
         std::fs::remove_file(path).unwrap();
