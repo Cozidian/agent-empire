@@ -14,7 +14,7 @@ use crossterm::event::{
     KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::{cursor, execute, style, terminal};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::f32::consts::TAU;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -291,8 +291,8 @@ pub enum Mode {
     Confirm { id: u32 },
     /// What a world needs, as a menu of quick actions.
     Actions { planet: String, sel: usize },
-    /// Every mission in the empire: under way, queued, done.
-    Log { sel: usize },
+    /// Every mission in the empire, grouped by `App::log_sort`; `open` ones show in full.
+    Log { sel: usize, open: HashSet<u32> },
     /// Founding a moon (git worktree) off a world.
     Moon { planet: String, branch: Line, kind: usize },
     /// Merging a moon back into its world.
@@ -302,6 +302,34 @@ pub enum Mode {
     /// Writing a mission for a world: hand it to a new ship now, or queue it.
     Brief { planet: String, text: Line, kind: usize, launch: bool },
     Help,
+}
+
+/// How the mission log is grouped.
+#[derive(Clone, Copy, PartialEq)]
+pub enum LogSort {
+    Status,
+    Planet,
+    System,
+    Fleet,
+}
+
+impl LogSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Status => Self::Planet,
+            Self::Planet => Self::System,
+            Self::System => Self::Fleet,
+            Self::Fleet => Self::Status,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Planet => "world",
+            Self::System => "system",
+            Self::Fleet => "fleet",
+        }
+    }
 }
 
 pub enum Fx {
@@ -332,6 +360,7 @@ pub struct App {
     /// Lines scrolled back in the comms window (0 = live).
     pub scroll: usize,
     pub missions: Vec<Mission>,
+    pub log_sort: LogSort,
     pub prestige: Prestige,
     /// Worlds that just levelled up, waiting for their fanfare on the map.
     pub fanfares: Vec<String>,
@@ -497,6 +526,7 @@ impl App {
             bg_key: (0, 0, 0),
             comms_at: Instant::now(),
             scroll: 0,
+            log_sort: LogSort::Status,
             pick: None,
             survey: survey::Snapshot::default(),
             missions: Vec::new(),
@@ -573,16 +603,32 @@ impl App {
         }
     }
 
-    /// Missions in log order: under way, then queued (in dispatch order), then done (newest first).
-    pub fn mission_log(&self) -> Vec<&Mission> {
-        let mut v: Vec<&Mission> = self.missions.iter().collect();
+    /// Missions in log order, each with its group heading. Within a group: under way,
+    /// then queued (in dispatch order), then done (newest first).
+    pub fn mission_log(&self) -> Vec<(String, &Mission)> {
         let rank = |m: &Mission| match m.state.as_str() {
             "active" | "sent" => 0,
             "queued" => 1,
             _ => 2,
         };
-        v.sort_by_key(|m| (rank(m), if rank(m) == 2 { std::cmp::Reverse(m.done_at.unwrap_or(m.at)) } else { std::cmp::Reverse(0) }, m.id));
-        v
+        // (sort key, heading) of a mission's group; moons file under their world's system
+        let group = |m: &Mission| -> (String, String) {
+            match self.log_sort {
+                LogSort::Status => (rank(m).to_string(), ["UNDER WAY", "QUEUED", "DONE"][rank(m)].into()),
+                LogSort::Planet => (m.cwd.clone(), format!("● {}", base_name(&m.cwd).to_uppercase())),
+                LogSort::System => {
+                    let sys = parent(&self.moon_host(&m.cwd).unwrap_or_else(|| m.cwd.clone()));
+                    (sys.clone(), format!("✶ {}", base_name(&sys).to_uppercase()))
+                }
+                LogSort::Fleet => match m.fleet {
+                    Some(f) => (format!("0{f:010}"), format!("⚑ FLEET ORDER #{f}")),
+                    None => ("1".into(), "SINGLE MISSIONS".into()),
+                },
+            }
+        };
+        let mut v: Vec<((String, String), &Mission)> = self.missions.iter().map(|m| (group(m), m)).collect();
+        v.sort_by_key(|(g, m)| (g.0.clone(), rank(m), if rank(m) == 2 { std::cmp::Reverse(m.done_at.unwrap_or(m.at)) } else { std::cmp::Reverse(0) }, m.id));
+        v.into_iter().map(|((_, head), m)| (head, m)).collect()
     }
 
     fn level(&self, key: &str) -> u8 {
@@ -909,13 +955,13 @@ impl App {
             *p = (mixf(p.0, target.0, k), mixf(p.1, target.1, k));
             let spos = *p;
             let sh = hash(skey);
-            let star = [v3(1.0, 0.86, 0.55), v3(0.7, 0.85, 1.0), v3(1.0, 0.62, 0.42), v3(1.0, 0.95, 0.85)][(sh % 4) as usize];
+            let star = mix(v3(1.0, 0.5, 0.28), v3(0.55, 0.78, 1.0), rnd(sh ^ 173));
             let mut sys = System { key: skey.clone(), name: base_name(skey), wpos: spos, planets: Vec::new(), orbits: Vec::new(), star };
             for (j, pkey) in pkeys.iter().enumerate() {
                 let h = hash(pkey);
                 let seed = rnd(h);
                 let orbit = ORBIT0 + ORBIT_STEP * j as f32;
-                let ang = seed * TAU + t * 0.035 / (1.0 + 0.4 * j as f32);
+                let ang = seed * TAU + t * 0.015 / (1.0 + 0.4 * j as f32);
                 let mut members = pmap[pkey].clone();
                 members.sort_by_key(|&i| self.agents[i].id);
                 let live = members.iter().filter(|&&i| self.agents[i].dying.is_none()).count();
@@ -924,7 +970,7 @@ impl App {
                 let m = members.len().max(1) as f32;
                 for (q, &ai) in members.iter().enumerate() {
                     let a = &mut self.agents[ai];
-                    let ang = t * (0.45 + a.seed * 0.25) + q as f32 * TAU / m;
+                    let ang = t * (0.15 + a.seed * 0.1) + q as f32 * TAU / m;
                     let orb = r + 8.0 + (q % 2) as f32 * 4.0;
                     a.wpos = (wpos.0 + ang.cos() * orb, wpos.1 + ang.sin() * orb * 0.55);
                     a.front = ang.sin() > 0.0;
@@ -944,7 +990,7 @@ impl App {
             let h = hash(mkey);
             let seed = rnd(h);
             let orbit = hr + 22.0 + 12.0 * q;
-            let ang = seed * TAU + t * 0.18 / (1.0 + 0.5 * q);
+            let ang = seed * TAU + t * 0.08 / (1.0 + 0.5 * q);
             let wpos = (hpos.0 + ang.cos() * orbit, hpos.1 + ang.sin() * orbit * 0.55);
             let mut members = pmap[mkey].clone();
             members.sort_by_key(|&i| self.agents[i].id);
@@ -953,7 +999,7 @@ impl App {
             let m = members.len().max(1) as f32;
             for (q, &ai) in members.iter().enumerate() {
                 let a = &mut self.agents[ai];
-                let ang = t * (0.6 + a.seed * 0.3) + q as f32 * TAU / m;
+                let ang = t * (0.2 + a.seed * 0.1) + q as f32 * TAU / m;
                 let orb = r + 5.0;
                 a.wpos = (wpos.0 + ang.cos() * orb, wpos.1 + ang.sin() * orb * 0.55);
                 a.front = ang.sin() > 0.0;
@@ -1660,9 +1706,10 @@ fn handle(
             }
             return false;
         }
-        Mode::Log { sel } => {
+        Mode::Log { sel, open } => {
             let mut s = *sel;
-            let log: Vec<(u32, Option<u32>)> = app.mission_log().iter().map(|m| (m.id, m.agent)).collect();
+            let mut open = std::mem::take(open);
+            let log: Vec<(u32, Option<u32>)> = app.mission_log().iter().map(|(_, m)| (m.id, m.agent)).collect();
             match k.code {
                 KeyCode::Esc | KeyCode::Char('L') | KeyCode::Char('q') => app.mode = Mode::Galaxy,
                 KeyCode::Up | KeyCode::Char('k') => s = s.saturating_sub(1),
@@ -1683,10 +1730,36 @@ fn handle(
                         app.open_comms(aid, client, l);
                     }
                 }
+                // expand / collapse: one mission, or all of them
+                KeyCode::Char(' ') => {
+                    if let Some((id, _)) = log.get(s)
+                        && !open.remove(id)
+                    {
+                        open.insert(*id);
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') => open.extend(log.get(s).map(|m| m.0)),
+                KeyCode::Left | KeyCode::Char('h') => {
+                    log.get(s).map(|m| open.remove(&m.0));
+                }
+                KeyCode::Char('e') => {
+                    if open.len() < log.len() {
+                        open.extend(log.iter().map(|m| m.0));
+                    } else {
+                        open.clear();
+                    }
+                }
+                // regroup, keeping the same mission selected
+                KeyCode::Char('s') | KeyCode::Tab => {
+                    app.log_sort = app.log_sort.next();
+                    let id = log.get(s).map(|m| m.0);
+                    s = app.mission_log().iter().position(|(_, m)| Some(m.id) == id).unwrap_or(0);
+                }
                 _ => {}
             }
-            if let Mode::Log { sel } = &mut app.mode {
+            if let Mode::Log { sel, open: o } = &mut app.mode {
                 *sel = s;
+                *o = open;
             }
             return false;
         }
@@ -1910,7 +1983,7 @@ fn handle(
             Some(p) => app.toast(format!("{} needs nothing from you right now ✓", base_name(&p)), t),
             None => app.toast("select a world to see what it needs", t),
         },
-        KeyCode::Char('L') => app.mode = Mode::Log { sel: 0 },
+        KeyCode::Char('L') => app.mode = Mode::Log { sel: 0, open: HashSet::new() },
         KeyCode::Char('X') => match app.sel_planet() {
             Some(p) if w.planet(&p).is_some_and(|p| p.dormant) => {
                 app.history.remove(&p);
@@ -2031,7 +2104,7 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
         ((sx - px).powi(2) + (sy - py).powi(2)).sqrt()
     };
     let nearest = |c: Vec<(f32, f32, Sel)>| c.into_iter().filter(|(d, r, _)| d < r).min_by(|a, b| a.0.total_cmp(&b.0)).map(|c| c.2);
-    let ships = app.agents.iter().filter(|a| a.dying.is_none()).map(|a| (dist(a.wpos), 6.0, Sel::Agent(a.id))).collect();
+    let ships = app.agents.iter().filter(|a| a.dying.is_none()).map(|a| (dist(a.wpos), 6.0 * z.clamp(0.7, 2.2), Sel::Agent(a.id))).collect();
     let planets = w.planets.iter().map(|p| (dist(p.wpos), (p.r * z).max(4.0) + 3.0, Sel::Planet(p.key.clone()))).collect();
     let stars = w.systems.iter().map(|s| (dist(s.wpos), (9.0 * z).max(4.0) + 4.0, Sel::Sys(s.key.clone()))).collect();
     nearest(ships).or_else(|| nearest(planets)).or_else(|| nearest(stars))
