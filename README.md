@@ -51,6 +51,12 @@ no "done" for turns shorter than a few seconds, and a blocked agent re-pings eve
 | done        | green burst, green planet ring until you look   | "bee-boop"            |
 | launching   | blinking amber                                  | data burst on arrival |
 
+## Answering from orbit
+
+When an agent asks something (a permission prompt, "trust this folder?", a y/n), an
+**incoming transmission** pops up over the galaxy with what it's about and the choices.
+Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one waiting.
+
 ## Stats
 
 - **Resources** (top bar): how much of your Claude 5-hour / weekly and Codex allowance is used,

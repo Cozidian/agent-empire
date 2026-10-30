@@ -42,6 +42,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     }
     if matches!(app.mode, Mode::Galaxy) {
         card(fb, app, w, l, t);
+        transmission(fb, app, l, t);
     }
     footer(fb, app, l, sound);
     if let Some((m, t0)) = &app.toast {
@@ -648,6 +649,44 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
             cx = seg(fb, cx, r, s, x + width - 2 - cx, *c, Some(BOX));
         }
     }
+}
+
+/// A blocked agent's question, answerable without opening comms.
+fn transmission(fb: &mut Fb, app: &App, l: &Lay, t: f32) {
+    let Some(a) = app.transmission() else { return };
+    let Some(q) = &a.ask else { return };
+    let cw = l.cols - l.pw;
+    let width = 76.min(cw - 4);
+    if width < 36 {
+        return;
+    }
+    let inner = (width - 4) as usize;
+    let waiting = app.agents.iter().filter(|a| a.dying.is_none() && a.status == Status::Blocked).count();
+    let mut body: Vec<(String, V3)> = Vec::new();
+    for c in &q.context {
+        body.push((trunc(c, inner), DIM));
+    }
+    body.push((trunc(&q.question, inner), TEXT));
+    body.push((String::new(), DIM));
+    let height = body.len() as i32 + q.options.len().min(9) as i32 + 3;
+    let x = (cw - width) / 2;
+    let y = 2;
+    let red = Status::Blocked.color();
+    let pulse = 0.75 + 0.25 * (t * 5.0).sin();
+    let title = format!("▲ INCOMING TRANSMISSION · {} @ {}", a.kind, base_name(&a.cwd));
+    frame_box(fb, x, y, width, height, &title, red * pulse);
+    for (i, (s, c)) in body.iter().enumerate() {
+        seg(fb, x + 2, y + 1 + i as i32, s, width - 4, *c, Some(BOX));
+    }
+    let oy = y + 1 + body.len() as i32;
+    for (i, o) in q.options.iter().take(9).enumerate() {
+        let r = oy + i as i32;
+        let cx = seg(fb, x + 2, r, &format!(" {} ", i + 1), 3, BOX, Some(red * 0.85));
+        seg(fb, cx + 1, r, &trunc(&o.label, inner - 4), width - 4 - (cx + 1 - x - 2), TEXT, Some(BOX));
+    }
+    let more = if waiting > 1 { format!(" · ⇥ next ({} waiting)", waiting - 1) } else { String::new() };
+    let hint = format!(" 1-{} answer · ⏎ open comms{more} ", q.options.len().min(9));
+    seg(fb, x + width - 2 - hint.chars().count() as i32, y + height - 1, &hint, width, DIM, Some(BOX));
 }
 
 fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {

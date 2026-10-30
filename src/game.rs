@@ -6,7 +6,7 @@
 use crate::client::{Client, Cmd, Msg};
 use crate::draw;
 use crate::gfx::*;
-use crate::proto::{AgentView, Report, ScreenView};
+use crate::proto::{AgentView, Ask, Report, ScreenView};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crossterm::event::{
@@ -117,6 +117,7 @@ pub struct Agent {
     pub busy_at: f32,
     pub turns: u32,
     pub report: Report,
+    pub ask: Option<Ask>,
     pub wpos: (f32, f32),
     /// In front of its planet (drawn after it).
     pub front: bool,
@@ -465,6 +466,18 @@ impl App {
         }
     }
 
+    /// The blocked agent whose question is on screen: the selected one if it's
+    /// asking, otherwise whoever has been waiting longest.
+    pub fn transmission(&self) -> Option<&Agent> {
+        let asking = |a: &&Agent| a.dying.is_none() && a.status == Status::Blocked && a.ask.as_ref().is_some_and(|q| !q.options.is_empty());
+        if let Some(Sel::Agent(id)) = self.sel
+            && let Some(a) = self.agents.iter().filter(asking).find(|a| a.id == id)
+        {
+            return Some(a);
+        }
+        self.agents.iter().filter(asking).min_by(|a, b| a.since.total_cmp(&b.since))
+    }
+
     pub fn agent(&self, id: u32) -> Option<&Agent> {
         self.agents.iter().find(|a| a.id == id && a.dying.is_none())
     }
@@ -515,6 +528,7 @@ impl App {
                 a.since = t - v.age;
                 a.turns = v.turns;
                 a.report = v.report.clone();
+                a.ask = v.ask.clone();
                 if !title.is_empty() {
                     a.title = title;
                 }
@@ -539,6 +553,7 @@ impl App {
                     busy_at: t,
                     turns: v.turns,
                     report: v.report.clone(),
+                    ask: v.ask.clone(),
                     wpos: (0.0, 0.0),
                     front: true,
                 });
@@ -1269,6 +1284,14 @@ fn handle(
         KeyCode::Up | KeyCode::Char('k') => pick(app, cur.map_or(0, |c| c.saturating_sub(1))),
         KeyCode::Home | KeyCode::Char('g') => pick(app, 0),
         KeyCode::End | KeyCode::Char('G') => pick(app, rows.len().saturating_sub(1)),
+        // the transmission on screen takes Enter, unless you've picked another agent
+        KeyCode::Enter
+            if let Some(id) = app.transmission().map(|a| a.id)
+                && !matches!(app.sel, Some(Sel::Agent(s)) if s != id) =>
+        {
+            app.sel = Some(Sel::Agent(id));
+            app.open_comms(id, client, l);
+        }
         KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char(' ') => app.activate(w, l, client),
         KeyCode::Tab => {
             let alerts: Vec<u32> = rows
@@ -1288,6 +1311,16 @@ fn handle(
                 app.sel = Some(Sel::Agent(alerts[at]));
                 app.glide_to_sel(w);
                 app.cam.tz = app.cam.tz.max(1.6);
+            }
+        }
+        KeyCode::Char(d @ '1'..='9') if app.transmission().is_some() => {
+            let a = app.transmission().unwrap();
+            let (id, kind, planet) = (a.id, a.kind.clone(), base_name(&a.cwd));
+            let opts = a.ask.as_ref().map(|q| q.options.clone()).unwrap_or_default();
+            if let Some(o) = opts.get(d as usize - '1' as usize) {
+                client.send(Cmd::Answer(id, o.key.clone()));
+                app.say(format!("➤ {kind} on {planet}: {}", o.label), v3(0.6, 0.85, 1.0));
+                app.toast(format!("orders sent: {}", o.label), t);
             }
         }
         KeyCode::Char('n') => {
