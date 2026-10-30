@@ -6,6 +6,7 @@ use crate::gfx::*;
 use crate::sound::Sound;
 use crate::survey;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -61,6 +62,8 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Brief { planet, text, kind, launch } => brief(fb, app, planet, text, *kind, *launch, l, t),
         Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
         Mode::Moon { planet, branch, kind } => moon(fb, app, planet, branch, *kind, l, t),
+        Mode::Actions { planet, sel } => actions(fb, app, planet, *sel, l),
+        Mode::Log { sel } => mission_log(fb, app, *sel, l, t),
         Mode::Dock { moon } => dock(fb, app, moon, l),
         _ => {}
     }
@@ -586,6 +589,25 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         for (s, col) in parts {
             c = seg(fb, c + 1, r, &s, 8, col, None);
         }
+        // what it needs, and its missions, on the line below
+        let mut chips: Vec<(String, V3)> = app.needs(&p.key).into_iter().filter(|n| n.badge != "▲" && n.badge != "✔").map(|n| (n.badge, n.col)).collect();
+        let ms = |st: &[&str]| app.missions.iter().filter(|m| m.cwd == p.key && st.contains(&m.state.as_str())).count();
+        let (busy, queued) = (ms(&["sent", "active"]), ms(&["queued"]));
+        if busy > 0 {
+            chips.push((format!("★{busy}"), v3(0.4, 0.85, 1.0)));
+        }
+        if queued > 0 {
+            chips.push((format!("☆{queued}"), v3(1.0, 0.85, 0.4)));
+        }
+        if !chips.is_empty() && p.fog < 0.6 {
+            let w: i32 = chips.iter().map(|(s, _)| s.chars().count() as i32 + 1).sum::<i32>() - 1;
+            let mut c = ((px / 2.0) as i32 - w / 2).max(0);
+            if in_view(c, r + 1) && in_view(c + w, r + 1) {
+                for (s, col) in chips {
+                    c = seg(fb, c, r + 1, &s, 10, col, None) + 1;
+                }
+            }
+        }
     }
     for a in app.agents.iter().filter(|a| a.dying.is_none()) {
         let selected = app.sel.as_ref() == Some(&Sel::Agent(a.id));
@@ -798,6 +820,14 @@ fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
         rows.push(("context", ctx));
     }
     fleet_row(&mut rows, app, &agents);
+    let needs = app.needs(&p.key);
+    for (i, n) in needs.iter().take(4).enumerate() {
+        let key = if n.act.is_some() { format!("{} ", needs.iter().take(i + 1).filter(|m| m.act.is_some()).count()) } else { "  ".into() };
+        rows.push((if i == 0 { "needs  r" } else { "" }, vec![(key, DIM), (clip(&n.label, 44), n.col)]));
+    }
+    if needs.len() > 4 {
+        rows.push(("", vec![(format!("  +{} more · r for all", needs.len() - 4), DIM)]));
+    }
     let mut files: Vec<String> = agents.iter().flat_map(|a| a.war.iter().flat_map(|w| w.files.clone())).collect();
     files.sort();
     files.dedup();
@@ -946,11 +976,11 @@ fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {
         Some(Sel::Agent(id)) if app.agent(*id).is_some_and(|a| !a.war.is_empty()) => "⏎ comms · P give priority · x decommission · ",
         Some(Sel::Agent(_)) => "⏎ comms · t mission · e deploy here · x decommission · ",
         Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ comms · t mission · D dock · e deploy here · ",
-        Some(Sel::Planet(_)) => "⏎ comms · t mission · b fleet order · u moon · e deploy here · ",
+        Some(Sel::Planet(_)) => "⏎ comms · r needs · t mission · b fleet · u moon · e deploy · ",
         Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
         None => "",
     };
-    let s = format!(" {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit");
+    let s = format!(" {ctx}n colonize · L missions · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit");
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1172,6 +1202,108 @@ fn fleet_order(fb: &mut Fb, app: &App, w: &World, target: &Sel, text: &Line, l: 
     seg(fb, x + 3, y + h - 2, "⏎ send to the fleet · esc cancel", bw - 6, DIM, Some(BOX));
 }
 
+/// Quick actions: what the world needs, one key each.
+fn actions(fb: &mut Fb, app: &App, planet: &str, sel: usize, l: &Lay) {
+    let needs = app.needs(planet);
+    let acts: Vec<&Need> = needs.iter().filter(|n| n.act.is_some()).collect();
+    let info: Vec<&Need> = needs.iter().filter(|n| n.act.is_none()).collect();
+    let (x, y, w, h) = centered(l, 76, (acts.len() + info.len()) as i32 + 7);
+    let accent = v3(1.0, 0.75, 0.3);
+    frame_box(fb, x, y, w, h, &format!("◆ {} NEEDS", base_name(planet).to_uppercase()), accent);
+    seg(fb, x + 3, y + 2, "Each order goes to a free agent here, or a new ship if there's no one.", w - 6, DIM, Some(BOX));
+    for (i, n) in acts.iter().enumerate() {
+        let r = y + 4 + i as i32;
+        let bg = if i == sel { SELBG } else { BOX };
+        fb.panel(x + 2, r, w - 4, 1, bg);
+        let what = match &n.act {
+            Some(Act::Comms(_)) => "open comms",
+            Some(Act::Priority(_)) => "give priority",
+            _ => "send orders",
+        };
+        let c = seg(fb, x + 3, r, &format!(" {} ", i + 1), 3, BOX, Some(n.col * 0.9));
+        let c = seg(fb, c + 1, r, &clip(&n.label, (w - 26) as usize), w - 26, TEXT, Some(bg));
+        let _ = c;
+        seg(fb, x + w - 3 - what.len() as i32, r, what, 16, DIM, Some(bg));
+    }
+    for (i, n) in info.iter().enumerate() {
+        seg(fb, x + 6, y + 4 + (acts.len() + i) as i32, &clip(&n.label, (w - 10) as usize), w - 10, n.col * 0.8, Some(BOX));
+    }
+    seg(fb, x + 3, y + h - 2, "1-9 / ⏎ act · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
+}
+
+/// The mission log: what's under way, what's queued (in the order it'll be handed out), what's done.
+fn mission_log(fb: &mut Fb, app: &App, sel: usize, l: &Lay, t: f32) {
+    let log = app.mission_log();
+    let (x, y, w, h) = centered(l, 96.min(l.cols - 4), (l.rows - 6).min(log.len() as i32 + 12).max(12));
+    let accent = v3(1.0, 0.85, 0.4);
+    frame_box(fb, x, y, w, h, &format!("★ MISSION LOG · {} under way · {} queued · {} done", 
+        log.iter().filter(|m| matches!(m.state.as_str(), "sent" | "active")).count(),
+        log.iter().filter(|m| m.state == "queued").count(),
+        log.iter().filter(|m| m.state == "done").count()), accent);
+    if log.is_empty() {
+        seg(fb, x + 3, y + 2, "No missions yet. Select a world and press t to give it one, or r for what it needs.", w - 6, DIM, Some(BOX));
+    }
+    let room = (h - 5) as usize;
+    let off = sel.saturating_sub(room.saturating_sub(1));
+    let now = survey::now() as u64;
+    let mut last = "";
+    let mut r = y + 2;
+    let mut queue_pos: HashMap<&str, usize> = HashMap::new();
+    for (i, m) in log.iter().enumerate() {
+        let group = match m.state.as_str() {
+            "sent" | "active" => "UNDER WAY",
+            "queued" => "QUEUED",
+            _ => "DONE",
+        };
+        let pos = if m.state == "queued" {
+            let n = queue_pos.entry(m.cwd.as_str()).or_insert(0);
+            *n += 1;
+            *n
+        } else {
+            0
+        };
+        if i < off {
+            last = group;
+            continue;
+        }
+        if r >= y + h - 2 {
+            break;
+        }
+        if group != last {
+            seg(fb, x + 3, r, group, w - 6, accent * 0.8, Some(BOX));
+            r += 1;
+            last = group;
+            if r >= y + h - 2 {
+                break;
+            }
+        }
+        let bg = if i == sel { SELBG } else { BOX };
+        fb.panel(x + 2, r, w - 4, 1, bg);
+        let (g, col) = match m.state.as_str() {
+            "sent" | "active" => ("◆", v3(0.4, 0.85, 1.0) * (0.7 + 0.3 * (t * 3.0).sin().abs())),
+            "queued" => ("○", v3(1.0, 0.85, 0.4)),
+            _ => ("★", v3(1.0, 0.85, 0.4) * 0.8),
+        };
+        let mut c = seg(fb, x + 3, r, &format!("{g} "), 2, col, Some(bg));
+        c = seg(fb, c, r, &pad(&clip(&base_name(&m.cwd), 14), 15), 15, TEXT, Some(bg));
+        let who = match (m.state.as_str(), m.agent.and_then(|id| app.agent(id))) {
+            ("queued", _) => format!("#{pos} in line"),
+            (_, Some(a)) => a.kind.clone(),
+            _ => "recalled".into(),
+        };
+        let when = match m.state.as_str() {
+            "done" => ago(now.saturating_sub(m.done_at.unwrap_or(m.at)) as f32),
+            _ => ago(now.saturating_sub(m.at) as f32),
+        };
+        let right = format!("{who} · {when}");
+        let tw = (w - 8 - (c - x) - right.chars().count() as i32).max(4);
+        seg(fb, c, r, &clip(&m.text, tw as usize), tw, if m.state == "done" { DIM } else { TEXT }, Some(bg));
+        seg(fb, x + w - 3 - right.chars().count() as i32, r, &right, 30, DIM, Some(bg));
+        r += 1;
+    }
+    seg(fb, x + 3, y + h - 2, "⏎ comms with its agent · x call off / strike · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
+}
+
 fn moon(fb: &mut Fb, app: &App, planet: &str, branch: &Line, kind: usize, l: &Lay, t: f32) {
     let (x, y, w, h) = centered(l, 72, 12);
     let accent = v3(0.75, 0.8, 0.9);
@@ -1234,7 +1366,7 @@ fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch:
         species(fb, app, xx + 2, r, kind);
     }
     let xx = seg(fb, x + 3, r + 1, if launch { "○ " } else { "● " }, 2, accent, Some(BOX));
-    let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it for the next free agent here ({crew} in orbit)") };
+    let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it: the first free one of the {crew} here takes it (b gives all of them an order)") };
     seg(fb, xx, r + 1, &note, w - 8, later, Some(BOX));
     seg(fb, x + 3, y + h - 2, "⏎ give orders · ⇥ launch/queue · ↑↓ species · esc cancel", w - 6, DIM, Some(BOX));
 }
@@ -1258,6 +1390,13 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("n", "colonize: launch an agent in a folder (new or existing)"),
         ("e", "deploy another agent to the selected world"),
         ("x", "decommission the selected agent"),
+        ("r", "what the selected world needs, with quick actions"),
+        ("t / L", "give a world a mission / the mission log"),
+        ("b", "fleet order: one order to every agent in a system or world"),
+        ("u / D", "found a moon (git worktree) / dock it back"),
+        ("P", "give an agent priority in a border conflict"),
+        ("X", "forget a dormant world"),
+        ("1-9", "answer the incoming transmission"),
         ("wasd / drag", "pan        ± / wheel  zoom"),
         ("z / f", "fit galaxy / focus selection"),
         ("o", "toggle outliner        m  mute"),

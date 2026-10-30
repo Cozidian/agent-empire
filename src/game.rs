@@ -289,6 +289,10 @@ pub enum Mode {
     Colonize(Colonize),
     Deploy { planet: String, kind: usize },
     Confirm { id: u32 },
+    /// What a world needs, as a menu of quick actions.
+    Actions { planet: String, sel: usize },
+    /// Every mission in the empire: under way, queued, done.
+    Log { sel: usize },
     /// Founding a moon (git worktree) off a world.
     Moon { planet: String, branch: Line, kind: usize },
     /// Merging a moon back into its world.
@@ -502,6 +506,83 @@ impl App {
             history_saved: Instant::now(),
             click: ((-1, -1), Instant::now(), 0),
         }
+    }
+
+    /// What the world at `key` needs from you, most pressing first.
+    pub fn needs(&self, key: &str) -> Vec<Need> {
+        let mut v = Vec::new();
+        let here: Vec<&Agent> = self.agents.iter().filter(|a| a.cwd == key && a.dying.is_none()).collect();
+        for a in here.iter().filter(|a| a.status == Status::Blocked) {
+            let q = a.ask.as_ref().map_or("a question".to_string(), |q| format!("\"{}\"", clip(&q.question, 40)));
+            v.push(Need { badge: "▲".into(), label: format!("{} is waiting on you: {q}", a.kind), col: Status::Blocked.color(), act: Some(Act::Comms(a.id)) });
+        }
+        if let Some(a) = here.iter().find(|a| !a.war.is_empty()) {
+            let files = a.war.iter().flat_map(|w| w.files.clone()).collect::<Vec<_>>().join(", ");
+            v.push(Need { badge: "⚔".into(), label: format!("border conflict over {files}: give {} priority", a.kind), col: RED, act: Some(Act::Priority(a.id)) });
+        }
+        let s = self.survey.worlds.get(key);
+        let prs = s.and_then(|w| w.host.as_ref()).and_then(|h| self.survey.worlds.get(h)).or(s).map(|w| w.prs.clone()).unwrap_or_default();
+        for pr in prs.iter().filter(|p| p.ci == "fail") {
+            let text = format!("CI is failing on PR #{} ({}). Find out why with `gh pr checks {}` and fix it.", pr.number, pr.title, pr.number);
+            v.push(Need { badge: format!("✖#{}", pr.number), label: format!("CI failing on #{}: send someone to fix it", pr.number), col: RED, act: Some(Act::Mission(text)) });
+        }
+        if let Some(w) = s.filter(|w| w.git) {
+            if w.dirty > 0 {
+                let text = "Commit the uncommitted changes in this repo with clear messages, split into logical commits where it makes sense.".to_string();
+                v.push(Need { badge: format!("±{}", w.dirty), label: format!("{} uncommitted file{}: get them committed", w.dirty, if w.dirty == 1 { "" } else { "s" }), col: AMBER, act: Some(Act::Mission(text)) });
+            }
+            if w.behind > 0 {
+                let text = format!("Pull the latest changes from upstream into {} and sort out anything that comes up.", w.branch);
+                v.push(Need { badge: format!("↓{}", w.behind), label: format!("{} commit{} behind upstream: pull", w.behind, if w.behind == 1 { "" } else { "s" }), col: AMBER, act: Some(Act::Mission(text)) });
+            }
+            if w.ahead > 0 {
+                let text = format!("Push the unpushed commits on {} to the remote.", w.branch);
+                v.push(Need { badge: format!("↑{}", w.ahead), label: format!("{} unpushed commit{}: push", w.ahead, if w.ahead == 1 { "" } else { "s" }), col: AMBER, act: Some(Act::Mission(text)) });
+            }
+        }
+        let queued = self.missions.iter().filter(|m| m.cwd == key && m.state == "queued").count();
+        if queued > 0 && here.is_empty() {
+            v.push(Need { badge: format!("○{queued}"), label: format!("{queued} mission{} queued with no one here to take {}: press e to send a ship", if queued == 1 { "" } else { "s" }, if queued == 1 { "it" } else { "them" }), col: AMBER, act: None });
+        }
+        for a in here.iter().filter(|a| a.status == Status::Done) {
+            v.push(Need { badge: "✔".into(), label: format!("{} finished{}: take a look", a.kind, if a.title.is_empty() { String::new() } else { format!(" ({})", clip(&a.title, 30)) }), col: Status::Done.color(), act: Some(Act::Comms(a.id)) });
+        }
+        v
+    }
+
+    /// Carry out a quick action for the world at `key`.
+    fn act(&mut self, key: &str, act: Act, client: &Client, l: &Lay, t: f32) {
+        match act {
+            Act::Mission(text) => {
+                // a free agent there takes it; with no one there, a ship is sent with it
+                let crewed = self.agents.iter().any(|a| a.cwd == key && a.dying.is_none() && a.status != Status::Exited);
+                let kind = self.kinds.first().cloned().unwrap_or_else(|| "claude".into());
+                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed });
+                self.mode = Mode::Galaxy;
+                self.toast(if crewed { format!("mission queued: {}", clip(&text, 40)) } else { format!("ship launched: {}", clip(&text, 40)) }, t);
+            }
+            Act::Comms(id) => {
+                self.sel = Some(Sel::Agent(id));
+                self.open_comms(id, client, l);
+            }
+            Act::Priority(id) => {
+                client.send(Cmd::Priority(id));
+                self.mode = Mode::Galaxy;
+                self.toast("priority given: its rivals were told to stand down", t);
+            }
+        }
+    }
+
+    /// Missions in log order: under way, then queued (in dispatch order), then done (newest first).
+    pub fn mission_log(&self) -> Vec<&Mission> {
+        let mut v: Vec<&Mission> = self.missions.iter().collect();
+        let rank = |m: &Mission| match m.state.as_str() {
+            "active" | "sent" => 0,
+            "queued" => 1,
+            _ => 2,
+        };
+        v.sort_by_key(|m| (rank(m), if rank(m) == 2 { std::cmp::Reverse(m.done_at.unwrap_or(m.at)) } else { std::cmp::Reverse(0) }, m.id));
+        v
     }
 
     fn level(&self, key: &str) -> u8 {
@@ -1158,6 +1239,27 @@ fn key_bytes(k: &KeyEvent) -> Option<String> {
     Some(if alt { format!("\x1b{s}") } else { s })
 }
 
+/// Something a world needs from you, and the quick action that deals with it.
+pub struct Need {
+    /// Short form for the map ("±7"), and the full sentence for cards and menus.
+    pub badge: String,
+    pub label: String,
+    pub col: V3,
+    pub act: Option<Act>,
+}
+
+#[derive(Clone)]
+pub enum Act {
+    /// Hand the world a mission (queued for a free agent, or with a new ship if none).
+    Mission(String),
+    /// Open comms with an agent.
+    Comms(u32),
+    Priority(u32),
+}
+
+const AMBER: V3 = v3(1.0, 0.75, 0.3);
+const RED: V3 = v3(1.0, 0.4, 0.3);
+
 /// Points each world has earned, and which events were already counted.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct Prestige {
@@ -1530,6 +1632,64 @@ fn handle(
             app.mode = Mode::Galaxy;
             return false;
         }
+        Mode::Actions { planet, sel } => {
+            let (planet, mut s) = (planet.clone(), *sel);
+            let acts: Vec<Act> = app.needs(&planet).into_iter().filter_map(|n| n.act).collect();
+            let pick = match k.code {
+                KeyCode::Esc | KeyCode::Char('r') => {
+                    app.mode = Mode::Galaxy;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    s = s.saturating_sub(1);
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    s = (s + 1).min(acts.len().saturating_sub(1));
+                    None
+                }
+                KeyCode::Char(d @ '1'..='9') => acts.get(d as usize - '1' as usize).cloned(),
+                KeyCode::Enter => acts.get(s).cloned(),
+                _ => None,
+            };
+            if let Mode::Actions { sel, .. } = &mut app.mode {
+                *sel = s;
+            }
+            if let Some(a) = pick {
+                app.act(&planet, a, client, l, t);
+            }
+            return false;
+        }
+        Mode::Log { sel } => {
+            let mut s = *sel;
+            let log: Vec<(u32, Option<u32>)> = app.mission_log().iter().map(|m| (m.id, m.agent)).collect();
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('L') | KeyCode::Char('q') => app.mode = Mode::Galaxy,
+                KeyCode::Up | KeyCode::Char('k') => s = s.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => s = (s + 1).min(log.len().saturating_sub(1)),
+                // strike it: a queued mission is called off, a finished one leaves the log
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    if let Some((id, _)) = log.get(s) {
+                        client.send(Cmd::Scrub(*id));
+                        app.missions.retain(|m| m.id != *id);
+                        s = s.saturating_sub(1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(&(_, Some(aid))) = log.get(s)
+                        && app.agent(aid).is_some()
+                    {
+                        app.sel = Some(Sel::Agent(aid));
+                        app.open_comms(aid, client, l);
+                    }
+                }
+                _ => {}
+            }
+            if let Mode::Log { sel } = &mut app.mode {
+                *sel = s;
+            }
+            return false;
+        }
         Mode::Moon { planet, branch, kind } => {
             match k.code {
                 KeyCode::Esc => app.mode = Mode::Galaxy,
@@ -1745,6 +1905,12 @@ fn handle(
             Some(p) if app.moon_host(&p).is_some() => app.mode = Mode::Dock { moon: p },
             _ => app.toast("select a moon to dock it", t),
         },
+        KeyCode::Char('r') => match app.sel_planet() {
+            Some(p) if app.needs(&p).iter().any(|n| n.act.is_some()) => app.mode = Mode::Actions { planet: p, sel: 0 },
+            Some(p) => app.toast(format!("{} needs nothing from you right now ✓", base_name(&p)), t),
+            None => app.toast("select a world to see what it needs", t),
+        },
+        KeyCode::Char('L') => app.mode = Mode::Log { sel: 0 },
         KeyCode::Char('X') => match app.sel_planet() {
             Some(p) if w.planet(&p).is_some_and(|p| p.dormant) => {
                 app.history.remove(&p);
