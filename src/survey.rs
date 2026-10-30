@@ -30,6 +30,8 @@ pub struct World {
     pub github: bool,
     /// Your open pull requests there.
     pub prs: Vec<Pr>,
+    pub prs_checked: Option<i64>,
+    pub prs_error: Option<String>,
     /// PRs seen merged since the galaxy opened (number, title), oldest first.
     pub merged: Vec<(u32, String)>,
 }
@@ -100,14 +102,20 @@ impl Survey {
                     }
                     // moons share their world's pull requests; ask once per repo
                     if w.github && w.host.is_none() && due(&trade, TRADE) {
-                        let now = prs(path);
-                        // a PR that left the list was merged or closed: find out which
-                        for gone in w.prs.iter().filter(|o| !now.iter().any(|n| n.number == o.number)) {
-                            if pr_state(path, gone.number).as_deref() == Some("MERGED") {
-                                w.merged.push((gone.number, gone.title.clone()));
+                        match prs(path) {
+                            Ok(now) => {
+                                // A PR that left the list was merged or closed: find out which.
+                                for gone in w.prs.iter().filter(|o| !now.iter().any(|n| n.number == o.number)) {
+                                    if pr_state(path, gone.number).as_deref() == Some("MERGED") {
+                                        w.merged.push((gone.number, gone.title.clone()));
+                                    }
+                                }
+                                w.prs = now;
+                                w.prs_checked = Some(self::now());
+                                w.prs_error = None;
                             }
+                            Err(e) => w.prs_error = Some(e),
                         }
-                        w.prs = now;
                         trade.insert(path.clone(), Instant::now());
                     }
                     d.lock().unwrap().worlds.insert(path.clone(), w);
@@ -190,18 +198,18 @@ fn size(path: &str, w: &mut World) {
 }
 
 /// Your open PRs in the repo at `path`, with their CI verdict.
-fn prs(path: &str) -> Vec<Pr> {
+fn prs(path: &str) -> Result<Vec<Pr>, String> {
     let Ok(out) = Command::new("gh")
-        .args(["pr", "list", "--author", "@me", "--limit", "8", "--json", "number,title,statusCheckRollup"])
+        .args(["pr", "list", "--author", "@me", "--limit", "100", "--json", "number,title,statusCheckRollup"])
         .current_dir(path)
         .output()
     else {
-        return Vec::new();
+        return Err("GitHub unavailable: install gh and sign in".into());
     };
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    v.as_array()
-        .into_iter()
-        .flatten()
+    if !out.status.success() { return Err("GitHub refresh failed; check gh authentication and connection".into()); }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid GitHub response")?;
+    Ok(v.as_array().ok_or("Invalid GitHub response")?
+        .iter()
         .map(|p| {
             let checks: Vec<&serde_json::Value> = p["statusCheckRollup"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
             let word = |c: &serde_json::Value| c["conclusion"].as_str().or(c["state"].as_str()).unwrap_or("").to_uppercase();
@@ -216,7 +224,7 @@ fn prs(path: &str) -> Vec<Pr> {
             };
             Pr { number: p["number"].as_u64().unwrap_or(0) as u32, title: p["title"].as_str().unwrap_or("").into(), ci }
         })
-        .collect()
+        .collect())
 }
 
 fn pr_state(path: &str, n: u32) -> Option<String> {

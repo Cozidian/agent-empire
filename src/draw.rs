@@ -55,15 +55,17 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         }
     }
     match &app.mode {
+        Mode::Trade { sel } => trade_overview(fb, app, w, l, *sel, t),
         Mode::Colonize(c) => colonize(fb, app, c, l, t),
         Mode::Deploy { planet, kind } => deploy(fb, app, planet, *kind, l),
         Mode::Confirm { id } => confirm(fb, app, *id, l),
+        Mode::Ship { id, sel } => ship_card(fb, app, *id, *sel, l, t),
         Mode::Help => help(fb, l),
         Mode::Brief { planet, text, kind, launch, attachments, sending } => brief(fb, app, planet, text, *kind, *launch, attachments, *sending, l, t),
         Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
         Mode::Moon { planet, branch, kind } => moon(fb, app, planet, branch, *kind, l, t),
         Mode::Actions { planet, sel } => actions(fb, app, planet, *sel, l),
-        Mode::Log { sel, open } => mission_log(fb, app, *sel, open, l, t),
+        Mode::Log { world, sel, open } => mission_log(fb, app, world, *sel, open, l, t),
         Mode::Dock { moon } => dock(fb, app, moon, l),
         _ => {}
     }
@@ -471,6 +473,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
     // target reticle
     let target = match &app.sel {
+        Some(Sel::GitHub) => w.station.map(|p| (p, (13.0 * z).max(5.0) * 2.2 + 5.0)),
         Some(Sel::Agent(id)) => app.agent(*id).map(|a| (a.wpos, 6.0 * z.clamp(0.7, 2.2) + 2.0)),
         Some(Sel::Planet(k)) => w.planet(k).map(|p| (p.wpos, (p.r * z).max(2.5) + 6.0)),
         Some(Sel::Sys(k)) => w.systems.iter().find(|s| &s.key == k).map(|s| (s.wpos, (8.0 * z).max(2.2) + 8.0)),
@@ -548,8 +551,10 @@ fn ci_color(ci: &str) -> V3 {
 }
 
 /// Every PR across the empire, with the world it's from.
-fn all_prs(app: &App) -> Vec<(&String, &survey::Pr)> {
-    let mut v: Vec<(&String, &survey::Pr)> = app.survey.worlds.iter().flat_map(|(k, w)| w.prs.iter().map(move |p| (k, p))).collect();
+fn all_prs<'a>(app: &'a App, world: &'a World) -> Vec<(&'a String, &'a survey::Pr)> {
+    let mut v: Vec<_> = world.planets.iter().filter(|p| p.host.is_none()).filter_map(|p| {
+        app.survey.worlds.get(&p.key).filter(|s| s.github).map(|s| (&p.key, s))
+    }).flat_map(|(k, s)| s.prs.iter().map(move |p| (k, p))).collect();
     v.sort_by_key(|(k, p)| ((*k).clone(), p.number));
     v
 }
@@ -576,7 +581,7 @@ fn trade(fb: &mut Fb, app: &App, w: &World, (sx, sy): (f32, f32), scr: &dyn Fn((
             orb(fb, x, y, 1.6 * z.clamp(0.8, 1.5), v3(1.0, 0.8, 0.35));
         }
     }
-    let prs = all_prs(app);
+    let prs = all_prs(app, w);
     let worst = if prs.iter().any(|(_, p)| p.ci == "fail") {
         "fail"
     } else if prs.iter().any(|(_, p)| p.ci == "pending") {
@@ -610,6 +615,77 @@ fn trade(fb: &mut Fb, app: &App, w: &World, (sx, sy): (f32, f32), scr: &dyn Fn((
     }
 }
 
+pub fn station_label(app: &App, w: &World, l: &Lay) -> Option<(i32, i32, String)> {
+    let (sx, sy) = l.to_screen(&app.cam, w.station?);
+    let prs = all_prs(app, w);
+    let fails = prs.iter().filter(|(_, p)| p.ci == "fail").count();
+    let mut text = format!("◇ GITHUB · {} PR{}", prs.len(), if prs.len() == 1 { "" } else { "s" });
+    if fails > 0 { text.push_str(&format!(" · ✖{fails}")); }
+    let len = text.chars().count() as i32;
+    let c = ((sx / 2.0) as i32 - len / 2).min(l.cols - l.pw - len - 1);
+    let r = ((sy + (13.0 * app.cam.z).max(5.0) * 1.3 + 8.0) / 4.0) as i32;
+    Some((c, r, text))
+}
+
+fn trade_layout(l: &Lay, count: usize, selected: usize) -> (i32, i32, i32, i32, usize, usize) {
+    let (x, y, width, height) = centered(l, 96, (count as i32 + 9).max(13).min(l.rows - 2));
+    let room = (height - 8).max(1) as usize;
+    let selected = selected.min(count.saturating_sub(1));
+    let offset = (selected + 1).saturating_sub(room);
+    (x, y, width, height, offset, room)
+}
+
+pub fn trade_hit(l: &Lay, count: usize, selected: usize, col: i32, row: i32) -> Option<usize> {
+    let (x, y, width, _, offset, room) = trade_layout(l, count, selected);
+    if col < x + 2 || col >= x + width - 2 || row < y + 4 || row >= y + 4 + room as i32 { return None; }
+    let index = offset + (row - y - 4) as usize;
+    (index < count).then_some(index)
+}
+
+fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usize, t: f32) {
+    let rows = app.trade_rows(world);
+    let selected = selected.min(rows.len().saturating_sub(1));
+    let (x, y, width, height, offset, room) = trade_layout(l, rows.len(), selected);
+    let accent = v3(0.6, 0.8, 1.0);
+    let projects = rows.iter().filter(|r| r.pr.is_none()).count();
+    let prs = rows.len() - projects;
+    frame_box(fb, x, y, width, height, &format!("◇ GITHUB · {projects} projects · {prs} PRs"), accent);
+    seg(fb, x + 3, y + 2, "Projects in this galaxy · your open PRs · failing checks first", width - 6, DIM, Some(BOX));
+    if rows.is_empty() {
+        seg(fb, x + 3, y + 4, "No GitHub projects in this galaxy yet.", width - 6, TEXT, Some(BOX));
+    }
+    for (i, row) in rows.iter().enumerate().skip(offset).take(room) {
+        let r = y + 4 + (i - offset) as i32;
+        let bg = if i == selected { SELBG } else { BOX };
+        fb.panel(x + 2, r, width - 4, 1, bg);
+        if let Some(pr) = &row.pr {
+            let (icon, status) = match pr.ci { "fail" => ("✖", "failing"), "pending" => ("◷", "pending"), "pass" => ("✔", "passing"), _ => ("○", "no checks") };
+            let prefix = format!("  {icon} #{} ", pr.number);
+            let c = seg(fb, x + 3, r, &prefix, width - 18, ci_color(pr.ci), Some(bg));
+            seg(fb, c, r, &clip(&pr.title, (x + width - 15 - c).max(1) as usize), (x + width - 15 - c).max(1), TEXT, Some(bg));
+            seg(fb, x + width - 13, r, status, 10, ci_color(pr.ci), Some(bg));
+        } else if let Some(s) = app.survey.worlds.get(&row.path) {
+            let state = if s.prs_error.is_some() { "PRs unavailable".to_string() }
+                else if s.prs_checked.is_none() { "checking PRs…".to_string() }
+                else if s.prs.is_empty() { "no open PRs".to_string() }
+                else { format!("{} PRs", s.prs.len()) };
+            let summary = format!("{state} · ↑{} unpushed", s.ahead);
+            let room = (width - summary.chars().count() as i32 - 9).max(1);
+            seg(fb, x + 3, r, &clip(&format!("● {}", base_name(&row.path)), room as usize), room, accent, Some(bg));
+            seg(fb, x + width - 3 - summary.chars().count() as i32, r, &summary, summary.chars().count() as i32, DIM, Some(bg));
+        }
+    }
+    if let Some(row) = rows.get(selected) {
+        let s = &app.survey.worlds[&row.path];
+        let note = if let Some((message, _)) = app.toast.as_ref().filter(|(_, at)| t - at < 3.2) { message.clone() }
+            else if let Some(error) = &s.prs_error { format!("{error} · showing cached PRs") }
+            else if let Some(at) = s.prs_checked { format!("{} · checked {} ago · up to 100 PRs/project", tilde(&row.path), ago((survey::now() - at).max(0) as f32)) }
+            else { format!("{} · waiting for GitHub survey", tilde(&row.path)) };
+        seg(fb, x + 3, y + height - 3, &clip(&note, (width - 6).max(1) as usize), width - 6, DIM, Some(BOX));
+    }
+    seg(fb, x + 3, y + height - 2, "↑↓ / wheel select · ⏎ project: focus / PR: browser · esc close", width - 6, DIM, Some(BOX));
+}
+
 fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     let cam = &app.cam;
     let z = cam.z;
@@ -625,17 +701,10 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         }
     }
     if let Some(st) = w.station {
-        let (sx, sy) = l.to_screen(cam, st);
-        let prs = all_prs(app);
+        let (sx, _) = l.to_screen(cam, st);
+        let prs = all_prs(app, w);
         let fails = prs.iter().filter(|(_, p)| p.ci == "fail").count();
-        let mut s = format!("◇ GITHUB · {} PR{}", prs.len(), if prs.len() == 1 { "" } else { "s" });
-        if fails > 0 {
-            s.push_str(&format!(" · ✖{fails}"));
-        }
-        let len = s.chars().count() as i32;
-        let (c, r) = ((sx / 2.0) as i32 - len / 2, ((sy + (13.0 * z).max(5.0) * 1.3 + 8.0) / 4.0) as i32);
-        // slide it back into view rather than lose it at the edge of the map
-        let c = c.min(cw - len - 1);
+        let (c, r, s) = station_label(app, w, l).unwrap();
         if in_view(c, r) && (sx / 2.0) < cw as f32 {
             fb.text(c, r, &s, if fails > 0 { v3(1.0, 0.45, 0.4) } else { v3(0.6, 0.75, 0.9) });
         }
@@ -950,14 +1019,75 @@ fn system_rows(app: &App, w: &World, s: &System, t: f32) -> Rows {
     rows
 }
 
-/// A Stellaris-style info card for the selected world or system, bottom left of the map.
+/// One ship: what it's on, what it has cost, and the orders it carries.
+fn ship_rows(app: &App, w: &World, a: &Agent, t: f32) -> Rows {
+    let mut rows: Rows = Vec::new();
+    if let Some(q) = &a.ask {
+        rows.push(("asking", vec![(clip(&q.question, 42), Status::Blocked.color())]));
+    }
+    rows.push(("task", vec![(if a.title.is_empty() { "—".into() } else { clip(&a.title, 42) }, TEXT)]));
+    let mut home = vec![];
+    if let Some(p) = w.planet(&a.cwd) {
+        home.push((format!("{} ", p.name), planet_color(p)));
+        if let Some(h) = p.host {
+            home.push((format!("☾ moon of {} ", w.planets[h].name), DIM));
+        }
+    }
+    if let Some(g) = app.survey.worlds.get(&a.cwd).filter(|g| g.git) {
+        home.push((format!("⎇ {}", g.branch), v3(0.6, 0.85, 1.0)));
+    }
+    if !home.is_empty() {
+        rows.push(("world", home));
+    }
+    let rep = &a.report;
+    if let Some(m) = &rep.model {
+        rows.push(("model", vec![(m.clone(), kind_color(&a.kind))]));
+    }
+    if let Some(c) = rep.ctx {
+        rows.push(("context", vec![(format!("{} {c:.0}%", meter(c / 100.0, 8)), strain(c))]));
+    }
+    let mut out = vec![(format!("{} turn{} ", a.turns, if a.turns == 1 { "" } else { "s" }), TEXT)];
+    if rep.added.is_some() || rep.removed.is_some() {
+        out.push((format!("+{} ", num(rep.added.unwrap_or(0))), v3(0.4, 0.95, 0.6)));
+        out.push((format!("−{}", num(rep.removed.unwrap_or(0))), v3(1.0, 0.45, 0.4)));
+    }
+    if a.status == Status::Working {
+        out.push((format!("  working {}", ago(t - a.busy_at)), DIM));
+    }
+    rows.push(("output", out));
+    if let Some(c) = rep.cost {
+        rows.push(("upkeep", vec![(format!("${c:.2}"), v3(1.0, 0.85, 0.4)), (" this session".into(), DIM)]));
+    }
+    for war in &a.war {
+        let rival = app.agent(war.rival).map_or(format!("#{}", war.rival), |r| format!("{} #{}", r.kind, r.id));
+        rows.push(("conflict", vec![(format!("⚔ vs {rival} "), v3(1.0, 0.45, 0.3)), (war.files.join(", "), TEXT)]));
+    }
+    fleet_row(&mut rows, app, &[a]);
+    // its own orders: what it's on now first, then what it finished
+    let mut ms: Vec<&crate::proto::Mission> = app.missions.iter().filter(|m| m.agent == Some(a.id)).collect();
+    ms.sort_by_key(|m| (m.state == "done", std::cmp::Reverse(m.done_at.unwrap_or(m.at))));
+    for (i, m) in ms.iter().take(4).enumerate() {
+        let (g, c) = if m.state == "done" { ("★", v3(1.0, 0.85, 0.4)) } else { ("◆", v3(0.4, 0.85, 1.0)) };
+        rows.push((if i == 0 { "missions" } else { "" }, vec![(format!("{g} "), c), (clip(&m.text, 38), if m.state == "done" { DIM } else { TEXT })]));
+    }
+    if ms.len() > 4 {
+        rows.push(("", vec![(format!("+{} more", ms.len() - 4), DIM)]));
+    }
+    rows
+}
+
+/// A Stellaris-style info card for the selected ship, world or system, bottom left of the map.
 fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     let planet_key = match &app.sel {
         Some(Sel::Planet(k)) => Some(k.clone()),
-        Some(Sel::Agent(id)) => app.agent(*id).map(|a| a.cwd.clone()),
         _ => None,
     };
-    let (title, sub, accent, rows) = if let Some(p) = planet_key.as_deref().and_then(|k| w.planet(k)) {
+    let (title, sub, accent, rows) = if let Some(Sel::Agent(id)) = &app.sel
+        && let Some(a) = app.agent(*id)
+    {
+        let sub = format!("{} {} · {} · {}", a.status.glyph(t), a.status.label(), ago(t - a.since), tilde(&a.cwd));
+        (format!("◆ {} #{} · {}", a.kind.to_uppercase(), a.id, base_name(&a.cwd).to_uppercase()), sub, kind_color(&a.kind), ship_rows(app, w, a, t))
+    } else if let Some(p) = planet_key.as_deref().and_then(|k| w.planet(k)) {
         if let Some(h) = p.host {
             let sub = format!("moon of {} · worktree at {}", w.planets[h].name, tilde(&p.key));
             (format!("☾ {}", p.name.to_uppercase()), sub, planet_color(p), planet_rows(app, w, p, t))
@@ -969,6 +1099,14 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         && let Some(s) = w.systems.iter().find(|s| &s.key == k)
     {
         (format!("✶ {} SYSTEM", s.name.to_uppercase()), tilde(&s.key), s.star, system_rows(app, w, s, t))
+    } else if app.sel == Some(Sel::GitHub) {
+        let projects = app.trade_rows(w).iter().filter(|r| r.pr.is_none()).count();
+        let rows = vec![
+            ("projects", vec![(projects.to_string(), TEXT)]),
+            ("your PRs", vec![(all_prs(app, w).len().to_string(), TEXT)]),
+            ("browse", vec![("⏎ projects and pull requests".into(), TEXT)]),
+        ];
+        ("◇ GITHUB STATION".into(), "Projects in this galaxy".into(), v3(0.6, 0.8, 1.0), rows)
     } else {
         return;
     };
@@ -1041,14 +1179,15 @@ fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {
         Some(_) => " · m mute",
     };
     let ctx = match &app.sel {
-        Some(Sel::Agent(id)) if app.agent(*id).is_some_and(|a| !a.war.is_empty()) => "⏎ comms · P give priority · x decommission · ",
-        Some(Sel::Agent(_)) => "⏎ comms · t mission · e deploy here · x decommission · ",
-        Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ comms · t mission · D dock · e deploy here · ",
-        Some(Sel::Planet(_)) => "⏎ comms · r needs · t mission · b fleet · u moon · e deploy · ",
+        Some(Sel::Agent(id)) if app.agent(*id).is_some_and(|a| !a.war.is_empty()) => "⏎ ship card · P give priority · L missions · x decommission · ",
+        Some(Sel::Agent(_)) => "⏎ ship card · t mission · L missions · e deploy here · x decommission · ",
+        Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ comms · t mission · L missions · D dock · e deploy here · ",
+        Some(Sel::Planet(_)) => "⏎ comms · r needs · t mission · L missions · b fleet · u moon · e deploy · ",
         Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
+        Some(Sel::GitHub) => "⏎ projects and pull requests · ",
         None => "",
     };
-    let s = format!(" {ctx}n colonize · L missions · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit");
+    let s = format!(" {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit");
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1089,6 +1228,9 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         }
         let c0 = x0 + 2;
         match sel {
+            Sel::GitHub => {
+                seg(fb, c0, row, "◇ GITHUB STATION", inner as i32, v3(0.6, 0.8, 1.0), Some(bg));
+            }
             Sel::Sys(key) => {
                 let s = w.systems.iter().find(|s| &s.key == key);
                 let col = s.map_or(DIM, |s| s.star * 0.8);
@@ -1253,7 +1395,7 @@ fn fleet_order(fb: &mut Fb, app: &App, w: &World, target: &Sel, text: &Line, l: 
     let name = match target {
         Sel::Sys(k) => format!("{} SYSTEM", base_name(k).to_uppercase()),
         Sel::Planet(k) => base_name(k).to_uppercase(),
-        Sel::Agent(_) => String::new(),
+        Sel::Agent(_) | Sel::GitHub => String::new(),
     };
     frame_box(fb, x, y, bw, h, &format!("◆ FLEET ORDER · {name}"), accent);
     let ships = app.fleet(w, target);
@@ -1300,9 +1442,9 @@ fn actions(fb: &mut Fb, app: &App, planet: &str, sel: usize, l: &Lay) {
     seg(fb, x + 3, y + h - 2, "1-9 / ⏎ act · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
 }
 
-/// The mission log, grouped by status, world, system or fleet order; open missions show in full.
-fn mission_log(fb: &mut Fb, app: &App, sel: usize, open: &HashSet<u32>, l: &Lay, t: f32) {
-    let log = app.mission_log();
+/// A world's mission log, grouped by status, world or moon, or fleet order; open missions show in full.
+fn mission_log(fb: &mut Fb, app: &App, world: &str, sel: usize, open: &HashSet<u32>, l: &Lay, t: f32) {
+    let log = app.mission_log(world);
     let accent = v3(1.0, 0.85, 0.4);
     let w = 96.min(l.cols - 4);
     // lay the log out as lines first, so expanded missions scroll like the rest
@@ -1346,10 +1488,10 @@ fn mission_log(fb: &mut Fb, app: &App, sel: usize, open: &HashSet<u32>, l: &Lay,
     let (x, y, w, h) = centered(l, w, (l.rows - 6).min(lines.len() as i32 + 6).max(12));
     let under = log.iter().filter(|(_, m)| matches!(m.state.as_str(), "sent" | "active")).count();
     let queued = log.iter().filter(|(_, m)| m.state == "queued").count();
-    let title = format!("★ MISSION LOG · {under} under way · {queued} queued · {} done · by {}", log.len() - under - queued, app.log_sort.label());
+    let title = format!("★ {} MISSIONS · {under} under way · {queued} queued · {} done · by {}", base_name(world).to_uppercase(), log.len() - under - queued, app.log_sort.label());
     frame_box(fb, x, y, w, h, &title, accent);
     if log.is_empty() {
-        seg(fb, x + 3, y + 2, "No missions yet. Select a world and press t to give it one, or r for what it needs.", w - 6, DIM, Some(BOX));
+        seg(fb, x + 3, y + 2, "No missions here yet. Press t to give this world one, or r for what it needs.", w - 6, DIM, Some(BOX));
     }
     // keep the whole selected mission in view, and its heading when there's room
     let room = (h - 5).max(1) as usize;
@@ -1511,6 +1653,60 @@ fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch:
     seg(fb, x + 3, y + h - 2, if sending { "Sending mission…" } else { "⏎ give orders · ⇥ launch/queue · ↑↓ species · esc cancel" }, w - 6, DIM, Some(BOX));
 }
 
+/// The ship card's frame: five lines about the ship, then its menu.
+fn ship_box(app: &App, id: u32, l: &Lay) -> (i32, i32, i32, i32) {
+    centered(l, 64, app.ship_acts(id).len() as i32 + 11)
+}
+
+/// Where a click lands on the ship card: outside it (None), on menu item i, or elsewhere on it.
+pub fn ship_hit(app: &App, id: u32, l: &Lay, c: i32, r: i32) -> Option<Option<usize>> {
+    let (x, y, w, h) = ship_box(app, id, l);
+    if c < x || c >= x + w || r < y || r >= y + h {
+        return None;
+    }
+    let i = r - (y + 8);
+    Some((i >= 0 && (i as usize) < app.ship_acts(id).len()).then_some(i as usize))
+}
+
+fn ship_card(fb: &mut Fb, app: &App, id: u32, sel: usize, l: &Lay, t: f32) {
+    let Some(a) = app.agent(id) else { return };
+    let (x, y, w, h) = ship_box(app, id, l);
+    let accent = kind_color(&a.kind);
+    frame_box(fb, x, y, w, h, &format!("◆ {} · {}", a.kind.to_uppercase(), base_name(&a.cwd).to_uppercase()), accent);
+    let iw = w - 6;
+    let c = seg(fb, x + 3, y + 2, &format!("{} {}", a.status.glyph(t), a.status.label()), iw, a.status.color(), Some(BOX));
+    seg(fb, c, y + 2, &format!(" · {} · {} turns", ago(t - a.since), a.turns), x + w - 3 - c, DIM, Some(BOX));
+    let mission = app.missions.iter().filter(|m| m.agent == Some(id) && m.state != "done").map(|m| m.text.as_str()).last();
+    let rep = &a.report;
+    let mut stats: Vec<String> = Vec::new();
+    stats.extend(rep.model.clone());
+    stats.extend(rep.ctx.map(|c| format!("{c:.0}% context")));
+    stats.extend(rep.cost.map(|c| format!("${c:.2}")));
+    if rep.added.is_some() || rep.removed.is_some() {
+        stats.push(format!("+{} −{}", rep.added.unwrap_or(0), rep.removed.unwrap_or(0)));
+    }
+    let lines = [
+        ("task", if a.title.is_empty() { "—".to_string() } else { a.title.clone() }),
+        ("mission", mission.map_or("none".into(), |m| m.replace('\n', " "))),
+        ("world", tilde(&a.cwd)),
+        ("report", if stats.is_empty() { "—".into() } else { stats.join(" · ") }),
+    ];
+    for (i, (k, v)) in lines.iter().enumerate() {
+        let r = y + 3 + i as i32;
+        seg(fb, x + 3, r, k, 9, DIM * 0.9, Some(BOX));
+        seg(fb, x + 13, r, &clip(v, (iw - 10) as usize), iw - 10, TEXT, Some(BOX));
+    }
+    for (i, act) in app.ship_acts(id).iter().enumerate() {
+        let r = y + 8 + i as i32;
+        let bg = if i == sel { SELBG } else { BOX };
+        fb.panel(x + 2, r, w - 4, 1, bg);
+        let col = if *act == ShipAct::Decommission { v3(1.0, 0.4, 0.3) } else { accent };
+        let c = seg(fb, x + 3, r, &format!(" {} ", i + 1), 3, BOX, Some(col * 0.9));
+        seg(fb, c + 1, r, act.label(), iw - 4, TEXT, Some(bg));
+    }
+    seg(fb, x + 3, y + h - 2, "1-9 / ⏎ act · ↑↓ choose · esc / click outside closes", iw, DIM, Some(BOX));
+}
+
 fn confirm(fb: &mut Fb, app: &App, id: u32, l: &Lay) {
     let (x, y, w, h) = centered(l, 60, 8);
     let accent = v3(1.0, 0.4, 0.3);
@@ -1525,13 +1721,13 @@ fn help(fb: &mut Fb, l: &Lay) {
     let lines = [
         ("GALAXY", ""),
         ("↑↓ / j k", "select in the outliner"),
-        ("⏎ / click twice", "open comms (live terminal with the agent)"),
+        ("⏎ / click twice", "a ship's card: comms, missions, priority, decommission"),
         ("⇥", "next agent that needs you"),
         ("n", "colonize: launch an agent in a folder (new or existing)"),
         ("e", "deploy another agent to the selected world"),
         ("x", "decommission the selected agent"),
         ("r", "what the selected world needs, with quick actions"),
-        ("t / L", "give a world a mission / the mission log"),
+        ("t / L", "give a world a mission / its mission log"),
         ("b", "fleet order: one order to every agent in a system or world"),
         ("u / D", "found a moon (git worktree) / dock it back"),
         ("P", "give an agent priority in a border conflict"),
