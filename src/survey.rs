@@ -30,6 +30,8 @@ pub struct World {
     pub github: bool,
     /// Your open pull requests there.
     pub prs: Vec<Pr>,
+    /// PRs seen merged since the galaxy opened (number, title), oldest first.
+    pub merged: Vec<(u32, String)>,
 }
 
 #[derive(Clone, Default, Debug, PartialEq)]
@@ -98,7 +100,14 @@ impl Survey {
                     }
                     // moons share their world's pull requests; ask once per repo
                     if w.github && w.host.is_none() && due(&trade, TRADE) {
-                        w.prs = prs(path);
+                        let now = prs(path);
+                        // a PR that left the list was merged or closed: find out which
+                        for gone in w.prs.iter().filter(|o| !now.iter().any(|n| n.number == o.number)) {
+                            if pr_state(path, gone.number).as_deref() == Some("MERGED") {
+                                w.merged.push((gone.number, gone.title.clone()));
+                            }
+                        }
+                        w.prs = now;
                         trade.insert(path.clone(), Instant::now());
                     }
                     d.lock().unwrap().worlds.insert(path.clone(), w);
@@ -208,6 +217,11 @@ fn prs(path: &str) -> Vec<Pr> {
             Pr { number: p["number"].as_u64().unwrap_or(0) as u32, title: p["title"].as_str().unwrap_or("").into(), ci }
         })
         .collect()
+}
+
+fn pr_state(path: &str, n: u32) -> Option<String> {
+    let out = Command::new("gh").args(["pr", "view", &n.to_string(), "--json", "state", "-q", ".state"]).current_dir(path).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn lang(ext: &str) -> Option<&'static str> {

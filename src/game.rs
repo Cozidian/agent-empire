@@ -145,6 +145,8 @@ pub struct Planet {
     /// A moon (git worktree) orbits this planet instead of a star.
     pub host: Option<usize>,
     pub moons: Vec<usize>,
+    /// Development from prestige: 0 outpost, 1 colony, 2 city world, 3 ecumenopolis.
+    pub level: u8,
     /// No agents here now: a world from the empire's history.
     pub dormant: bool,
     /// 0 (lively) … 1 (forgotten, lost in the nebula), from how long it's been left alone.
@@ -326,6 +328,9 @@ pub struct App {
     /// Lines scrolled back in the comms window (0 = live).
     pub scroll: usize,
     pub missions: Vec<Mission>,
+    pub prestige: Prestige,
+    /// Worlds that just levelled up, waiting for their fanfare on the map.
+    pub fanfares: Vec<String>,
     /// Every world ever colonized, and when it last had agents.
     pub history: HashMap<String, u64>,
     history_saved: Instant,
@@ -491,9 +496,39 @@ impl App {
             pick: None,
             survey: survey::Snapshot::default(),
             missions: Vec::new(),
+            prestige: std::fs::read_to_string(prestige_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+            fanfares: Vec::new(),
             history: std::fs::read_to_string(history_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
             history_saved: Instant::now(),
             click: ((-1, -1), Instant::now(), 0),
+        }
+    }
+
+    fn level(&self, key: &str) -> u8 {
+        level_of(self.prestige.worlds.get(key).copied().unwrap_or(0))
+    }
+
+    /// Prestige for a world, once per event `id`; a new development level gets a fanfare.
+    fn award(&mut self, key: &str, id: String, pts: u32, why: &str, cues: &mut Vec<Cue>) {
+        // moons earn for their world
+        let key = self.moon_host(key).unwrap_or_else(|| key.to_string());
+        if !self.prestige.counted.insert(id) {
+            return;
+        }
+        let before = self.prestige.worlds.get(&key).copied().unwrap_or(0);
+        let after = before + pts;
+        self.prestige.worlds.insert(key.clone(), after);
+        let _ = std::fs::create_dir_all(crate::daemon::dirs_state());
+        let _ = std::fs::write(prestige_file(), serde_json::to_string(&self.prestige).unwrap_or_default());
+        let place = base_name(&key);
+        self.say(format!("✦ +{pts} prestige · {place}: {why}"), v3(1.0, 0.85, 0.4));
+        let (l0, l1) = (level_of(before), level_of(after));
+        if l1 > l0 {
+            let name = LEVELS[l1 as usize].1;
+            self.say(format!("♛ {place} is now a{} {name}!", if name.starts_with(['a', 'e', 'i', 'o', 'u']) { "n" } else { "" }), v3(1.0, 0.9, 0.5));
+            self.fanfares.push(key);
+            cues.push(Cue::Done);
+            cues.push(Cue::Spawn);
         }
     }
 
@@ -541,7 +576,10 @@ impl App {
     }
 
     /// New mission log from the daemon; announce what changed.
-    fn track(&mut self, missions: Vec<Mission>) {
+    fn track(&mut self, missions: Vec<Mission>, cues: &mut Vec<Cue>) {
+        for m in missions.iter().filter(|m| m.state == "done") {
+            self.award(&m.cwd, format!("mission-{}-{}", m.id, m.at), 2, &format!("mission accomplished ({})", clip(&m.text, 30)), cues);
+        }
         if self.loaded && !self.missions.is_empty() {
             for m in &missions {
                 let old = self.missions.iter().find(|o| o.id == m.id).map(|o| o.state.as_str());
@@ -813,7 +851,7 @@ impl App {
                 sys.orbits.push(orbit);
                 sys.planets.push(planets.len());
                 let (dormant, fog, last_seen) = self.fog(pkey, live, now);
-                planets.push(Planet { key: pkey.clone(), name: base_name(pkey), agents: members, terrain: (h >> 8) as u8 % 7, seed, wpos, r, host: None, moons: Vec::new(), dormant, fog, last_seen });
+                planets.push(Planet { key: pkey.clone(), name: base_name(pkey), agents: members, terrain: (h >> 8) as u8 % 7, seed, wpos, r, host: None, moons: Vec::new(), dormant, fog, last_seen, level: self.level(pkey) });
             }
             systems.push(sys);
         }
@@ -843,7 +881,7 @@ impl App {
             let idx = planets.len();
             planets[hi].moons.push(idx);
             // moons are grey, cratered rock
-            planets.push(Planet { key: mkey.clone(), name, agents: members, terrain: 3, seed, wpos, r, host: Some(hi), moons: Vec::new(), dormant: live == 0, fog: 0.0, last_seen: now });
+            planets.push(Planet { key: mkey.clone(), name, agents: members, terrain: 3, seed, wpos, r, host: Some(hi), moons: Vec::new(), dormant: live == 0, fog: 0.0, last_seen: now, level: 0 });
         }
         let mut lanes = Vec::new();
         for i in 0..systems.len() {
@@ -1120,6 +1158,24 @@ fn key_bytes(k: &KeyEvent) -> Option<String> {
     Some(if alt { format!("\x1b{s}") } else { s })
 }
 
+/// Points each world has earned, and which events were already counted.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct Prestige {
+    pub worlds: HashMap<String, u32>,
+    pub counted: std::collections::HashSet<String>,
+}
+
+fn prestige_file() -> PathBuf {
+    crate::daemon::dirs_state().join("prestige.json")
+}
+
+/// Prestige needed for each development level, and its name.
+pub const LEVELS: [(u32, &str); 4] = [(0, "outpost"), (4, "colony"), (12, "city world"), (25, "ecumenopolis")];
+
+pub fn level_of(points: u32) -> u8 {
+    LEVELS.iter().rposition(|(p, _)| points >= *p).unwrap_or(0) as u8
+}
+
 fn history_file() -> PathBuf {
     crate::daemon::dirs_state().join("worlds.json")
 }
@@ -1227,7 +1283,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             match m {
                 Msg::Agents(list, missions) => {
                     app.apply(list, t, &mut cues);
-                    app.track(missions);
+                    app.track(missions, &mut cues);
                 }
                 Msg::Down(e) => {
                     app.online = false;
@@ -1252,8 +1308,8 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                     match result {
                         Ok(()) => {
                             app.burst(at, v3(0.6, 0.85, 1.0), t, 48);
-                            app.say(format!("⚓ moon {name} docked with {host}: its branch is merged"), v3(0.6, 0.85, 1.0));
-                            app.toast(format!("⚓ {name} docked"), t);
+                            app.say(format!("⊕ moon {name} docked with {host}: its branch is merged"), v3(0.6, 0.85, 1.0));
+                            app.toast(format!("⊕ {name} docked"), t);
                             if app.sel == Some(Sel::Planet(moon.clone())) {
                                 app.sel = None;
                             }
@@ -1264,7 +1320,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                                 app.burst(at, v3(1.0, 0.35, 0.2), t, 80);
                                 cues.push(Cue::Blocked);
                             }
-                            app.say(format!("{} {name}: {e}", if crash { "💥" } else { "✖" }), v3(1.0, 0.4, 0.3));
+                            app.say(format!("{} {name}: {e}", if crash { "✸" } else { "✖" }), v3(1.0, 0.4, 0.3));
                             app.toast(format!("docking failed: {e}"), t);
                         }
                     }
@@ -1286,6 +1342,14 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
 
         let lay = Lay::new(&fb, app.panel);
         let world = app.world(t, dt);
+        for key in std::mem::take(&mut app.fanfares) {
+            if let Some(p) = world.planet(&key) {
+                let pos = p.wpos;
+                app.burst(pos, v3(1.0, 0.85, 0.35), t, 120);
+                app.fx.push(Fx::Ring { x: pos.0, y: pos.1, t0: t + 0.3, col: v3(1.0, 0.95, 0.7), speed: 70.0, dur: 1.8 });
+                app.toast(format!("♛ {} levelled up", p.name), t);
+            }
+        }
         if !app.fitted && app.loaded {
             app.fit(&world, &lay);
             (app.cam.x, app.cam.y, app.cam.z) = (app.cam.tx, app.cam.ty, app.cam.tz);
@@ -1294,7 +1358,22 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         if surveyed.elapsed() > Duration::from_millis(500) {
             survey.watch(world.planets.iter().map(|p| p.key.clone()).collect());
             let snap = survey.snapshot();
+            let mut awards: Vec<(String, String, u32, String)> = Vec::new();
             for (path, w) in &snap.worlds {
+                let old = app.survey.worlds.get(path);
+                // everything committed again, with agents at work there
+                if w.git && w.dirty == 0 && old.is_some_and(|o| o.git && o.dirty > 0) && app.agents.iter().any(|a| &a.cwd == path && a.dying.is_none()) {
+                    let n = old.map_or(0, |o| o.dirty);
+                    awards.push((path.clone(), format!("clean-{path}-{}", survey::now()), 1, format!("all committed ({n} file{})", if n == 1 { "" } else { "s" })));
+                }
+                for (n, title) in &w.merged {
+                    awards.push((path.clone(), format!("merged-{path}-{n}"), 5, format!("PR #{n} merged: {}", clip(title, 30))));
+                }
+                for pr in w.prs.iter().filter(|p| p.ci == "pass") {
+                    if old.and_then(|o| o.prs.iter().find(|p| p.number == pr.number)).is_some_and(|p| p.ci != "pass") {
+                        awards.push((path.clone(), format!("green-{path}-{}", pr.number), 1, format!("CI green on #{}", pr.number)));
+                    }
+                }
                 for pr in &w.prs {
                     let before = app.survey.worlds.get(path).and_then(|o| o.prs.iter().find(|p| p.number == pr.number)).map(|p| p.ci);
                     match (before, pr.ci) {
@@ -1304,13 +1383,16 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                         }
                         (Some(b), "pass") if b != "pass" => app.say(format!("✔ CI green on #{} ({})", pr.number, base_name(path)), v3(0.4, 0.95, 0.6)),
                         (None, _) if app.survey.worlds.contains_key(path) && app.survey.worlds[path].github => {
-                            app.say(format!("⛴ PR #{} docked at the station ({})", pr.number, base_name(path)), v3(0.6, 0.85, 1.0))
+                            app.say(format!("▸ PR #{} docked at the station ({})", pr.number, base_name(path)), v3(0.6, 0.85, 1.0))
                         }
                         _ => {}
                     }
                 }
             }
             app.survey = snap;
+            for (path, id, pts, why) in awards {
+                app.award(&path, id, pts, &why, &mut cues);
+            }
             surveyed = Instant::now();
         }
         // a comms target that's gone for good drops you back to the galaxy
@@ -1469,7 +1551,7 @@ fn handle(
         Mode::Dock { moon } => {
             if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 client.send(Cmd::Dock(moon.clone()));
-                app.toast("⚓ docking…", t);
+                app.toast("⊕ docking…", t);
             }
             app.mode = Mode::Galaxy;
             return false;
