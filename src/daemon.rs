@@ -733,7 +733,7 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
                     taken.insert(id);
                     m.state = "sent".into();
                     m.agent = Some(id);
-                    order(a.clone(), m.text.clone());
+                    order(a.clone(), crate::screenshots::prompt(&m.text, &m.attachments));
                 }
             }
             "sent" | "active" => match me {
@@ -763,7 +763,9 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
 /// it as a pasted newline.
 fn order(a: Arc<Mutex<Agent>>, text: String) {
     thread::spawn(move || {
-        let _ = a.lock().unwrap().writer.write_all(text.as_bytes());
+        // Multiline mission prompts and image references must be a single paste.
+        let pasted = format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""));
+        let _ = a.lock().unwrap().writer.write_all(pasted.as_bytes());
         thread::sleep(Duration::from_millis(150));
         let mut g = a.lock().unwrap();
         g.last_in = Instant::now();
@@ -1017,11 +1019,13 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             });
             Resp::Ok
         }
-        Req::Mission { cwd, text, kind, launch } => {
+        Req::Mission { cwd, text, kind, launch, attachments } => {
+            if let Err(msg) = crate::screenshots::validate(&attachments) { return Resp::Err { msg }; }
             let id = hub.lock().unwrap().missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
-            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), state: "queued".into(), agent: None, at: unix_now(), done_at: None, fleet: None };
+            let prompt = crate::screenshots::prompt(&text, &attachments);
+            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: None, at: unix_now(), done_at: None, fleet: None };
             if launch {
-                match spawn(hub, &kind, &cwd, None, Some(&text)) {
+                match spawn(hub, &kind, &cwd, None, Some(&prompt)) {
                     Ok(aid) => {
                         m.state = "sent".into();
                         m.agent = Some(aid);
@@ -1047,7 +1051,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                     }
                     g.cwd.clone()
                 };
-                h.missions.push(Mission { id: next, cwd, text: text.clone(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet) });
+                h.missions.push(Mission { id: next, cwd, text: text.clone(), attachments: Vec::new(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet) });
                 next += 1;
                 sent += 1;
                 order(a, text.clone());
@@ -1512,4 +1516,42 @@ pub fn ensure_running() -> io::Result<()> {
 pub fn dirs_state() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
     std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| home.join(".local/state")).join("empire")
+}
+
+#[cfg(test)]
+mod screenshot_tests {
+    use super::*;
+
+    #[test]
+    fn queued_mission_preserves_attachments_and_rejects_missing_files() {
+        let dir = std::env::temp_dir().join(format!("empire-daemon-images-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("screenshot.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let attachments = vec![crate::screenshots::Attachment { name: "screenshot.png".into(), path: path.to_str().unwrap().into() }];
+        let hub = Shared::default();
+        let request = Req::Mission { cwd: "/world".into(), text: "Fix this".into(), kind: "codex".into(), launch: false, attachments: attachments.clone() };
+        assert!(matches!(handle(&hub, request.clone()), Resp::Ok));
+        assert_eq!(hub.lock().unwrap().missions[0].attachments, attachments);
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(handle(&hub, request), Resp::Err { .. }));
+        assert_eq!(hub.lock().unwrap().missions.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn multiline_image_prompt_is_one_paste_followed_by_enter() {
+        let (tx, mut rx) = UnixStream::pair().unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let writer = Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 };
+        let agent = Arc::new(Mutex::new(new_agent(1, "codex", "/world", writer, 40, 120)));
+        let prompt = crate::screenshots::prompt("Fix this\nKeep the colours", &[
+            crate::screenshots::Attachment { name: "shot.png".into(), path: "/saved/shot.png".into() },
+        ]);
+        let expected = format!("\x1b[200~{prompt}\x1b[201~\r");
+        order(agent, prompt);
+        let mut bytes = vec![0; expected.len()];
+        rx.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, expected.as_bytes());
+    }
 }

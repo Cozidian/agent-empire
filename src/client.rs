@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 pub enum Msg {
+    MissionResult(Result<(), String>),
     Agents(Vec<AgentView>, Vec<Mission>),
     Down(String),
     Screen(u32, ScreenView),
@@ -27,7 +28,7 @@ pub enum Cmd {
     Resize(u32, u16, u16),
     Seen(u32),
     Answer(u32, String),
-    Mission { cwd: String, text: String, kind: String, launch: bool },
+    Mission { cwd: String, text: String, kind: String, launch: bool, attachments: Vec<crate::screenshots::Attachment>, draft: bool },
     Scrub(u32),
     Broadcast(Vec<u32>, String),
     Moon { cwd: String, branch: String, kind: String },
@@ -105,11 +106,12 @@ impl Client {
         thread::spawn(move || {
             let mut conn: Option<Conn> = None;
             for cmd in crx {
+                let draft = matches!(&cmd, Cmd::Mission { draft: true, .. });
                 if conn.is_none() {
                     conn = Conn::open().ok();
                 }
                 let Some(c) = conn.as_mut() else {
-                    let _ = mtx.send(Msg::Error("daemon offline".into()));
+                    let _ = mtx.send(if draft { Msg::MissionResult(Err("daemon offline".into())) } else { Msg::Error("daemon offline".into()) });
                     continue;
                 };
                 let dock = match &cmd {
@@ -123,14 +125,25 @@ impl Client {
                     Cmd::Resize(id, cols, rows) => (Req::Resize { id, cols, rows }, None),
                     Cmd::Seen(id) => (Req::Seen { id }, None),
                     Cmd::Answer(id, key) => (Req::Answer { id, key }, None),
-                    Cmd::Mission { cwd, text, kind, launch } => (Req::Mission { cwd, text, kind, launch }, None),
+                    Cmd::Mission { cwd, text, kind, launch, attachments, .. } => (Req::Mission { cwd, text, kind, launch, attachments }, None),
                     Cmd::Scrub(id) => (Req::Scrub { id }, None),
                     Cmd::Broadcast(ids, text) => (Req::Broadcast { ids, text }, None),
                     Cmd::Moon { cwd, branch, kind } => (Req::Moon { cwd, branch: branch.clone(), kind: kind.clone() }, Some((kind, format!("moon {branch}")))),
                     Cmd::Dock(cwd) => (Req::Dock { cwd }, None),
                     Cmd::Priority(id) => (Req::Priority { id }, None),
                 };
-                let msg = match c.call(&req) {
+                let reply = c.call(&req);
+                if draft {
+                    let result = match reply {
+                        Ok(Resp::Ok) => Ok(()),
+                        Ok(Resp::Err { msg }) => Err(msg),
+                        Ok(_) => Err("unexpected mission reply".into()),
+                        Err(e) => { conn = None; Err(e.to_string()) },
+                    };
+                    let _ = mtx.send(Msg::MissionResult(result));
+                    continue;
+                }
+                let msg = match reply {
                     Ok(Resp::Spawned { id }) => spawn.map(|(kind, cwd)| Msg::Spawned { id, kind, cwd }),
                     Ok(Resp::Err { msg }) => Some(match dock {
                         Some(moon) => Msg::Docked { moon, result: Err(msg) },
