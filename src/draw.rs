@@ -46,7 +46,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         card(fb, app, w, l, t);
         transmission(fb, app, l, t);
     }
-    footer(fb, app, l, sound);
+    footer(fb, app, w, l, sound);
     if let Some((m, t0)) = &app.toast {
         let a = 1.0 - smoothstep(2.6, 3.2, t - t0);
         if a > 0.0 {
@@ -56,6 +56,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         }
     }
     match &app.mode {
+        Mode::Commander => commander(fb, app, w, l),
         Mode::Trade { sel } => trade_overview(fb, app, w, l, *sel, t),
         Mode::Situation { id, typing } => situation(fb, app, w, l, *id, *typing, t),
         Mode::Colonize(c) => colonize(fb, app, c, l, t),
@@ -1198,7 +1199,11 @@ fn transmission(fb: &mut Fb, app: &App, l: &Lay, t: f32) {
     seg(fb, x + width - 2 - hint.chars().count() as i32, y + height - 1, &hint, width, DIM, Some(BOX));
 }
 
-fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {
+pub fn commander_button(app: &App, w: &World) -> String {
+    format!(" C commander ({}) ", app.attention(w).len())
+}
+
+fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
     fb.panel(0, l.rows - 1, l.cols, 1, BAR);
     let mute = match sound {
         None => "",
@@ -1214,7 +1219,7 @@ fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {
         Some(Sel::GitHub) => "⏎ projects and pull requests · ",
         None => "",
     };
-    let s = format!(" {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit");
+    let s = format!("{}· {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1917,6 +1922,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("↑↓ / j k", "select in the outliner"),
         ("⏎ / click twice", "a ship's card: comms, missions, priority, decommission"),
         ("⇥", "next agent that needs you"),
+        ("C", "commander: your attention queue across all systems"),
         ("n", "colonize: launch an agent in a folder (new or existing)"),
         ("e", "deploy another agent to the selected world"),
         ("x", "decommission the selected agent"),
@@ -2041,6 +2047,70 @@ fn chat(fb: &mut Fb, app: &App, id: u32, text: &Line, l: &Lay, t: f32) {
         None => "⏎ send · PgUp / wheel scroll · ⇥ full screen · esc close".into(),
     };
     seg(fb, x + 2, y + h - 2, &hint, w - 4, DIM, Some(BOX));
+}
+
+// ─────────────────────────────── commander ───────────────────────────────
+
+fn commander_layout(l: &Lay, sel: usize) -> (i32, i32, i32, i32, usize, usize, usize) {
+    let (x, y, w, h) = centered(l, 120, l.rows - 4);
+    let detail = ((h - 7) / 3).clamp(2, 10) as usize;
+    let room = ((h - detail as i32 - 6) / 2).max(1) as usize;
+    (x, y, w, h, room, (sel + 1).saturating_sub(room), detail)
+}
+
+pub fn commander_hit(l: &Lay, count: usize, sel: usize, col: i32, row: i32) -> Option<usize> {
+    let (x, y, w, _, room, off, _) = commander_layout(l, sel);
+    if col < x + 2 || col >= x + w - 2 || row < y + 3 || row >= y + 3 + 2 * room as i32 { return None; }
+    let i = off + ((row - y - 3) / 2) as usize;
+    (i < count).then_some(i)
+}
+
+fn commander(fb: &mut Fb, app: &mut App, world: &World, l: &Lay) {
+    let items = app.attention(world);
+    let sel = app.attention_selection(&items);
+    let id = items.get(sel).map_or(String::new(), |r| r.id.clone());
+    if app.commander != id { app.commander_detail = 0; }
+    app.commander = id;
+    let (x, y, w, h, room, off, detail_h) = commander_layout(l, sel);
+    let accent = v3(0.65, 0.85, 1.0);
+    frame_box(fb, x, y, w, h, &format!("COMMANDER · {} need your attention", items.len()), accent);
+    seg(fb, x + 3, y + 1, "All star systems · questions, approvals and work to inspect", w - 6, DIM, Some(BOX));
+    if items.is_empty() {
+        seg(fb, x + 3, y + 4, if app.online { "Nothing needs your attention. Your agents can keep working." } else { "Waiting for the daemon to reconnect." }, w - 6, TEXT, Some(BOX));
+    }
+    for (i, item) in items.iter().enumerate().skip(off).take(room) {
+        let r = y + 3 + 2 * (i - off) as i32;
+        let bg = if i == sel { SELBG } else { BOX };
+        fb.panel(x + 2, r, w - 4, 2, bg);
+        let col = match item.kind { "Input" | "Conflict" | "CI failed" => v3(1.0, 0.65, 0.4), "Finished" => v3(0.4, 0.9, 0.6), _ => accent };
+        seg(fb, x + 3, r, &pad(item.kind, 11), 11, col, Some(bg));
+        seg(fb, x + 14, r, &trunc(&item.title, (w - 17).max(1) as usize), w - 17, TEXT, Some(bg));
+        seg(fb, x + 14, r + 1, &tilde(&item.world), w - 17, DIM, Some(bg));
+    }
+    if let Some(item) = items.get(sel) {
+        let dy = y + h - detail_h as i32 - 3;
+        let place = world.planets.iter().position(|p| p.key == item.world).and_then(|i| {
+            let p = &world.planets[i];
+            world.system_of(p.host.unwrap_or(i))
+        }).map_or_else(|| tilde(&item.world), |s| format!("{} · {}", s.name, tilde(&item.world)));
+        seg(fb, x + 3, dy, &format!("{} / {} · {place}", sel + 1, items.len()), w - 6, accent, Some(BOX));
+        let detail = wrap(&item.detail, (w - 6).max(1) as usize);
+        app.commander_detail = app.commander_detail.min(detail.len().saturating_sub(detail_h));
+        let scroll = app.commander_detail;
+        for (i, line) in detail.iter().skip(scroll).take(detail_h).enumerate() {
+            seg(fb, x + 3, dy + 1 + i as i32, line, w - 6, TEXT, Some(BOX));
+        }
+        let action = match item.target {
+            AttentionTarget::Agent(_) => "⏎ comms / answer",
+            AttentionTarget::Needs => "⏎ world actions",
+            AttentionTarget::Deploy => "⏎ deploy agent",
+            AttentionTarget::Pr(_) => "⏎ open PR · t mission",
+        };
+        let hint = format!("↑↓ select · {action} · PgUp/Dn details · Esc galaxy");
+        seg(fb, x + 3, y + h - 2, &hint, w - 6, DIM, Some(BOX));
+    } else {
+        seg(fb, x + 3, y + h - 2, "Esc back to galaxy", w - 6, DIM, Some(BOX));
+    }
 }
 
 // ─────────────────────────────── situation log ───────────────────────────────
