@@ -95,6 +95,22 @@ last they pick the species.
 A mission goes to **one** agent: the first free one on that world. To give every agent there the
 same order, use a fleet order.
 
+In the mission composer `⇥` switches between launching a new ship and queueing the mission (or
+click either). A new ship can have a **role**, its standing order for life (`⇧⇥` cycles, or click
+one):
+
+| role        | what it does                                                                 |
+| ----------- | ---------------------------------------------------------------------------- |
+| none        | a generalist: does whatever the mission asks                                 |
+| `scout`     | investigates and reports a plan, read-only: Claude runs in plan mode and Codex in its read-only sandbox (other species are only asked) |
+| `builder`   | implements, runs the tests and commits on its world; never pushes            |
+| `inspector` | runs the tests and reviews recent changes; fixes only what's broken          |
+
+Claude gets the standing order as a system prompt, so your mission stays as you wrote it; other
+species get it in front of the mission. A ship keeps its role across upgrades and restarts, and it
+shows in the outliner, on its cards and in its hull: scouts, frigates (builders) and inspectors
+each have their own silhouette.
+
 In the mission composer, **drop screenshot files** onto the terminal or press **Ctrl+V** to
 attach a PNG image from the clipboard (`wl-paste` on Wayland, `xclip` on X11). File drops support
 PNG, JPEG, WebP and GIF, up to 8 images of 20 MiB each. If your terminal types a dropped path

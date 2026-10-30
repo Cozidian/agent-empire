@@ -5,6 +5,7 @@ mod game;
 mod gfx;
 mod octant;
 mod proto;
+mod role;
 mod sound;
 mod screenshots;
 mod survey;

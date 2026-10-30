@@ -2,6 +2,7 @@
 //! terminal (text cells).
 
 use crate::game::*;
+use crate::role::{ROLES, Role};
 use crate::gfx::*;
 use crate::sound::Sound;
 use crate::survey;
@@ -62,7 +63,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Confirm { id } => confirm(fb, app, *id, l),
         Mode::Ship { id, sel } => ship_card(fb, app, *id, *sel, l, t),
         Mode::Help => help(fb, l),
-        Mode::Brief { planet, text, kind, launch, attachments, sending } => brief(fb, app, planet, text, *kind, *launch, attachments, *sending, l, t),
+        Mode::Brief { planet, text, kind, launch, role, attachments, sending } => brief(fb, app, planet, text, *kind, *launch, *role, attachments, *sending, l, t),
         Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
         Mode::Moon { planet, branch, kind } => moon(fb, app, planet, branch, *kind, l, t),
         Mode::Actions { planet, sel } => actions(fb, app, planet, *sel, l),
@@ -266,15 +267,21 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
     }
 }
 
-/// Seeded silhouettes, kept inside the existing ship selection radius.
-fn hull(fb: &mut Fb, (x, y): (f32, f32), s: f32, seed: u32, col: V3) {
+/// Seeded silhouettes, kept inside the existing ship selection radius; a role has its own.
+fn hull(fb: &mut Fb, (x, y): (f32, f32), s: f32, seed: u32, role: Role, col: V3) {
     let angle = rnd(seed ^ 101) * TAU;
     let (sn, cs) = angle.sin_cos();
     let width = 0.8 + rnd(seed ^ 103) * 0.35;
     let point = |(u, v): (f32, f32)| {
         (x + (u * cs - v * width * sn) * s, y + (u * sn + v * width * cs) * s)
     };
-    let vertices: &[(f32, f32)] = match crate::gfx::hash(seed ^ 107) % 4 {
+    let style = match role {
+        Role::None => crate::gfx::hash(seed ^ 107) % 4,
+        Role::Scout => 1,
+        Role::Builder => 2,
+        Role::Inspector => 3,
+    };
+    let vertices: &[(f32, f32)] = match style {
         0 => &[(3.8, 0.0), (-2.5, -2.6), (-1.0, 0.0), (-2.5, 2.6)], // interceptor
         1 => &[(3.5, 0.0), (0.0, -2.5), (-3.5, 0.0), (0.0, 2.5)], // scout
         2 => &[(3.0, -1.2), (3.0, 1.2), (-2.8, 2.2), (-2.8, -2.2)], // frigate
@@ -323,7 +330,7 @@ fn ship(fb: &mut Fb, a: &Agent, (x, y): (f32, f32), z: f32, t: f32) {
         Status::Idle => orb(fb, x, y, 0.8 * s, col * (0.55 + 0.12 * (t * 1.2 + a.seed * 6.0).sin())),
         Status::Exited => orb(fb, x, y, 0.7 * s, col * 0.4),
     }
-    hull(fb, (x, y), s, a.seed.to_bits(), mix(col, kind_color(&a.kind), 0.25) * grow);
+    hull(fb, (x, y), s, a.seed.to_bits(), a.role, mix(col, kind_color(&a.kind), 0.25) * grow);
     // The agent provider remains a small, consistent navigation light.
     fb.splat(x, y - 2.0 * s, kind_color(&a.kind) * grow);
 }
@@ -1043,6 +1050,9 @@ fn ship_rows(app: &App, w: &World, a: &Agent, t: f32) -> Rows {
         rows.push(("asking", vec![(clip(&q.question, 42), Status::Blocked.color())]));
     }
     rows.push(("task", vec![(if a.title.is_empty() { "—".into() } else { clip(&a.title, 42) }, TEXT)]));
+    if a.role != Role::None {
+        rows.push(("role", vec![(format!("{} ", a.role.name()), a.role.color()), (clip(a.role.about(), 36), DIM)]));
+    }
     let mut home = vec![];
     if let Some(p) = w.planet(&a.cwd) {
         home.push((format!("{} ", p.name), planet_color(p)));
@@ -1284,6 +1294,9 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 let indent = if w.planet(&a.cwd).is_some_and(|p| p.host.is_some()) { 5 } else { 3 };
                 let mut x = seg(fb, c0 + indent, row, &format!("{} ", a.status.glyph(t)), 2, a.status.color(), Some(bg));
                 x = seg(fb, x, row, &pad(&a.kind, 7), 7, kind_color(&a.kind), Some(bg)) + 1;
+                if a.role != Role::None {
+                    x = seg(fb, x, row, a.role.name(), 9, a.role.color(), Some(bg)) + 1;
+                }
                 let room = (x0 + pw - 2 - el.len() as i32 - x).max(0);
                 seg(fb, x, row, &pad(&a.title, room as usize), room, if me { TEXT } else { DIM }, Some(bg));
                 seg(fb, x0 + pw - 1 - el.len() as i32, row, &el, 8, DIM, Some(bg));
@@ -1644,38 +1657,97 @@ fn fleet_row(rows: &mut Rows, app: &App, agents: &[&Agent]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch: bool, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
+/// The mission composer's frame, the height of its text, how many images it lists, and the
+/// row its launch/queue options start on.
+fn brief_box(l: &Lay, text: &Line, images: usize) -> ((i32, i32, i32, i32), i32, usize, i32) {
     let w = 80.min(l.cols - 2);
     // the text grows to eight lines, then scrolls
-    let lines = (layout(&text.s, w - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 19).max(1));
-    let visible = attachments.len().min((l.rows - 16 - lines).max(1) as usize);
-    let (x, y, w, h) = centered(l, w, 14 + lines + visible as i32);
+    let lines = (layout(&text.s, w - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 21).max(1));
+    let visible = images.min((l.rows - 18 - lines).max(1) as usize);
+    let (x, y, w, h) = centered(l, w, 16 + lines + visible as i32);
+    ((x, y, w, h), lines, visible, y + lines + 6 + visible as i32)
+}
+
+/// Where each role's name sits on the role row: (role index, first column, last column + 1).
+fn role_spans(x: i32) -> Vec<(usize, i32, i32)> {
+    let mut c = x + 13;
+    ROLES.iter().enumerate().map(|(i, r)| {
+        let span = (i, c, c + r.label().chars().count() as i32);
+        c = span.2 + 3;
+        span
+    }).collect()
+}
+
+/// What a click on the mission composer lands on.
+pub enum BriefHit {
+    Launch,
+    Queue,
+    Role(usize),
+}
+
+pub fn brief_hit(l: &Lay, text: &Line, images: usize, c: i32, r: i32) -> Option<BriefHit> {
+    let ((x, _, w, _), _, _, row) = brief_box(l, text, images);
+    if c < x || c >= x + w {
+        return None;
+    }
+    match r - row {
+        0 | 2 => Some(BriefHit::Launch),
+        1 => role_spans(x).into_iter().find(|&(_, a, b)| c >= a && c < b).map(|(i, ..)| BriefHit::Role(i)).or(Some(BriefHit::Launch)),
+        3 => Some(BriefHit::Queue),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch: bool, role: usize, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
+    let ((x, y, w, h), lines, visible, r) = brief_box(l, text, attachments.len());
     let accent = v3(1.0, 0.85, 0.4);
     frame_box(fb, x, y, w, h, &format!("★ NEW MISSION FOR {}", base_name(planet).to_uppercase()), accent);
     seg(fb, x + 3, y + 2, "What should be done here?", w - 6, DIM, Some(BOX));
     seg(fb, x + 3, y + 4, "› ", 2, accent, Some(BOX));
     area(fb, (x + 5, y + 4, w - 8, lines), text, accent, t);
-    let y = y + lines - 1; // the rest sits below the text
     let crew = app.agents.iter().filter(|a| a.cwd == planet && a.dying.is_none()).count();
     let (now, later) = if launch { (TEXT, DIM) } else { (DIM, TEXT) };
     for (i, image) in attachments.iter().skip(attachments.len() - visible).enumerate() {
         let prefix = if i == 0 && visible < attachments.len() { format!("▧ {} total · ", attachments.len()) } else { "▧ ".into() };
-        seg(fb, x + 3, y + 6 + i as i32, &clip(&format!("{prefix}{}", image.name), (w - 7).max(1) as usize), w - 6, TEXT * 0.85, Some(BOX));
+        seg(fb, x + 3, y + lines + 5 + i as i32, &clip(&format!("{prefix}{}", image.name), (w - 7).max(1) as usize), w - 6, TEXT * 0.85, Some(BOX));
     }
-    let r = y + 7 + visible as i32;
+    // launch: species, then the new ship's role
     let xx = seg(fb, x + 3, r, if launch { "● " } else { "○ " }, 2, accent, Some(BOX));
     let xx = seg(fb, xx, r, "launch a new ship with it now", w - 6, now, Some(BOX));
     if launch {
-        species(fb, app, xx + 2, r, kind);
+        species(fb, app, xx + 3, r, kind);
     }
-    let xx = seg(fb, x + 3, r + 1, if launch { "○ " } else { "● " }, 2, accent, Some(BOX));
-    let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it: the first free one of the {crew} here takes it (b gives all of them an order)") };
-    seg(fb, xx, r + 1, &note, w - 8, later, Some(BOX));
-    let y = y - lines + 1;
+    let picked = ROLES[role];
+    seg(fb, x + 7, r + 1, "role", 4, if launch { DIM } else { DIM * 0.6 }, Some(BOX));
+    for (i, a, _) in role_spans(x) {
+        let rl = ROLES[i];
+        let me = i == role;
+        let col = if !launch { DIM * 0.6 } else if me { rl.color() } else { DIM };
+        let bg = if me && launch { SELBG } else { BOX };
+        seg(fb, a, r + 1, rl.label(), 10, col, Some(bg));
+        if i + 1 < ROLES.len() {
+            seg(fb, a + rl.label().chars().count() as i32, r + 1, " · ", 3, DIM * 0.6, Some(BOX));
+        }
+    }
+    seg(fb, x + w - 6, r + 1, "⇧⇥", 2, DIM * 0.8, Some(BOX));
+    let kind_name = app.kinds.get(kind).map_or("", String::as_str);
+    let about = match picked {
+        Role::Scout if picked.enforced(kind_name) => format!("{} (enforced for {kind_name})", picked.about()),
+        Role::Scout => format!("{} (asked, not enforced, for {kind_name})", picked.about()),
+        _ => picked.about().to_string(),
+    };
+    seg(fb, x + 13, r + 2, &clip(&about, (w - 16) as usize), w - 16, if launch { picked.color() * 0.8 } else { DIM * 0.6 }, Some(BOX));
+    // queue: the first free agent here takes it
+    let xx = seg(fb, x + 3, r + 3, if launch { "○ " } else { "● " }, 2, accent, Some(BOX));
+    let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it for the first free one of the {crew} here") };
+    seg(fb, xx, r + 3, &note, w - 8, later, Some(BOX));
+    seg(fb, x + w - 5, r, "⇥", 1, DIM * 0.8, Some(BOX));
+    seg(fb, x + w - 5, r + 3, "⇥", 1, DIM * 0.8, Some(BOX));
     seg(fb, x + 3, y + h - 4, "Drop image · Ctrl+V clipboard · Ctrl+O attach path · Ctrl+X remove last", w - 6, DIM, Some(BOX));
-    seg(fb, x + 3, y + h - 2, if sending { "Sending mission…" } else { "⏎ give orders · Shift/Alt+⏎ or Ctrl+J new line · ⇥ launch/queue · ↑↓ species · esc" }, w - 6, DIM, Some(BOX));
+    let hint = if sending { "Sending mission…" } else { "⏎ give orders · Alt+⏎ new line · ⇥ launch/queue · ⇧⇥ role · ↑↓ species · esc" };
+    seg(fb, x + 3, y + h - 2, hint, w - 6, DIM, Some(BOX));
 }
-
 
 /// Where each character of `s` lands when wrapped to `width` columns, as (row, column),
 /// plus one more entry for the end of the text.
@@ -1740,7 +1812,8 @@ fn ship_card(fb: &mut Fb, app: &App, id: u32, sel: usize, l: &Lay, t: f32) {
     let Some(a) = app.agent(id) else { return };
     let (x, y, w, h) = ship_box(app, id, l);
     let accent = kind_color(&a.kind);
-    frame_box(fb, x, y, w, h, &format!("◆ {} · {}", a.kind.to_uppercase(), base_name(&a.cwd).to_uppercase()), accent);
+    let role = if a.role == Role::None { String::new() } else { format!(" {}", a.role.name().to_uppercase()) };
+    frame_box(fb, x, y, w, h, &format!("◆ {}{role} · {}", a.kind.to_uppercase(), base_name(&a.cwd).to_uppercase()), accent);
     let iw = w - 6;
     let c = seg(fb, x + 3, y + 2, &format!("{} {}", a.status.glyph(t), a.status.label()), iw, a.status.color(), Some(BOX));
     seg(fb, c, y + 2, &format!(" · {} · {} turns", ago(t - a.since), a.turns), x + w - 3 - c, DIM, Some(BOX));
