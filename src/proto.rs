@@ -35,6 +35,8 @@ pub enum Req {
     /// A new mission for the world at `cwd`: launch a ship with it right away, or queue it
     /// for the next agent there that's free.
     Mission { cwd: String, text: String, kind: String, launch: bool },
+    /// One order to many agents at once, followed as one fleet order.
+    Broadcast { ids: Vec<u32>, text: String },
     /// Strike a mission from the log.
     Scrub { id: u32 },
     /// Exec the binary on disk in place of the running daemon, keeping every agent.
@@ -73,6 +75,9 @@ pub struct Mission {
     /// Unix time it was written, and finished.
     pub at: u64,
     pub done_at: Option<u64>,
+    /// Missions given together as one fleet order share this.
+    #[serde(default)]
+    pub fleet: Option<u32>,
 }
 
 /// A question read off an agent's screen, answerable from the galaxy.

@@ -27,6 +27,7 @@ pub enum Cmd {
     Answer(u32, String),
     Mission { cwd: String, text: String, kind: String, launch: bool },
     Scrub(u32),
+    Broadcast(Vec<u32>, String),
 }
 
 pub struct Client {
@@ -115,6 +116,7 @@ impl Client {
                     Cmd::Answer(id, key) => (Req::Answer { id, key }, None),
                     Cmd::Mission { cwd, text, kind, launch } => (Req::Mission { cwd, text, kind, launch }, None),
                     Cmd::Scrub(id) => (Req::Scrub { id }, None),
+                    Cmd::Broadcast(ids, text) => (Req::Broadcast { ids, text }, None),
                 };
                 let msg = match c.call(&req) {
                     Ok(Resp::Spawned { id }) => spawn.map(|(kind, cwd)| Msg::Spawned { id, kind, cwd }),

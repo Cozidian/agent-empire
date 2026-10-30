@@ -699,15 +699,7 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
                     taken.insert(id);
                     m.state = "sent".into();
                     m.agent = Some(id);
-                    let (a, text) = (a.clone(), m.text.clone());
-                    thread::spawn(move || {
-                        // typed, then submitted separately, so TUIs don't take it as a pasted newline
-                        let _ = a.lock().unwrap().writer.write_all(text.as_bytes());
-                        thread::sleep(Duration::from_millis(150));
-                        let mut g = a.lock().unwrap();
-                        g.last_in = Instant::now();
-                        let _ = g.writer.write_all(b"\r");
-                    });
+                    order(a.clone(), m.text.clone());
                 }
             }
             "sent" | "active" => match me {
@@ -731,6 +723,21 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
         let _ = std::fs::write(missions_file(), serde_json::to_string(&h.missions).unwrap_or_default());
         *logged = h.missions.clone();
     }
+}
+
+/// Give an agent an order: typed, then submitted separately, so TUIs don't take
+/// it as a pasted newline.
+fn order(a: Arc<Mutex<Agent>>, text: String) {
+    thread::spawn(move || {
+        let _ = a.lock().unwrap().writer.write_all(text.as_bytes());
+        thread::sleep(Duration::from_millis(150));
+        let mut g = a.lock().unwrap();
+        g.last_in = Instant::now();
+        if g.status == Status::Done {
+            g.set(Status::Idle);
+        }
+        let _ = g.writer.write_all(b"\r");
+    });
 }
 
 fn registry_file() -> PathBuf {
@@ -885,7 +892,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
         }
         Req::Mission { cwd, text, kind, launch } => {
             let id = hub.lock().unwrap().missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
-            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), state: "queued".into(), agent: None, at: unix_now(), done_at: None };
+            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), state: "queued".into(), agent: None, at: unix_now(), done_at: None, fleet: None };
             if launch {
                 match spawn(hub, &kind, &cwd, None, Some(&text)) {
                     Ok(aid) => {
@@ -897,6 +904,28 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             }
             hub.lock().unwrap().missions.push(m);
             Resp::Ok
+        }
+        Req::Broadcast { ids, text } => {
+            let mut h = hub.lock().unwrap();
+            let fleet = h.missions.iter().filter_map(|m| m.fleet).max().unwrap_or(0) + 1;
+            let mut next = h.missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
+            let mut sent = 0;
+            for id in ids {
+                let Some(a) = h.agents.get(&id).cloned() else { continue };
+                let cwd = {
+                    let g = a.lock().unwrap();
+                    // a blocked agent would take the order as an answer to its question
+                    if g.exited.is_some() || g.status == Status::Blocked {
+                        continue;
+                    }
+                    g.cwd.clone()
+                };
+                h.missions.push(Mission { id: next, cwd, text: text.clone(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet) });
+                next += 1;
+                sent += 1;
+                order(a, text.clone());
+            }
+            if sent == 0 { Resp::Err { msg: "no agent free to take the order".into() } } else { Resp::Ok }
         }
         Req::Scrub { id } => {
             hub.lock().unwrap().missions.retain(|m| m.id != id);
