@@ -56,6 +56,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     }
     match &app.mode {
         Mode::Trade { sel } => trade_overview(fb, app, w, l, *sel, t),
+        Mode::Situation { id, typing } => situation(fb, app, w, l, *id, *typing, t),
         Mode::Colonize(c) => colonize(fb, app, c, l, t),
         Mode::Deploy { planet, kind } => deploy(fb, app, planet, *kind, l),
         Mode::Confirm { id } => confirm(fb, app, *id, l),
@@ -67,6 +68,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Actions { planet, sel } => actions(fb, app, planet, *sel, l),
         Mode::Log { world, sel, open } => mission_log(fb, app, world, *sel, open, l, t),
         Mode::Dock { moon } => dock(fb, app, moon, l),
+        Mode::Chat { id, text } => chat(fb, app, *id, text, l, t),
         _ => {}
     }
     if !app.online {
@@ -649,8 +651,9 @@ fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usiz
     let accent = v3(0.6, 0.8, 1.0);
     let projects = rows.iter().filter(|r| r.pr.is_none()).count();
     let prs = rows.len() - projects;
-    frame_box(fb, x, y, width, height, &format!("◇ GITHUB · {projects} projects · {prs} PRs"), accent);
-    seg(fb, x + 3, y + 2, "Projects in this galaxy · your open PRs · failing checks first", width - 6, DIM, Some(BOX));
+    frame_box(fb, x, y, width, height, &format!("◇ GITHUB · {projects} projects · {prs} PRs · {}", app.trade_view.label()), accent);
+    let views = [TradeView::All, TradeView::Review, TradeView::Mine].map(|v| if v == app.trade_view { format!("[{}]", v.label()) } else { v.label().to_string() }).join("  ");
+    seg(fb, x + 3, y + 2, &format!("Projects in this galaxy · ⇥ {views}"), width - 6, DIM, Some(BOX));
     if rows.is_empty() {
         seg(fb, x + 3, y + 4, "No GitHub projects in this galaxy yet.", width - 6, TEXT, Some(BOX));
     }
@@ -662,13 +665,27 @@ fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usiz
             let (icon, status) = match pr.ci { "fail" => ("✖", "failing"), "pending" => ("◷", "pending"), "pass" => ("✔", "passing"), _ => ("○", "no checks") };
             let prefix = format!("  {icon} #{} ", pr.number);
             let c = seg(fb, x + 3, r, &prefix, width - 18, ci_color(pr.ci), Some(bg));
-            seg(fb, c, r, &clip(&pr.title, (x + width - 15 - c).max(1) as usize), (x + width - 15 - c).max(1), TEXT, Some(bg));
+            // someone else's: who opened it, and whether it waits on your review
+            let mine = app.survey.worlds.get(&row.path).is_some_and(|s| s.prs.iter().any(|m| m.number == pr.number));
+            let (who, who_col) = if mine { (String::new(), DIM) }
+                else if pr.asks_you { (format!("◆ review · @{}", pr.author), v3(1.0, 0.75, 0.3)) }
+                else { (format!("@{}", pr.author), DIM) };
+            let who = clip(&who, 24);
+            let end = x + width - 15 - who.chars().count() as i32 - if who.is_empty() { 0 } else { 2 };
+            let title = if pr.draft { format!("{} (draft)", pr.title) } else { pr.title.clone() };
+            seg(fb, c, r, &clip(&title, (end - c).max(1) as usize), (end - c).max(1), if pr.draft { DIM } else { TEXT }, Some(bg));
+            seg(fb, end + 1, r, &who, who.chars().count() as i32, who_col, Some(bg));
             seg(fb, x + width - 13, r, status, 10, ci_color(pr.ci), Some(bg));
         } else if let Some(s) = app.survey.worlds.get(&row.path) {
             let state = if s.prs_error.is_some() { "PRs unavailable".to_string() }
                 else if s.prs_checked.is_none() { "checking PRs…".to_string() }
-                else if s.prs.is_empty() { "no open PRs".to_string() }
-                else { format!("{} PRs", s.prs.len()) };
+                else {
+                    let asks = s.others.iter().filter(|p| p.asks_you).count();
+                    let mut parts = vec![format!("{} yours", s.prs.len())];
+                    if asks > 0 { parts.push(format!("{asks} to review")); }
+                    parts.push(format!("{} others", s.others.len()));
+                    parts.join(" · ")
+                };
             let summary = format!("{state} · ↑{} unpushed", s.ahead);
             let room = (width - summary.chars().count() as i32 - 9).max(1);
             seg(fb, x + 3, r, &clip(&format!("● {}", base_name(&row.path)), room as usize), room, accent, Some(bg));
@@ -683,7 +700,7 @@ fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usiz
             else { format!("{} · waiting for GitHub survey", tilde(&row.path)) };
         seg(fb, x + 3, y + height - 3, &clip(&note, (width - 6).max(1) as usize), width - 6, DIM, Some(BOX));
     }
-    seg(fb, x + 3, y + height - 2, "↑↓ / wheel select · ⏎ project: focus / PR: browser · esc close", width - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + height - 2, "↑↓ / wheel select · ⇥ view · ⏎ project: focus / PR: browser · esc close", width - 6, DIM, Some(BOX));
 }
 
 fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
@@ -1277,13 +1294,24 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         seg(fb, x0 + 3, first, "no worlds yet — press n", pw - 4, DIM, Some(PANEL));
     }
     let ly = first + vis + 1;
-    seg(fb, x0 + 2, ly, "SITUATION LOG", pw, v3(0.6, 0.85, 1.0), Some(PANEL));
+    let x = seg(fb, x0 + 2, ly, "SITUATION LOG", pw, v3(0.6, 0.85, 1.0), Some(PANEL));
+    seg(fb, x + 1, ly, "S", 1, DIM * 0.7, Some(PANEL));
     seg(fb, x0 + 2, ly + 1, &"─".repeat(pw as usize - 3), pw, v3(0.1, 0.2, 0.26), Some(PANEL));
-    for (k, (when, msg, col)) in app.log.iter().enumerate().take((l.rows - 2 - ly - 2).max(0) as usize) {
+    for (k, e) in app.log.iter().enumerate().take((l.rows - 2 - ly - 2).max(0) as usize) {
         let r = ly + 2 + k as i32;
-        let x = seg(fb, x0 + 2, r, when, 5, DIM * 0.8, Some(PANEL)) + 1;
-        seg(fb, x, r, &trunc(msg, (x0 + pw - 1 - x) as usize), x0 + pw - 1 - x, *col, Some(PANEL));
+        let x = seg(fb, x0 + 2, r, &e.clock, 5, DIM * 0.8, Some(PANEL)) + 1;
+        seg(fb, x, r, &trunc(&e.msg, (x0 + pw - 1 - x) as usize), x0 + pw - 1 - x, e.col, Some(PANEL));
     }
+}
+
+/// The situation log entry under a row of the side panel, if any (its heading means the newest).
+pub fn panel_log_hit(app: &App, w: &World, l: &Lay, row: i32) -> Option<u64> {
+    let (_, first, vis, _) = outliner_view(app, w, l);
+    let k = row - (first + vis + 3);
+    if k < -2 || row >= l.rows - 2 {
+        return None;
+    }
+    app.log.get(k.max(0) as usize).map(|e| e.id)
 }
 
 fn planet_color(p: &Planet) -> V3 {
@@ -1728,6 +1756,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("x", "decommission the selected agent"),
         ("r", "what the selected world needs, with quick actions"),
         ("t / L", "give a world a mission / its mission log"),
+        ("S", "situation log: filter it, read an entry in full"),
         ("b", "fleet order: one order to every agent in a system or world"),
         ("u / D", "found a moon (git worktree) / dock it back"),
         ("P", "give an agent priority in a border conflict"),
@@ -1738,7 +1767,12 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("o", "toggle outliner        m  mute"),
         ("q", "leave (agents keep running in the daemon)"),
         ("", ""),
-        ("COMMS", ""),
+        ("CHAT", ""),
+        ("⏎", "send what you wrote (nothing written: Enter)"),
+        ("1-9 / ↑↓", "answer a waiting agent's question"),
+        ("⇥", "full-screen terminal        esc  close"),
+        ("", ""),
+        ("FULL SCREEN", ""),
         ("any key", "goes straight to the agent"),
         ("Ctrl-] / F12", "back to the galaxy"),
     ];
@@ -1768,12 +1802,19 @@ fn comms(fb: &mut Fb, app: &App, l: &Lay, t: f32, id: u32) {
     frame_box(fb, 0, 1, l.cols, l.rows - 1, &title, accent);
     let hint = " Ctrl-] galaxy ";
     seg(fb, l.cols - hint.chars().count() as i32 - 2, 1, hint, l.cols, DIM, Some(BOX));
-    let (iw, ih) = (l.cols - 2, l.rows - 3);
-    fb.panel(1, 2, iw, ih, TERM_BG);
+    if let Some(n) = term(fb, app, (1, 2, l.cols - 2, l.rows - 3), accent, t, true) {
+        let m = format!(" ↑ {n} lines back · wheel down or type to return ");
+        seg(fb, (l.cols - m.chars().count() as i32) / 2, l.rows - 1, &m, l.cols, accent, Some(BOX));
+    }
+}
+
+/// The agent's terminal in a box; how far back it's scrolled, if it is.
+fn term(fb: &mut Fb, app: &App, (x, y, iw, ih): (i32, i32, i32, i32), accent: V3, t: f32, cursor: bool) -> Option<usize> {
+    fb.panel(x, y, iw, ih, TERM_BG);
     let Some((_, s)) = &app.screen else {
         let m = "establishing uplink…";
-        seg(fb, (l.cols - m.chars().count() as i32) / 2, l.rows / 2, m, l.cols, accent * (0.6 + 0.4 * (t * 4.0).sin().abs()), Some(TERM_BG));
-        return;
+        seg(fb, x + (iw - m.chars().count() as i32) / 2, y + ih / 2, m, iw, accent * (0.6 + 0.4 * (t * 4.0).sin().abs()), Some(TERM_BG));
+        return None;
     };
     let c3 = |c: [u8; 3]| v3(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0);
     for (r, line) in s.lines.iter().enumerate().take(ih as usize) {
@@ -1784,23 +1825,198 @@ fn comms(fb: &mut Fb, app: &App, l: &Lay, t: f32, id: u32) {
             for ch in run.t.chars() {
                 if col < iw {
                     let (fg, bg) = if app.pick.is_some_and(|p| p.has(r as i32, col)) { (TERM_BG, v3(0.55, 0.8, 1.0)) } else { (fg, bg) };
-                    fb.put_bg(1 + col, 2 + r as i32, ch, fg, Some(bg));
+                    fb.put_bg(x + col, y + r as i32, ch, fg, Some(bg));
                 }
                 col += 1;
             }
         }
     }
-    if s.scroll > 0 {
-        let m = format!(" ↑ {} lines back · wheel down or type to return ", s.scroll);
-        seg(fb, (l.cols - m.chars().count() as i32) / 2, l.rows - 1, &m, l.cols, accent, Some(BOX));
-    }
-    if !s.hide_cursor && fract(t * 1.6) < 0.6 {
+    if cursor && !s.hide_cursor && fract(t * 1.6) < 0.6 {
         let (cr, cc) = (s.cursor.0 as i32, s.cursor.1 as i32);
         if cr < ih && cc < iw {
-            let i = (2 + cr) as usize * fb.cols + (1 + cc) as usize;
+            let i = (y + cr) as usize * fb.cols + (x + cc) as usize;
             let (ch, fg, bg) = fb.txt[i].map_or((' ', TERM_FG, TERM_BG), |c| (c.ch, c.fg, c.bg.unwrap_or(TERM_BG)));
             let ch = if ch == '\0' { ' ' } else { ch };
-            fb.put_bg(1 + cc, 2 + cr, ch, bg, Some(fg));
+            fb.put_bg(x + cc, y + cr, ch, bg, Some(fg));
         }
     }
+    (s.scroll > 0).then_some(s.scroll)
+}
+
+/// The chat popup, centred over the galaxy.
+pub fn chat_box(l: &Lay) -> (i32, i32, i32, i32) {
+    centered(l, 100.min(l.cols - 6), (l.rows - 6).max(12))
+}
+
+/// The agent's terminal size inside the chat popup: frame, then a rule, the line you
+/// write in and the hints below it.
+pub fn chat_term(l: &Lay) -> (i32, i32) {
+    let (_, _, w, h) = chat_box(l);
+    (w - 2, h - 5)
+}
+
+fn chat(fb: &mut Fb, app: &App, id: u32, text: &Line, l: &Lay, t: f32) {
+    let a = app.agents.iter().find(|a| a.id == id);
+    let accent = a.map_or(DIM, |a| a.status.color());
+    let (x, y, w, h) = chat_box(l);
+    let title = match a {
+        Some(a) => format!("◆ {} #{} @ {} · {}", a.kind, a.id, base_name(&a.cwd), a.status.label()),
+        None => "◆ COMMS".into(),
+    };
+    frame_box(fb, x, y, w, h, &title, accent);
+    let (iw, ih) = chat_term(l);
+    let back = term(fb, app, (x + 1, y + 1, iw, ih), accent, t, false);
+    seg(fb, x + 1, y + h - 4, &"─".repeat(iw as usize), iw, accent * 0.4, Some(BOX));
+    field(fb, x + 2, y + h - 3, w - 4, text, accent, t);
+    let asking = a.is_some_and(|a| a.status == Status::Blocked);
+    let hint = match back {
+        Some(n) => format!("↑ {n} lines back · PgDn / wheel to return · ⇥ full screen · esc close"),
+        None if asking && text.s.is_empty() => "1-9 / ↑↓ ⏎ answer · or write a reply · ⇥ full screen · esc close".into(),
+        None => "⏎ send · PgUp / wheel scroll · ⇥ full screen · esc close".into(),
+    };
+    seg(fb, x + 2, y + h - 2, &hint, w - 4, DIM, Some(BOX));
+}
+
+// ─────────────────────────────── situation log ───────────────────────────────
+
+/// What a click in the situation log view landed on.
+pub enum SitHit {
+    Row(usize),
+    Kind(Option<Ev>),
+}
+
+const DETAIL_H: i32 = 7;
+
+/// The view's box, and its list: first row, rows, and how far it's scrolled to show `sel`.
+fn situation_layout(l: &Lay, sel: usize) -> (i32, i32, i32, i32, i32, usize, usize) {
+    let (x, y, w, h) = centered(l, 120, l.rows - 6);
+    let list_y = y + 5;
+    let room = (h - 5 - DETAIL_H - 2).max(1) as usize;
+    let off = (sel + 1).saturating_sub(room);
+    (x, y, w, h, list_y, room, off)
+}
+
+/// The filter chips along the top: label, the kind it picks, and where it sits.
+fn situation_chips(app: &App, x: i32) -> Vec<(String, Option<Ev>, i32)> {
+    let mut c = x + 3;
+    let mut out = Vec::new();
+    let all = std::iter::once((format!("0 all {}", app.log.len()), None));
+    let kinds = Ev::ALL.iter().enumerate().map(|(i, &k)| (format!("{} {} {}", i + 1, k.label(), app.log.iter().filter(|e| e.kind == k).count()), Some(k)));
+    for (label, k) in all.chain(kinds) {
+        let n = label.chars().count() as i32 + 2;
+        out.push((label, k, c));
+        c += n + 1;
+    }
+    out
+}
+
+pub fn situation_hit(app: &App, l: &Lay, sel: usize, col: i32, row: i32) -> Option<SitHit> {
+    let (x, y, w, _, list_y, room, off) = situation_layout(l, sel);
+    if row == y + 2 {
+        return situation_chips(app, x)
+            .into_iter()
+            .find(|(label, _, c)| col >= *c && col < c + label.chars().count() as i32 + 2)
+            .map(|(_, k, _)| SitHit::Kind(k));
+    }
+    if col < x + 2 || col >= x + w - 2 || row < list_y || row >= list_y + room as i32 {
+        return None;
+    }
+    let i = off + (row - list_y) as usize;
+    (i < app.situation().len()).then_some(SitHit::Row(i))
+}
+
+fn situation(fb: &mut Fb, app: &App, w: &World, l: &Lay, id: u64, typing: bool, t: f32) {
+    let list = app.situation();
+    let sel = list.iter().position(|e| e.id == id).unwrap_or(0);
+    let (x, y, bw, h, list_y, room, off) = situation_layout(l, sel);
+    let accent = v3(0.6, 0.85, 1.0);
+    frame_box(fb, x, y, bw, h, &format!("◉ SITUATION LOG · {} of {} entries", list.len(), app.log.len()), accent);
+
+    // filters: kind chips, then world and search
+    for (label, k, c) in situation_chips(app, x) {
+        let on = app.sit.kind == k;
+        let n = label.chars().count() as i32 + 2;
+        if c + n > x + bw - 3 {
+            break;
+        }
+        seg(fb, c, y + 2, &format!(" {label} "), n, if on { TEXT } else { DIM }, Some(if on { SELBG } else { BOX }));
+    }
+    let mut c = x + 3;
+    let world = app.sit.world.as_deref().map_or("every world".into(), base_name);
+    c = seg(fb, c, y + 3, "world ", 6, DIM, Some(BOX));
+    c = seg(fb, c, y + 3, &world, 30, if app.sit.world.is_some() { TEXT } else { DIM }, Some(BOX));
+    c = seg(fb, c, y + 3, "   search ", 10, DIM, Some(BOX));
+    let cursor = if typing && (t * 2.0).fract() < 0.5 { "▏" } else { "" };
+    let query = if app.sit.query.is_empty() && !typing { "—".to_string() } else { format!("{}{cursor}", app.sit.query) };
+    seg(fb, c, y + 3, &query, x + bw - 3 - c, if typing { TEXT } else if app.sit.query.is_empty() { DIM } else { accent }, Some(if typing { SELBG } else { BOX }));
+
+    // the entries
+    if list.is_empty() {
+        let why = if app.log.is_empty() { "Nothing has happened yet." } else { "Nothing matches these filters. Press x to clear them." };
+        seg(fb, x + 3, list_y, why, bw - 6, DIM, Some(BOX));
+    }
+    for (i, e) in list.iter().enumerate().skip(off).take(room) {
+        let r = list_y + (i - off) as i32;
+        let bg = if i == sel { SELBG } else { BOX };
+        fb.panel(x + 2, r, bw - 4, 1, bg);
+        let mut c = seg(fb, x + 3, r, &e.clock, 5, DIM * 0.8, Some(bg)) + 1;
+        c = seg(fb, c, r, &pad(e.kind.label(), 9), 9, DIM, Some(bg));
+        let place = e.world.as_deref().map(base_name).unwrap_or_default();
+        c = seg(fb, c, r, &pad(&place, 17), 17, DIM, Some(bg));
+        seg(fb, c, r, &trunc(&e.msg, (x + bw - 3 - c).max(0) as usize), x + bw - 3 - c, e.col, Some(bg));
+    }
+
+    // the selected entry, in full
+    let dy = y + h - 2 - DETAIL_H;
+    seg(fb, x + 2, dy, &"─".repeat(bw as usize - 4), bw - 4, accent * 0.3, Some(BOX));
+    if let Some(e) = list.get(sel) {
+        let mut rows: Vec<(String, Vec<(String, V3)>)> = Vec::new();
+        for (i, line) in wrap(&e.msg, (bw - 17) as usize).into_iter().take(2).enumerate() {
+            rows.push((if i == 0 { "entry" } else { "" }.into(), vec![(line, e.col)]));
+        }
+        let age = ago((survey::now() - e.at) as f32);
+        rows.push(("when".into(), vec![(format!("{} · {age} ago · ", e.clock), TEXT), (e.kind.label().into(), DIM)]));
+        let place = match &e.world {
+            Some(p) => {
+                let mut v = vec![(tilde(p), TEXT)];
+                if let Some(h) = app.moon_host(p) {
+                    v.push((format!("  ☾ moon of {}", base_name(&h)), DIM));
+                }
+                if w.planet(p).is_none() {
+                    v.push(("  no longer charted".into(), DIM));
+                }
+                v
+            }
+            None => vec![("—".into(), DIM)],
+        };
+        rows.push(("world".into(), place));
+        let agent = match e.agent.map(|a| (a, app.agent(a))) {
+            Some((_, Some(a))) => {
+                let mut v = vec![(format!("{} #{} ", a.kind, a.id), kind_color(&a.kind)), (format!("{} {} ", a.status.glyph(t), a.status.label()), a.status.color())];
+                if !a.title.is_empty() {
+                    v.push((format!("· {}", a.title), DIM));
+                }
+                v
+            }
+            Some((id, None)) => vec![(format!("#{id} · has left"), DIM)],
+            None => vec![("—".into(), DIM)],
+        };
+        rows.push(("agent".into(), agent));
+        for (k, (label, parts)) in rows.iter().enumerate() {
+            let r = dy + 1 + k as i32;
+            seg(fb, x + 3, r, label, 9, DIM, Some(BOX));
+            let mut c = x + 13;
+            for (s, col) in parts {
+                c = seg(fb, c, r, s, (x + bw - 3 - c).max(0), *col, Some(BOX));
+            }
+        }
+    }
+    let help = if typing {
+        "type to search · ⏎ / esc done".to_string()
+    } else if let Some((m, _)) = app.toast.as_ref().filter(|(_, at)| t - at < 3.2) {
+        m.clone()
+    } else {
+        "↑↓ select · 0-7 / f kind · w this world · / search · x clear · ⏎ go to · c comms · esc close".into()
+    };
+    seg(fb, x + 3, y + h - 2, &help, bw - 6, DIM, Some(BOX));
 }

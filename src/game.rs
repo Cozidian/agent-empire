@@ -29,6 +29,68 @@ const NAG: f32 = 120.0;
 const SHORT_TURN: f32 = 6.0;
 const FPS: u64 = 30;
 const DIM_LOG: V3 = v3(0.5, 0.55, 0.65);
+/// How many situation log entries are kept.
+const LOG_KEEP: usize = 500;
+
+/// What a situation log entry is about, for filtering.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Ev {
+    Alert,
+    Mission,
+    Agent,
+    Trade,
+    Prestige,
+    World,
+    Error,
+}
+
+impl Ev {
+    pub const ALL: [Ev; 7] = [Ev::Alert, Ev::Mission, Ev::Agent, Ev::Trade, Ev::Prestige, Ev::World, Ev::Error];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Ev::Alert => "alerts",
+            Ev::Mission => "missions",
+            Ev::Agent => "agents",
+            Ev::Trade => "trade",
+            Ev::Prestige => "prestige",
+            Ev::World => "worlds",
+            Ev::Error => "errors",
+        }
+    }
+}
+
+/// One situation log entry, with what it's about.
+pub struct LogEntry {
+    pub id: u64,
+    pub at: i64,
+    pub clock: String,
+    pub msg: String,
+    pub col: V3,
+    pub kind: Ev,
+    pub world: Option<String>,
+    pub agent: Option<u32>,
+}
+
+impl LogEntry {
+    fn on(&mut self, world: &str) -> &mut Self {
+        self.world = Some(world.to_string());
+        self
+    }
+
+    fn by(&mut self, agent: impl Into<Option<u32>>) -> &mut Self {
+        self.agent = agent.into();
+        self
+    }
+}
+
+/// The situation log view's filter: one kind of entry, one world (and its moons), some text.
+#[derive(Default)]
+pub struct SitFilter {
+    pub kind: Option<Ev>,
+    pub world: Option<String>,
+    pub query: String,
+}
 /// Default names for new moons (they become branch names).
 const MOONS: [&str; 12] = ["luna", "phobos", "deimos", "io", "europa", "ganymede", "callisto", "titan", "rhea", "triton", "charon", "oberon"];
 /// Radius of a system's first planetary orbit, and the gap between orbits.
@@ -298,6 +360,9 @@ pub struct Colonize {
 pub enum Mode {
     Galaxy,
     Trade { sel: usize },
+    /// Talking to an agent in a popup over the galaxy: its terminal, and a line to write in.
+    Chat { id: u32, text: Line },
+    /// Its terminal, full screen.
     Comms(u32),
     Colonize(Colonize),
     Deploy { planet: String, kind: usize },
@@ -316,6 +381,9 @@ pub enum Mode {
     Fleet { target: Sel, text: Line },
     /// Writing a mission for a world: hand it to a new ship now, or queue it.
     Brief { planet: String, text: Line, kind: usize, launch: bool, attachments: Vec<Attachment>, sending: bool },
+    /// The situation log in full: filter it, read an entry's details. `id` is the selected entry
+    /// (it stays put as news arrives); `typing` edits the search.
+    Situation { id: u64, typing: bool },
     Help,
 }
 
@@ -330,6 +398,31 @@ pub enum LogSort {
 pub struct TradeRow {
     pub path: String,
     pub pr: Option<survey::Pr>,
+}
+
+/// Which pull requests the GitHub station lists.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TradeView {
+    All,
+    Review,
+    Mine,
+}
+
+impl TradeView {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Review,
+            Self::Review => Self::Mine,
+            Self::Mine => Self::All,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all open PRs",
+            Self::Review => "waiting on your review",
+            Self::Mine => "your PRs",
+        }
+    }
 }
 
 impl LogSort {
@@ -360,11 +453,14 @@ pub struct App {
     pub err: String,
     pub loaded: bool,
     pub sel: Option<Sel>,
+    seq: u64,
     pub cam: Cam,
     pub fitted: bool,
     pub sys_pos: HashMap<String, (f32, f32)>,
     pub fx: Vec<Fx>,
-    pub log: VecDeque<(String, String, V3)>,
+    pub log: VecDeque<LogEntry>,
+    /// What the situation log view shows.
+    pub sit: SitFilter,
     pub toast: Option<(String, f32)>,
     pub mode: Mode,
     pub kinds: Vec<String>,
@@ -378,6 +474,7 @@ pub struct App {
     pub scroll: usize,
     pub missions: Vec<Mission>,
     pub log_sort: LogSort,
+    pub trade_view: TradeView,
     pub prestige: Prestige,
     /// Worlds that just levelled up, waiting for their fanfare on the map.
     pub fanfares: Vec<String>,
@@ -526,12 +623,18 @@ impl App {
     pub fn trade_rows(&self, w: &World) -> Vec<TradeRow> {
         let mut projects: Vec<_> = w.planets.iter().filter(|p| p.host.is_none())
             .filter_map(|p| self.survey.worlds.get(&p.key).filter(|s| s.github).map(|s| (&p.key, s))).collect();
-        projects.sort_by_key(|(key, s)| (!s.prs.iter().any(|p| p.ci == "fail"), *key));
+        projects.sort_by_key(|(key, s)| (!s.prs.iter().any(|p| p.ci == "fail"), !s.others.iter().any(|p| p.asks_you), *key));
         let mut rows = Vec::new();
         for (path, s) in projects {
             rows.push(TradeRow { path: path.clone(), pr: None });
-            let mut prs = s.prs.clone();
-            prs.sort_by_key(|p| (match p.ci { "fail" => 0, "pending" => 1, "pass" => 2, _ => 3 }, p.number));
+            let mut prs: Vec<survey::Pr> = match self.trade_view {
+                TradeView::All => s.prs.iter().chain(&s.others).cloned().collect(),
+                TradeView::Review => s.others.iter().filter(|p| p.asks_you).cloned().collect(),
+                TradeView::Mine => s.prs.clone(),
+            };
+            // yours, then reviews asked of you, then the rest; failing checks first in each
+            let mine = |p: &survey::Pr| s.prs.iter().any(|m| m.number == p.number);
+            prs.sort_by_key(|p| (if mine(p) { 0 } else if p.asks_you { 1 } else { 2 }, match p.ci { "fail" => 0, "pending" => 1, "pass" => 2, _ => 3 }, p.number));
             rows.extend(prs.into_iter().map(|pr| TradeRow { path: path.clone(), pr: Some(pr) }));
         }
         rows
@@ -557,11 +660,13 @@ impl App {
             err: String::new(),
             loaded: false,
             sel: None,
+            seq: 0,
             cam: Cam { x: 0.0, y: 0.0, z: 1.0, tx: 0.0, ty: 0.0, tz: 1.0 },
             fitted: false,
             sys_pos: HashMap::new(),
             fx: Vec::new(),
             log: VecDeque::new(),
+            sit: SitFilter::default(),
             toast: None,
             mode: Mode::Galaxy,
             kinds: detect_kinds(),
@@ -572,6 +677,7 @@ impl App {
             comms_at: Instant::now(),
             scroll: 0,
             log_sort: LogSort::Status,
+            trade_view: TradeView::All,
             pick: None,
             survey: survey::Snapshot::default(),
             missions: Vec::new(),
@@ -690,14 +796,13 @@ impl App {
         let _ = std::fs::create_dir_all(crate::daemon::dirs_state());
         let _ = std::fs::write(prestige_file(), serde_json::to_string(&self.prestige).unwrap_or_default());
         let place = base_name(&key);
-        self.say(format!("✦ +{pts} prestige · {place}: {why}"), v3(1.0, 0.85, 0.4));
+        self.say(Ev::Prestige, format!("✦ +{pts} prestige · {place}: {why}"), v3(1.0, 0.85, 0.4)).on(&key);
         let (l0, l1) = (level_of(before), level_of(after));
         if l1 > l0 {
             let name = LEVELS[l1 as usize].1;
-            self.say(format!("♛ {place} is now a{} {name}!", if name.starts_with(['a', 'e', 'i', 'o', 'u']) { "n" } else { "" }), v3(1.0, 0.9, 0.5));
+            self.say(Ev::Prestige, format!("♛ {place} is now a{} {name}!", if name.starts_with(['a', 'e', 'i', 'o', 'u']) { "n" } else { "" }), v3(1.0, 0.9, 0.5)).on(&key);
             self.fanfares.push(key);
-            cues.push(Cue::Done);
-            cues.push(Cue::Spawn);
+            cues.push(Cue::Fanfare);
         }
     }
 
@@ -783,8 +888,12 @@ impl App {
                 let place = base_name(&m.cwd);
                 let what = clip(&m.text, 40);
                 match m.state.as_str() {
-                    "sent" | "active" if !matches!(old, Some("sent") | Some("active")) => self.say(format!("➤ mission to {place}: {what}"), v3(0.6, 0.85, 1.0)),
-                    "done" => self.say(format!("★ mission complete on {place}: {what}"), v3(1.0, 0.85, 0.4)),
+                    "sent" | "active" if !matches!(old, Some("sent") | Some("active")) => {
+                        self.say(Ev::Mission, format!("➤ mission to {place}: {what}"), v3(0.6, 0.85, 1.0)).on(&m.cwd).by(m.agent);
+                    }
+                    "done" => {
+                        self.say(Ev::Mission, format!("★ mission complete on {place}: {what}"), v3(1.0, 0.85, 0.4)).on(&m.cwd).by(m.agent);
+                    }
                     _ => {}
                 }
             }
@@ -796,7 +905,7 @@ impl App {
             let was_done = self.missions.iter().filter(|m| m.fleet == Some(f)).all(|m| m.state == "done") && self.missions.iter().any(|m| m.fleet == Some(f));
             if self.loaded && all.iter().all(|m| m.state == "done") && !was_done {
                 let what = clip(&all[0].text, 40);
-                self.say(format!("★ fleet order complete · {} ships · {what}", all.len()), v3(1.0, 0.85, 0.4));
+                self.say(Ev::Mission, format!("★ fleet order complete · {} ships · {what}", all.len()), v3(1.0, 0.85, 0.4));
             }
         }
         self.missions = missions;
@@ -818,9 +927,27 @@ impl App {
         self.agents.iter().find(|a| a.id == id && a.dying.is_none())
     }
 
-    fn say(&mut self, msg: String, col: V3) {
-        self.log.push_front((clock(), msg, col));
-        self.log.truncate(60);
+    /// Report to the situation log; tag the entry with `.on(world)` and `.by(agent)`.
+    fn say(&mut self, kind: Ev, msg: String, col: V3) -> &mut LogEntry {
+        self.seq += 1;
+        self.log.push_front(LogEntry { id: self.seq, at: survey::now(), clock: clock(), msg, col, kind, world: None, agent: None });
+        self.log.truncate(LOG_KEEP);
+        &mut self.log[0]
+    }
+
+    /// The situation log as filtered by `sit`, newest first.
+    pub fn situation(&self) -> Vec<&LogEntry> {
+        let q = self.sit.query.to_lowercase();
+        self.log
+            .iter()
+            .filter(|e| self.sit.kind.is_none_or(|k| k == e.kind))
+            .filter(|e| match (&self.sit.world, &e.world) {
+                (None, _) => true,
+                (Some(w), Some(ew)) => ew == w || self.moon_host(ew).as_ref() == Some(w),
+                (Some(_), None) => false,
+            })
+            .filter(|e| q.is_empty() || e.msg.to_lowercase().contains(&q))
+            .collect()
     }
 
     fn toast(&mut self, msg: impl Into<String>, t: f32) {
@@ -833,7 +960,7 @@ impl App {
         self.loaded = true;
         if first {
             let worlds = list.iter().map(|v| &v.cwd).collect::<std::collections::HashSet<_>>().len();
-            self.say(format!("◆ uplink established · {} agents on {worlds} worlds", list.len()), v3(0.6, 0.85, 1.0));
+            self.say(Ev::World, format!("◆ uplink established · {} agents on {worlds} worlds", list.len()), v3(0.6, 0.85, 1.0));
         }
         for v in &list {
             let st = Status::parse(&v.status);
@@ -843,12 +970,12 @@ impl App {
                 let old = self.agents[i].status;
                 if old != st {
                     let a = &self.agents[i];
-                    let (kind, planet, title, pos) = (a.kind.clone(), base_name(&a.cwd), a.title.clone(), a.wpos);
+                    let (kind, cwd, title, pos) = (a.kind.clone(), a.cwd.clone(), a.title.clone(), a.wpos);
                     // no sounds for the agent you're already talking to, or for quick little turns
-                    let watching = matches!(self.mode, Mode::Comms(c) if c == v.id);
+                    let watching = self.talking_to() == Some(v.id);
                     let quick = st == Status::Done && t - a.busy_at < SHORT_TURN;
                     let mut heard = Vec::new();
-                    self.transition(old, st, &kind, &planet, &title, pos, t, &mut heard);
+                    self.transition(old, st, (v.id, &kind, &cwd), &title, pos, t, &mut heard);
                     if !watching && !quick {
                         cues.extend(heard);
                     }
@@ -871,7 +998,7 @@ impl App {
                 for w in &v.war {
                     if w.rival > v.id && !old_war.iter().any(|o| o.rival == w.rival) {
                         let rival = self.agents.iter().find(|r| r.id == w.rival).map_or("another agent".into(), |r| r.kind.clone());
-                        self.say(format!("⚔ border conflict on {planet}: {kind} and {rival} both editing {}", w.files.join(", ")), v3(1.0, 0.45, 0.3));
+                        self.say(Ev::Alert, format!("⚔ border conflict on {planet}: {kind} and {rival} both editing {}", w.files.join(", ")), v3(1.0, 0.45, 0.3)).on(&v.cwd).by(v.id);
                         self.fx.push(Fx::Ring { x: pos.0, y: pos.1, t0: t, col: v3(1.0, 0.4, 0.2), speed: 50.0, dur: 1.2 });
                         cues.push(Cue::Blocked);
                     }
@@ -883,10 +1010,10 @@ impl App {
                 }
             } else {
                 if !first {
-                    if !matches!(self.mode, Mode::Comms(c) if c == v.id) {
+                    if self.talking_to() != Some(v.id) {
                         cues.push(Cue::Spawn);
                     }
-                    self.say(format!("✦ {} arrived at {}", v.kind, base_name(&v.cwd)), kind_color(&v.kind));
+                    self.say(Ev::Agent, format!("✦ {} arrived at {}", v.kind, base_name(&v.cwd)), kind_color(&v.kind)).on(&v.cwd).by(v.id);
                 }
                 self.agents.push(Agent {
                     id: v.id,
@@ -913,25 +1040,26 @@ impl App {
         for a in &mut self.agents {
             if a.dying.is_none() && !list.iter().any(|v| v.id == a.id) {
                 a.dying = Some(t);
-                gone.push((a.kind.clone(), base_name(&a.cwd), a.status == Status::Exited));
+                gone.push((a.id, a.kind.clone(), a.cwd.clone(), a.status == Status::Exited));
             }
         }
-        for (k, p, dark) in gone {
+        for (id, k, cwd, dark) in gone {
             if !first && !dark {
                 cues.push(Cue::Gone);
-                self.say(format!("✝ {k} left {p}"), s3(0.5));
+                self.say(Ev::Agent, format!("✝ {k} left {}", base_name(&cwd)), s3(0.5)).on(&cwd).by(id);
             }
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transition(&mut self, from: Status, to: Status, kind: &str, planet: &str, title: &str, (x, y): (f32, f32), t: f32, cues: &mut Vec<Cue>) {
+    fn transition(&mut self, from: Status, to: Status, (id, kind, cwd): (u32, &str, &str), title: &str, (x, y): (f32, f32), t: f32, cues: &mut Vec<Cue>) {
+        let planet = base_name(cwd);
         let ring = |col: V3, speed: f32| Fx::Ring { x, y, t0: t, col, speed, dur: 1.0 };
         match (from, to) {
             (_, Status::Blocked) => {
                 cues.push(Cue::Blocked);
                 self.fx.push(ring(to.color(), 40.0));
-                self.say(format!("▲ {kind} on {planet} awaits orders"), to.color());
+                self.say(Ev::Alert, format!("▲ {kind} on {planet} awaits orders"), to.color()).on(cwd).by(id);
             }
             (_, Status::Done) => {
                 cues.push(Cue::Done);
@@ -942,11 +1070,11 @@ impl App {
                     self.fx.push(Fx::Spark { x, y, vx: a.cos() * sp, vy: a.sin() * sp, t0: t, life: 0.6 + rnd(i * 3) * 0.8, col: to.color() });
                 }
                 let what = if title.is_empty() { String::new() } else { format!(": {title}") };
-                self.say(format!("✔ {kind} finished on {planet}{what}"), to.color());
+                self.say(Ev::Agent, format!("✔ {kind} finished on {planet}{what}"), to.color()).on(cwd).by(id);
             }
             (_, Status::Exited) => {
                 cues.push(Cue::Gone);
-                self.say(format!("✝ {kind} on {planet} went dark"), s3(0.55));
+                self.say(Ev::Agent, format!("✝ {kind} on {planet} went dark"), s3(0.55)).on(cwd).by(id);
             }
             (_, Status::Working) => self.fx.push(ring(to.color(), 20.0)),
             _ => {}
@@ -954,8 +1082,9 @@ impl App {
     }
 
     fn tick(&mut self, t: f32, cues: &mut Vec<Cue>) {
+        let talking = self.talking_to();
         for a in &mut self.agents {
-            let watching = matches!(self.mode, Mode::Comms(c) if c == a.id);
+            let watching = talking == Some(a.id);
             if a.status == Status::Blocked && a.dying.is_none() && !watching && t - a.last_ping > NAG {
                 a.last_ping = t;
                 cues.push(Cue::Blocked);
@@ -1189,15 +1318,42 @@ impl App {
         self.agents.iter().filter(|a| a.cwd == planet && a.dying.is_none()).min_by_key(|a| (a.status, a.id)).map(|a| a.id)
     }
 
+    /// The agent whose terminal is on screen, in the chat popup or full screen.
+    pub fn talking_to(&self) -> Option<u32> {
+        match self.mode {
+            Mode::Chat { id, .. } | Mode::Comms(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Talk to an agent: the chat popup first; ⇥ there goes full screen.
     fn open_comms(&mut self, id: u32, client: &Client, l: &Lay) {
-        self.mode = Mode::Comms(id);
+        self.mode = Mode::Chat { id, text: Line::default() };
         self.comms_at = Instant::now();
         self.screen = None;
         self.scroll = 0;
         self.pick = None;
         client.watch(Some(id));
-        client.send(Cmd::Resize(id, (l.cols - 2) as u16, (l.rows - 3) as u16));
+        self.fit_comms(client, l);
         client.send(Cmd::Seen(id));
+    }
+
+    /// From the chat popup to the full-screen terminal.
+    fn fullscreen_comms(&mut self, id: u32, client: &Client, l: &Lay) {
+        self.mode = Mode::Comms(id);
+        self.screen = None;
+        self.scroll_by(-(self.scroll as isize), client);
+        self.fit_comms(client, l);
+    }
+
+    /// Size the agent's terminal to the window it's shown in.
+    fn fit_comms(&self, client: &Client, l: &Lay) {
+        let (id, (cols, rows)) = match self.mode {
+            Mode::Chat { id, .. } => (id, draw::chat_term(l)),
+            Mode::Comms(id) => (id, (l.cols - 2, l.rows - 3)),
+            _ => return,
+        };
+        client.send(Cmd::Resize(id, cols.max(2) as u16, rows.max(2) as u16));
     }
 
     /// Click and drag in comms selects text, like a terminal: double-click a word,
@@ -1497,7 +1653,7 @@ fn restore() {
 fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: Option<String>) -> io::Result<()> {
     let mut app = App::new();
     if let Some(e) = stale {
-        app.say(format!("✖ {e}"), v3(1.0, 0.4, 0.3));
+        app.say(Ev::Error, format!("✖ {e}"), v3(1.0, 0.4, 0.3));
     }
     let (c, r) = terminal::size()?;
     let mut fb = Fb::new(c as usize, r as usize);
@@ -1542,12 +1698,12 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                     app.err = e;
                 }
                 Msg::Screen(id, s) => {
-                    if matches!(app.mode, Mode::Comms(c) if c == id) {
+                    if app.talking_to() == Some(id) {
                         app.screen = Some((id, s));
                     }
                 }
                 Msg::Spawned { id, kind, cwd } => {
-                    app.say(format!("◆ {kind} launched to {}", base_name(&cwd)), kind_color(&kind));
+                    app.say(Ev::Agent, format!("◆ {kind} launched to {}", base_name(&cwd)), kind_color(&kind)).on(&cwd).by(id);
                     app.sel = Some(Sel::Agent(id));
                     if matches!(app.mode, Mode::Galaxy) {
                         app.open_comms(id, client, &Lay::new(&fb, app.panel));
@@ -1556,11 +1712,12 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                 Msg::Docked { moon, result } => {
                     let at = app.agents.iter().find(|a| a.cwd == moon).map_or((0.0, 0.0), |a| a.wpos);
                     let name = app.survey.worlds.get(&moon).map(|w| w.branch.clone()).unwrap_or_else(|| base_name(&moon));
-                    let host = app.survey.worlds.get(&moon).and_then(|w| w.host.clone()).map(|h| base_name(&h)).unwrap_or_default();
+                    let host_path = app.survey.worlds.get(&moon).and_then(|w| w.host.clone()).unwrap_or_default();
+                    let host = base_name(&host_path);
                     match result {
                         Ok(()) => {
                             app.burst(at, v3(0.6, 0.85, 1.0), t, 48);
-                            app.say(format!("⊕ moon {name} docked with {host}: its branch is merged"), v3(0.6, 0.85, 1.0));
+                            app.say(Ev::World, format!("⊕ moon {name} docked with {host}: its branch is merged"), v3(0.6, 0.85, 1.0)).on(&host_path);
                             app.toast(format!("⊕ {name} docked"), t);
                             if app.sel == Some(Sel::Planet(moon.clone())) {
                                 app.sel = None;
@@ -1572,13 +1729,13 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                                 app.burst(at, v3(1.0, 0.35, 0.2), t, 80);
                                 cues.push(Cue::Blocked);
                             }
-                            app.say(format!("{} {name}: {e}", if crash { "✸" } else { "✖" }), v3(1.0, 0.4, 0.3));
+                            app.say(Ev::Error, format!("{} {name}: {e}", if crash { "✸" } else { "✖" }), v3(1.0, 0.4, 0.3)).on(&moon);
                             app.toast(format!("docking failed: {e}"), t);
                         }
                     }
                 }
                 Msg::Error(e) => {
-                    app.say(format!("✖ {e}"), v3(1.0, 0.4, 0.3));
+                    app.say(Ev::Error, format!("✖ {e}"), v3(1.0, 0.4, 0.3));
                     app.toast(format!("✖ {e}"), t);
                 }
             }
@@ -1630,12 +1787,14 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                     let before = app.survey.worlds.get(path).and_then(|o| o.prs.iter().find(|p| p.number == pr.number)).map(|p| p.ci);
                     match (before, pr.ci) {
                         (Some(b), "fail") if b != "fail" => {
-                            app.say(format!("✖ CI failed on #{} ({}): {}", pr.number, base_name(path), clip(&pr.title, 30)), v3(1.0, 0.4, 0.3));
+                            app.say(Ev::Alert, format!("✖ CI failed on #{} ({}): {}", pr.number, base_name(path), pr.title), v3(1.0, 0.4, 0.3)).on(path);
                             cues.push(Cue::Blocked);
                         }
-                        (Some(b), "pass") if b != "pass" => app.say(format!("✔ CI green on #{} ({})", pr.number, base_name(path)), v3(0.4, 0.95, 0.6)),
+                        (Some(b), "pass") if b != "pass" => {
+                            app.say(Ev::Trade, format!("✔ CI green on #{} ({}): {}", pr.number, base_name(path), pr.title), v3(0.4, 0.95, 0.6)).on(path);
+                        }
                         (None, _) if app.survey.worlds.contains_key(path) && app.survey.worlds[path].github => {
-                            app.say(format!("▸ PR #{} docked at the station ({})", pr.number, base_name(path)), v3(0.6, 0.85, 1.0))
+                            app.say(Ev::Trade, format!("▸ PR #{} docked at the station ({}): {}", pr.number, base_name(path), pr.title), v3(0.6, 0.85, 1.0)).on(path);
                         }
                         _ => {}
                     }
@@ -1649,7 +1808,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         }
         // a comms target that's gone for good drops you back to the galaxy
         // (a freshly launched agent takes a moment to show up in the list)
-        if let Mode::Comms(id) = app.mode
+        if let Some(id) = app.talking_to()
             && !app.agents.iter().any(|a| a.id == id)
             && app.comms_at.elapsed() > Duration::from_secs(4)
         {
@@ -1669,13 +1828,11 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                 out = Out::new(fb.cols * fb.rows);
                 app.bg_key = (0, 0, 0);
                 execute!(o, terminal::Clear(terminal::ClearType::All))?;
-                if let Mode::Comms(id) = app.mode {
-                    client.send(Cmd::Resize(id, c.saturating_sub(2), r.saturating_sub(3)));
-                }
+                app.fit_comms(client, &Lay::new(&fb, app.panel));
                 continue;
             }
             if handle(&mut app, &world, &lay, client, sound, ev, t, &mut drag) {
-                if let Mode::Comms(_) = app.mode {
+                if app.talking_to().is_some() {
                     app.close_comms(client);
                 }
                 return Ok(());
@@ -1715,6 +1872,14 @@ fn paste_brief(text: &mut Line, attachments: &mut Vec<Attachment>, pasted: &str,
     }
 }
 
+/// What's written in the chat popup.
+fn chat_text(app: &mut App) -> Option<&mut Line> {
+    match &mut app.mode {
+        Mode::Chat { text, .. } => Some(text),
+        _ => None,
+    }
+}
+
 /// Handle one input event. Returns true to quit.
 #[allow(clippy::too_many_arguments)]
 fn handle(
@@ -1727,6 +1892,61 @@ fn handle(
     t: f32,
     drag: &mut Option<((u16, u16), (f32, f32), bool)>,
 ) -> bool {
+    // ── chat: a popup with the agent's terminal and a line to write in
+    if let Mode::Chat { id, ref text } = app.mode {
+        let asking = app.agent(id).is_some_and(|a| a.status == Status::Blocked);
+        let empty = text.s.is_empty();
+        match ev {
+            Event::Key(k) if k.kind != KeyEventKind::Release => {
+                let page = (draw::chat_term(l).1 - 1).max(1) as isize;
+                match k.code {
+                    _ if is_leave(&k) => app.close_comms(client),
+                    KeyCode::Esc => app.close_comms(client),
+                    KeyCode::Tab => app.fullscreen_comms(id, client, l),
+                    KeyCode::PageUp => app.scroll_by(page, client),
+                    KeyCode::PageDown => app.scroll_by(-page, client),
+                    KeyCode::Enter => {
+                        let msg = chat_text(app).map(std::mem::take).unwrap_or_default().s;
+                        app.scroll_by(-(app.scroll as isize), client);
+                        // nothing written: Enter goes to the agent (confirming a menu)
+                        client.send(if msg.trim().is_empty() { Cmd::Input(id, "\r".into()) } else { Cmd::Say(id, msg) });
+                    }
+                    // with nothing written, a waiting agent's menu takes arrows and numbers
+                    KeyCode::Up | KeyCode::Down if empty => {
+                        client.send(Cmd::Input(id, if k.code == KeyCode::Up { "\x1b[A" } else { "\x1b[B" }.into()));
+                    }
+                    KeyCode::Char(c) if empty && asking && c.is_ascii_digit() && k.modifiers.is_empty() => {
+                        client.send(Cmd::Answer(id, c.to_string()));
+                    }
+                    _ => {
+                        if let Some(text) = chat_text(app) {
+                            text.key(&k);
+                        }
+                    }
+                }
+            }
+            Event::Paste(p) => {
+                if let Some(text) = chat_text(app) {
+                    text.paste(&p);
+                }
+            }
+            Event::Mouse(me) => match me.kind {
+                MouseEventKind::ScrollUp => app.scroll_by(3, client),
+                MouseEventKind::ScrollDown => app.scroll_by(-3, client),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let (x, y, w, h) = draw::chat_box(l);
+                    let (c, r) = (me.column as i32, me.row as i32);
+                    if c < x || c >= x + w || r < y || r >= y + h {
+                        app.close_comms(client);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        return false;
+    }
+
     // ── comms: you're talking to the agent directly
     if let Mode::Comms(id) = app.mode {
         match ev {
@@ -1784,6 +2004,10 @@ fn handle(
         }
         return false;
     }
+    if let Mode::Situation { id, typing } = app.mode {
+        situation_input(app, w, l, client, &ev, id, typing, t);
+        return false;
+    }
     if let Mode::Trade { sel } = app.mode {
         let rows = app.trade_rows(w);
         let max = rows.len().saturating_sub(1);
@@ -1799,6 +2023,10 @@ fn handle(
                 KeyCode::PageUp => selected = selected.saturating_sub((l.rows - 10).max(1) as usize),
                 KeyCode::PageDown => selected = (selected + (l.rows - 10).max(1) as usize).min(max),
                 KeyCode::Enter => activate = true,
+                KeyCode::Tab | KeyCode::Char('v') => {
+                    app.trade_view = app.trade_view.next();
+                    selected = 0;
+                }
                 _ => {}
             },
             Event::Mouse(me) => match me.kind {
@@ -1842,8 +2070,8 @@ fn handle(
             if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 client.send(Cmd::Kill(id));
                 if let Some(a) = app.agent(id) {
-                    let msg = format!("✖ decommissioned {} on {}", a.kind, base_name(&a.cwd));
-                    app.say(msg, v3(1.0, 0.5, 0.35));
+                    let (msg, cwd) = (format!("✖ decommissioned {} on {}", a.kind, base_name(&a.cwd)), a.cwd.clone());
+                    app.say(Ev::Agent, msg, v3(1.0, 0.5, 0.35)).on(&cwd).by(id);
                 }
             }
             app.mode = Mode::Galaxy;
@@ -2096,7 +2324,7 @@ fn handle(
                     } else {
                         match std::fs::create_dir_all(&path) {
                             Ok(()) => {
-                                app.say(format!("◆ charted new world {}", tilde(&path.to_string_lossy())), v3(0.6, 0.9, 1.0));
+                                app.say(Ev::World, format!("◆ charted new world {}", tilde(&path.to_string_lossy())), v3(0.6, 0.9, 1.0)).on(&path.to_string_lossy());
                                 app.spawn(&kind, &path, client, t);
                             }
                             Err(e) => app.toast(format!("✖ {e}"), t),
@@ -2113,7 +2341,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Galaxy | Mode::Comms(_) | Mode::Trade { .. } => {}
+        Mode::Galaxy | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
     // ── galaxy
@@ -2167,11 +2395,11 @@ fn handle(
         }
         KeyCode::Char(d @ '1'..='9') if app.transmission().is_some() => {
             let a = app.transmission().unwrap();
-            let (id, kind, planet) = (a.id, a.kind.clone(), base_name(&a.cwd));
+            let (id, kind, planet, cwd) = (a.id, a.kind.clone(), base_name(&a.cwd), a.cwd.clone());
             let opts = a.ask.as_ref().map(|q| q.options.clone()).unwrap_or_default();
             if let Some(o) = opts.get(d as usize - '1' as usize) {
                 client.send(Cmd::Answer(id, o.key.clone()));
-                app.say(format!("➤ {kind} on {planet}: {}", o.label), v3(0.6, 0.85, 1.0));
+                app.say(Ev::Mission, format!("➤ {kind} on {planet}: {}", o.label), v3(0.6, 0.85, 1.0)).on(&cwd).by(id);
                 app.toast(format!("orders sent: {}", o.label), t);
             }
         }
@@ -2216,11 +2444,12 @@ fn handle(
             Some(p) => app.mode = Mode::Log { world: app.moon_host(&p).unwrap_or(p), sel: 0, open: HashSet::new() },
             None => app.toast("select a world to see its mission log", t),
         },
+        KeyCode::Char('S') => app.mode = Mode::Situation { id: app.log.front().map_or(0, |e| e.id), typing: false },
         KeyCode::Char('X') => match app.sel_planet() {
             Some(p) if w.planet(&p).is_some_and(|p| p.dormant) => {
                 app.history.remove(&p);
                 let _ = std::fs::write(history_file(), serde_json::to_string(&app.history).unwrap_or_default());
-                app.say(format!("◌ {} forgotten", base_name(&p)), DIM_LOG);
+                app.say(Ev::World, format!("◌ {} forgotten", base_name(&p)), DIM_LOG).on(&p);
                 app.sel = None;
             }
             _ => app.toast("select a dormant world (no agents) to forget it", t),
@@ -2229,8 +2458,8 @@ fn handle(
             Some(Sel::Agent(id)) if app.agent(id).is_some_and(|a| !a.war.is_empty()) => {
                 client.send(Cmd::Priority(id));
                 let a = app.agent(id).unwrap();
-                let msg = format!("☮ {} on {} has priority: its rivals were told to stand down", a.kind, base_name(&a.cwd));
-                app.say(msg, v3(0.6, 0.85, 1.0));
+                let (msg, cwd) = (format!("☮ {} on {} has priority: its rivals were told to stand down", a.kind, base_name(&a.cwd)), a.cwd.clone());
+                app.say(Ev::Alert, msg, v3(0.6, 0.85, 1.0)).on(&cwd).by(id);
             }
             _ => app.toast("select an agent in a border conflict to give it priority", t),
         },
@@ -2285,6 +2514,106 @@ fn handle(
     false
 }
 
+/// Keys and clicks in the situation log view.
+#[allow(clippy::too_many_arguments)]
+fn situation_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event, id: u64, mut typing: bool, t: f32) {
+    let ids: Vec<u64> = app.situation().iter().map(|e| e.id).collect();
+    let max = ids.len().saturating_sub(1);
+    let at = ids.iter().position(|&i| i == id).unwrap_or(0);
+    let mut sel = at;
+    let page = (l.rows - 20).max(1) as usize;
+    let (mut go, mut comms) = (false, false);
+    match ev {
+        Event::Key(k) if k.kind == KeyEventKind::Release => {}
+        // the search line takes every key until it's done
+        Event::Key(k) if typing => match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Down | KeyCode::Up | KeyCode::Tab => typing = false,
+            KeyCode::Backspace => {
+                app.sit.query.pop();
+            }
+            KeyCode::Char(c) => app.sit.query.push(c),
+            _ => {}
+        },
+        Event::Key(k) => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
+                app.mode = Mode::Galaxy;
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(max),
+            KeyCode::Home | KeyCode::Char('g') => sel = 0,
+            KeyCode::End | KeyCode::Char('G') => sel = max,
+            KeyCode::PageUp => sel = sel.saturating_sub(page),
+            KeyCode::PageDown => sel = (sel + page).min(max),
+            KeyCode::Char('/') => typing = true,
+            // one kind of news: by number, or cycling through them
+            KeyCode::Char('0') => app.sit.kind = None,
+            KeyCode::Char(d @ '1'..='7') => {
+                let k = Ev::ALL[d as usize - '1' as usize];
+                app.sit.kind = (app.sit.kind != Some(k)).then_some(k);
+            }
+            KeyCode::Char('f') | KeyCode::Tab | KeyCode::BackTab => {
+                let i = app.sit.kind.and_then(|k| Ev::ALL.iter().position(|&e| e == k)).map_or(0, |i| i + 1);
+                let n = Ev::ALL.len() + 1;
+                let i = if k.code == KeyCode::BackTab { (i + n - 1) % n } else { (i + 1) % n };
+                app.sit.kind = i.checked_sub(1).map(|i| Ev::ALL[i]);
+            }
+            // just the selected entry's world (and its moons), or every world again
+            KeyCode::Char('w') => {
+                if app.sit.world.take().is_none() {
+                    let world = app.log.iter().find(|e| e.id == id).and_then(|e| e.world.clone());
+                    match world {
+                        Some(p) => app.sit.world = Some(app.moon_host(&p).unwrap_or(p)),
+                        None => app.toast("this entry isn't about a world", t),
+                    }
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Backspace => app.sit = SitFilter::default(),
+            KeyCode::Enter => go = true,
+            KeyCode::Char('c') => comms = true,
+            _ => {}
+        },
+        Event::Mouse(me) => match me.kind {
+            MouseEventKind::ScrollUp => sel = sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => sel = (sel + 1).min(max),
+            MouseEventKind::Up(MouseButton::Left) => match draw::situation_hit(app, l, at, me.column as i32, me.row as i32) {
+                Some(draw::SitHit::Row(i)) => {
+                    go = i == sel;
+                    sel = i;
+                }
+                Some(draw::SitHit::Kind(k)) => app.sit.kind = k,
+                None => {}
+            },
+            _ => {}
+        },
+        _ => {}
+    }
+    // a changed filter keeps the same entry if it's still shown
+    let list: Vec<u64> = app.situation().iter().map(|e| e.id).collect();
+    let id = if list != ids { list.iter().copied().find(|&i| i == id).or(list.first().copied()) } else { ids.get(sel).copied() };
+    let id = id.unwrap_or(0);
+    app.mode = Mode::Situation { id, typing };
+    let Some(e) = app.log.iter().find(|e| e.id == id) else { return };
+    let (agent, world) = (e.agent.filter(|&a| app.agent(a).is_some()), e.world.clone().filter(|p| w.planet(p).is_some()));
+    if comms {
+        match agent {
+            Some(a) => {
+                app.sel = Some(Sel::Agent(a));
+                app.open_comms(a, client, l);
+            }
+            None => app.toast("no agent to talk to here: it has left", t),
+        }
+    } else if go {
+        app.sel = match (agent, world) {
+            (Some(a), _) => Some(Sel::Agent(a)),
+            (None, Some(p)) => Some(Sel::Planet(p)),
+            _ => return app.toast("nothing to go to: its world and agent are gone", t),
+        };
+        app.mode = Mode::Galaxy;
+        app.glide_to_sel(w);
+    }
+}
+
 fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEvent, drag: &mut Option<((u16, u16), (f32, f32), bool)>, t: f32) {
     let (mc, mr) = (me.column, me.row);
     let px = (mc as f32 * 2.0 + 1.0, mr as f32 * 4.0 + 2.0);
@@ -2322,6 +2651,14 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
         MouseEventKind::Up(MouseButton::Left) => {
             let was_drag = drag.take().is_some_and(|d| d.2);
             if was_drag {
+                return;
+            }
+            if in_panel && let Some(id) = draw::panel_log_hit(app, w, l, mr as i32) {
+                // show it even if the view's filters would hide it
+                if !app.situation().iter().any(|e| e.id == id) {
+                    app.sit = SitFilter::default();
+                }
+                app.mode = Mode::Situation { id, typing: false };
                 return;
             }
             let hit = if in_panel { draw::panel_hit(app, w, l, mr as i32) } else { pick_at(app, w, l, px) };
@@ -2424,7 +2761,7 @@ mod station_tests {
         let mut world = World { systems: vec![], planets: vec![], lanes: vec![], station: Some((0.0, 0.0)) };
         for (key, github, ci, host) in [("/alpha", true, "pass", None), ("/beta", true, "fail", None), ("/local", false, "none", None), ("/moon", true, "fail", Some(0))] {
             world.planets.push(Planet { key: key.into(), name: base_name(key), agents: vec![], terrain: 0, seed: 0.5, wpos: (80.0, 70.0), r: 10.0, host, moons: vec![], level: 0, dormant: false, fog: 0.0, last_seen: 0 });
-            app.survey.worlds.insert(key.into(), survey::World { github, prs: vec![survey::Pr { number: 7, title: format!("Fix {key}"), ci }], prs_checked: Some(survey::now()), ..Default::default() });
+            app.survey.worlds.insert(key.into(), survey::World { github, prs: vec![survey::Pr { number: 7, title: format!("Fix {key}"), ci, ..Default::default() }], prs_checked: Some(survey::now()), ..Default::default() });
         }
         app.survey.worlds.insert("/forgotten".into(), survey::World { github: true, ..Default::default() });
         (app, world)
@@ -2438,6 +2775,24 @@ mod station_tests {
         assert_eq!(projects, ["/beta", "/alpha"]);
         assert_eq!(rows[1].pr.as_ref().unwrap().ci, "fail");
         assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn views_split_your_prs_from_reviews_asked_of_you() {
+        let (mut app, world) = fixture();
+        let pr = |number, asks_you| survey::Pr { number, title: format!("Theirs {number}"), ci: "pass", author: "ana".into(), asks_you, draft: false };
+        app.survey.worlds.get_mut("/alpha").unwrap().others = vec![pr(20, false), pr(21, true)];
+        let numbers = |app: &App| -> Vec<u32> { app.trade_rows(&world).iter().filter(|r| r.path == "/alpha").filter_map(|r| r.pr.as_ref().map(|p| p.number)).collect() };
+        // all: yours, then the one waiting on your review, then the rest
+        assert_eq!(numbers(&app), [7, 21, 20]);
+        app.trade_view = TradeView::Review;
+        assert_eq!(numbers(&app), [21]);
+        app.trade_view = TradeView::Mine;
+        assert_eq!(numbers(&app), [7]);
+        // a project with a review waiting on you outranks a quiet one
+        app.trade_view = TradeView::All;
+        let projects: Vec<_> = app.trade_rows(&world).iter().filter(|r| r.pr.is_none()).map(|r| r.path.clone()).collect();
+        assert_eq!(projects, ["/beta", "/alpha"]);
     }
 
     #[test]
@@ -2479,7 +2834,7 @@ mod station_tests {
     #[test]
     fn station_overview_scrolls_to_last_row_and_hits_the_visible_row() {
         let (mut app, world) = fixture();
-        app.survey.worlds.get_mut("/beta").unwrap().prs = (1..=40).map(|number| survey::Pr { number, title: format!("Change {number}"), ci: "fail" }).collect();
+        app.survey.worlds.get_mut("/beta").unwrap().prs = (1..=40).map(|number| survey::Pr { number, title: format!("Change {number}"), ci: "fail", ..Default::default() }).collect();
         app.mode = Mode::Trade { sel: 0 };
         let mut fb = Fb::new(80, 24);
         let l = Lay::new(&fb, false);
@@ -2582,5 +2937,80 @@ mod mission_log_tests {
         let ids: Vec<u32> = app.mission_log("/a").iter().map(|(_, m)| m.id).collect();
         assert_eq!(ids, vec![1, 3]);
         assert!(app.mission_log("/c").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod situation_tests {
+    use super::*;
+
+    fn key(app: &mut App, w: &World, l: &Lay, c: KeyCode) {
+        let ev = Event::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        situation_input(app, w, l, &Client::isolated(), &ev, match app.mode { Mode::Situation { id, .. } => id, _ => 0 }, matches!(app.mode, Mode::Situation { typing: true, .. }), 0.0);
+    }
+
+    fn shown(app: &App) -> Vec<String> {
+        app.situation().iter().map(|e| e.msg.clone()).collect()
+    }
+
+    #[test]
+    fn the_situation_log_filters_by_kind_world_and_text() {
+        let mut app = App::new();
+        app.say(Ev::Alert, "claude awaits orders".into(), DIM_LOG).on("/a").by(1);
+        app.say(Ev::Mission, "mission to b".into(), DIM_LOG).on("/b");
+        app.say(Ev::Error, "uplink lost".into(), DIM_LOG);
+        assert_eq!(shown(&app), ["uplink lost", "mission to b", "claude awaits orders"]);
+        app.sit.kind = Some(Ev::Alert);
+        assert_eq!(shown(&app), ["claude awaits orders"]);
+        app.sit = SitFilter { world: Some("/b".into()), ..SitFilter::default() };
+        assert_eq!(shown(&app), ["mission to b"]);
+        app.sit = SitFilter { query: "UPLINK".into(), ..SitFilter::default() };
+        assert_eq!(shown(&app), ["uplink lost"]);
+    }
+
+    #[test]
+    fn keys_filter_search_and_keep_the_selected_entry() {
+        let mut app = App::new();
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let l = Lay::new(&Fb::new(120, 40), false);
+        app.say(Ev::Alert, "first alert".into(), DIM_LOG).on("/a");
+        app.say(Ev::Mission, "a mission".into(), DIM_LOG).on("/a");
+        app.say(Ev::Alert, "second alert".into(), DIM_LOG).on("/b");
+        app.mode = Mode::Situation { id: app.log[0].id, typing: false };
+        key(&mut app, &world, &l, KeyCode::Down);
+        key(&mut app, &world, &l, KeyCode::Down);
+        // the selected alert survives filtering to alerts only
+        key(&mut app, &world, &l, KeyCode::Char('1'));
+        assert_eq!(app.sit.kind, Some(Ev::Alert));
+        assert!(matches!(app.mode, Mode::Situation { id, .. } if app.log.iter().find(|e| e.id == id).unwrap().msg == "first alert"));
+        // w narrows to its world
+        key(&mut app, &world, &l, KeyCode::Char('w'));
+        assert_eq!(shown(&app), ["first alert"]);
+        key(&mut app, &world, &l, KeyCode::Char('x'));
+        key(&mut app, &world, &l, KeyCode::Char('/'));
+        for c in "miss".chars() {
+            key(&mut app, &world, &l, KeyCode::Char(c));
+        }
+        assert_eq!(shown(&app), ["a mission"]);
+        key(&mut app, &world, &l, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Situation { typing: false, .. }));
+        key(&mut app, &world, &l, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Galaxy));
+    }
+
+    #[test]
+    fn the_view_renders_entries_and_details() {
+        let mut app = App::new();
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        app.say(Ev::Alert, "codex on alpha awaits orders".into(), DIM_LOG).on("/alpha").by(9);
+        app.mode = Mode::Situation { id: app.log[0].id, typing: false };
+        let mut fb = Fb::new(120, 40);
+        let l = Lay::new(&fb, false);
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let rendered: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(rendered.contains("SITUATION LOG · 1 of 1 entries"));
+        assert!(rendered.contains("1 alerts 1"));
+        assert!(rendered.contains("codex on alpha awaits orders"));
+        assert!(rendered.contains("#9 · has left"));
     }
 }

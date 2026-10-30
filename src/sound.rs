@@ -1,5 +1,6 @@
-//! Robotic UI cues: formant "robot voice" chirps, R2-style warbles, data bursts,
-//! all bitcrushed. Silent if there's no audio device.
+//! Spacious grand-strategy UI cues: glassy FM bells, warm detuned synth pads and
+//! brass, sub swells and filtered-noise whooshes, all in a long reverb. Silent if
+//! there's no audio device.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
@@ -18,6 +19,8 @@ pub enum Cue {
     Spawn,
     /// An agent went away.
     Gone,
+    /// A world reached a new development level.
+    Fanfare,
 }
 
 impl Cue {
@@ -25,14 +28,15 @@ impl Cue {
     pub fn rank(self) -> u8 {
         match self {
             Cue::Blocked => 0,
-            Cue::Done => 1,
-            Cue::Spawn => 2,
-            Cue::Gone => 3,
+            Cue::Fanfare => 1,
+            Cue::Done => 2,
+            Cue::Spawn => 3,
+            Cue::Gone => 4,
         }
     }
 }
 
-pub const ALL: [Cue; 4] = [Cue::Done, Cue::Blocked, Cue::Spawn, Cue::Gone];
+pub const ALL: [Cue; 5] = [Cue::Done, Cue::Blocked, Cue::Spawn, Cue::Gone, Cue::Fanfare];
 
 pub struct Sound {
     tx: Sender<Cue>,
@@ -71,7 +75,7 @@ fn build<T: SizedSample + FromSample<f32>>(
     muted: Arc<AtomicBool>,
 ) -> Option<cpal::Stream> {
     let ch = cfg.channels as usize;
-    let mut synth = Robo::new(cfg.sample_rate as f32);
+    let mut synth = Synth::new(cfg.sample_rate as f32);
     let stream = dev
         .build_output_stream(
             cfg,
@@ -98,15 +102,15 @@ fn build<T: SizedSample + FromSample<f32>>(
 
 // ─────────────────────────────── synthesis ─────────────────────────────
 
-/// Zero-delay-feedback state variable filter, bandpass output.
+/// Zero-delay-feedback state variable filter: (lowpass, bandpass).
 #[derive(Default, Clone, Copy)]
-struct Bp {
+struct Svf {
     ic1: f32,
     ic2: f32,
 }
 
-impl Bp {
-    fn run(&mut self, x: f32, fc: f32, q: f32, sr: f32) -> f32 {
+impl Svf {
+    fn run(&mut self, x: f32, fc: f32, q: f32, sr: f32) -> (f32, f32) {
         let g = (PI * fc.clamp(20.0, sr * 0.45) / sr).tan();
         let k = 1.0 / q;
         let a1 = 1.0 / (1.0 + g * (g + k));
@@ -116,40 +120,24 @@ impl Bp {
         let v2 = self.ic2 + a2 * self.ic1 + a3 * v3;
         self.ic1 = 2.0 * v1 - self.ic1;
         self.ic2 = 2.0 * v2 - self.ic2;
-        v1
+        (v2, v1)
     }
 }
 
-/// Vowel formants (F1, F2) in Hz.
-#[derive(Clone, Copy)]
-enum V {
-    A,
-    E,
-    I,
-    O,
-    U,
-}
-
-impl V {
-    fn f(self) -> (f32, f32) {
-        match self {
-            V::A => (800.0, 1250.0),
-            V::E => (420.0, 2000.0),
-            V::I => (300.0, 2350.0),
-            V::O => (480.0, 850.0),
-            V::U => (330.0, 720.0),
-        }
-    }
+/// A MIDI note's frequency.
+fn hz(note: f32) -> f32 {
+    440.0 * 2f32.powf((note - 69.0) / 12.0)
 }
 
 #[derive(Clone, Copy)]
 enum Wave {
-    /// Buzzy source through morphing vowel formants: a little robot voice.
-    Vox(V, V),
-    /// Pure whistle (R2-style when given vibrato).
+    /// FM bell: a modulator at `ratio` × pitch, its `index` fading as the note rings.
+    Bell { ratio: f32, index: f32 },
+    /// Three detuned saws through a lowpass: pads, and brass when the filter opens.
+    Pad { detune: f32 },
+    /// Filtered noise: whooshes and air.
+    Noise,
     Sine,
-    /// Hard digital blip.
-    Square,
 }
 
 #[derive(Clone, Copy)]
@@ -158,29 +146,48 @@ struct Voice {
     /// Seconds; negative while waiting to start.
     t: f32,
     dur: f32,
+    /// Pitch (or noise band) glides exponentially from f0 to f1.
     f0: f32,
     f1: f32,
-    /// Vibrato (rate Hz, depth as a pitch ratio).
-    vib: (f32, f32),
-    /// Ring modulator frequency (0 = off) for a metallic edge.
-    ring: f32,
+    /// Lowpass cutoff, gliding from the first to the second.
+    cut: (f32, f32),
+    att: f32,
+    /// Exponential decay rate per second (0 = holds).
+    decay: f32,
+    /// Fraction of `dur` where the release begins.
+    rel: f32,
     amp: f32,
     pan: f32,
-    ph: f32,
-    rph: f32,
-    bp: [Bp; 2],
+    ph: [f32; 3],
+    mph: f32,
+    svf: Svf,
+    rng: u32,
 }
 
 impl Voice {
     fn new(wave: Wave, delay: f32, dur: f32, f0: f32, f1: f32, amp: f32) -> Self {
-        Self { wave, t: -delay, dur, f0, f1, vib: (0.0, 0.0), ring: 0.0, amp, pan: 0.0, ph: 0.0, rph: 0.0, bp: [Bp::default(); 2] }
+        Self { wave, t: -delay, dur, f0, f1, cut: (18000.0, 18000.0), att: 0.005, decay: 0.0, rel: 0.6, amp, pan: 0.0, ph: [0.0, 0.33, 0.67], mph: 0.0, svf: Svf::default(), rng: 0x2545_f491 ^ (f0 as u32).wrapping_mul(2_654_435_761) }
     }
-    fn vib(mut self, rate: f32, depth: f32) -> Self {
-        self.vib = (rate, depth);
+    fn bell(note: f32, delay: f32, dur: f32, amp: f32) -> Self {
+        Self::new(Wave::Bell { ratio: 3.5, index: 1.6 }, delay, dur, hz(note), hz(note), amp).decay(2.2).rel(0.85)
+    }
+    fn pad(note: f32, delay: f32, dur: f32, amp: f32) -> Self {
+        Self::new(Wave::Pad { detune: 0.006 }, delay, dur, hz(note), hz(note), amp).att(0.25).rel(0.55)
+    }
+    fn att(mut self, a: f32) -> Self {
+        self.att = a;
         self
     }
-    fn ring(mut self, f: f32) -> Self {
-        self.ring = f;
+    fn decay(mut self, k: f32) -> Self {
+        self.decay = k;
+        self
+    }
+    fn rel(mut self, r: f32) -> Self {
+        self.rel = r;
+        self
+    }
+    fn cut(mut self, c0: f32, c1: f32) -> Self {
+        self.cut = (c0, c1);
         self
     }
     fn pan(mut self, p: f32) -> Self {
@@ -195,32 +202,38 @@ impl Voice {
             return 0.0;
         }
         let u = (self.t / self.dur).min(1.0);
-        // exponential glide plus vibrato
-        let f = self.f0 * (self.f1 / self.f0).powf(u) * (1.0 + self.vib.1 * (TAU * self.vib.0 * self.t).sin());
-        self.ph = (self.ph + f * dt) % 1.0;
-        let env = (self.t / 0.004).min(1.0) * (1.0 - smooth(0.75, 1.0, u));
-        let mut s = match self.wave {
-            Wave::Sine => (self.ph * TAU).sin(),
-            Wave::Square => {
-                if self.ph < 0.5 {
-                    0.6
-                } else {
-                    -0.6
-                }
+        let f = self.f0 * (self.f1 / self.f0).powf(u);
+        let env = smooth(0.0, 1.0, self.t / self.att) * (-self.decay * self.t).exp() * (1.0 - smooth(self.rel, 1.0, u));
+        let s = match self.wave {
+            Wave::Bell { ratio, index } => {
+                self.ph[0] = (self.ph[0] + f * dt) % 1.0;
+                self.mph = (self.mph + f * ratio * dt) % 1.0;
+                let m = (self.mph * TAU).sin() * index * (-self.t * 4.0).exp();
+                // a quieter octave partial for shimmer
+                self.ph[1] = (self.ph[1] + f * 2.0 * dt) % 1.0;
+                (self.ph[0] * TAU + m).sin() + 0.15 * (self.ph[1] * TAU).sin()
             }
-            Wave::Vox(a, b) => {
-                let ((a1, a2), (b1, b2)) = (a.f(), b.f());
-                let k = smooth(0.0, 1.0, u);
-                let src = 2.0 * self.ph - 1.0;
-                let f1 = self.bp[0].run(src, a1 + (b1 - a1) * k, 6.0, sr);
-                let f2 = self.bp[1].run(src, a2 + (b2 - a2) * k, 8.0, sr);
-                (f1 + f2 * 0.7) * 2.6
+            Wave::Pad { detune } => {
+                let mut x = 0.0;
+                for (k, d) in [-detune, 0.0, detune].into_iter().enumerate() {
+                    self.ph[k] = (self.ph[k] + f * (1.0 + d) * dt) % 1.0;
+                    x += 2.0 * self.ph[k] - 1.0;
+                }
+                let fc = self.cut.0 * (self.cut.1 / self.cut.0).powf(smooth(0.0, 1.0, u));
+                self.svf.run(x / 3.0, fc, 0.9, sr).0
+            }
+            Wave::Noise => {
+                self.rng ^= self.rng << 13;
+                self.rng ^= self.rng >> 17;
+                self.rng ^= self.rng << 5;
+                let n = (self.rng >> 8) as f32 / (1u32 << 23) as f32 - 1.0;
+                self.svf.run(n, f, 2.5, sr).1
+            }
+            Wave::Sine => {
+                self.ph[0] = (self.ph[0] + f * dt) % 1.0;
+                (self.ph[0] * TAU).sin()
             }
         };
-        if self.ring > 0.0 {
-            self.rph = (self.rph + self.ring * dt) % 1.0;
-            s *= 0.4 + 0.6 * (self.rph * TAU).sin();
-        }
         s * env * self.amp
     }
 
@@ -234,59 +247,128 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-struct Robo {
-    sr: f32,
-    voices: Vec<Voice>,
-    rng: u32,
-    hold: (f32, f32),
-    n: u32,
-    dl: Vec<f32>,
-    dr: Vec<f32>,
-    dpos: usize,
+/// Feedback comb with a damped loop, Freeverb-style.
+struct Comb {
+    buf: Vec<f32>,
+    i: usize,
+    store: f32,
 }
 
-impl Robo {
+impl Comb {
+    fn run(&mut self, x: f32, fb: f32, damp: f32) -> f32 {
+        let y = self.buf[self.i];
+        self.store = y * (1.0 - damp) + self.store * damp;
+        self.buf[self.i] = x + self.store * fb;
+        self.i = (self.i + 1) % self.buf.len();
+        y
+    }
+}
+
+struct Allpass {
+    buf: Vec<f32>,
+    i: usize,
+}
+
+impl Allpass {
+    fn run(&mut self, x: f32) -> f32 {
+        let b = self.buf[self.i];
+        self.buf[self.i] = x + b * 0.5;
+        self.i = (self.i + 1) % self.buf.len();
+        b - x
+    }
+}
+
+/// A large, dark hall: the space everything rings out into.
+struct Hall {
+    combs: [Vec<Comb>; 2],
+    aps: [Vec<Allpass>; 2],
+}
+
+impl Hall {
     fn new(sr: f32) -> Self {
-        let n = (sr * 0.16) as usize;
-        Self { sr, voices: Vec::new(), rng: 0x9e37_79b9, hold: (0.0, 0.0), n: 0, dl: vec![0.0; n], dr: vec![0.0; n], dpos: 0 }
+        let k = sr / 44100.0;
+        let len = |n: usize| ((n as f32 * k) as usize).max(1);
+        let combs = |spread: usize| [1557usize, 1617, 1491, 1422, 1277, 1356].iter().map(|&n| Comb { buf: vec![0.0; len(n + spread)], i: 0, store: 0.0 }).collect();
+        let aps = |spread: usize| [556usize, 441, 341].iter().map(|&n| Allpass { buf: vec![0.0; len(n + spread)], i: 0 }).collect();
+        Self { combs: [combs(0), combs(23)], aps: [aps(0), aps(23)] }
     }
 
-    fn rnd(&mut self) -> f32 {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 17;
-        self.rng ^= self.rng << 5;
-        (self.rng >> 8) as f32 / (1u32 << 24) as f32
+    fn run(&mut self, l: f32, r: f32) -> (f32, f32) {
+        let x = (l + r) * 0.08;
+        let mut out = [0.0; 2];
+        for c in 0..2 {
+            let mut y: f32 = self.combs[c].iter_mut().map(|cb| cb.run(x, 0.88, 0.35)).sum();
+            for ap in &mut self.aps[c] {
+                y = ap.run(y);
+            }
+            out[c] = y;
+        }
+        (out[0], out[1])
+    }
+}
+
+struct Synth {
+    sr: f32,
+    voices: Vec<Voice>,
+    hall: Hall,
+}
+
+impl Synth {
+    fn new(sr: f32) -> Self {
+        Self { sr, voices: Vec::new(), hall: Hall::new(sr) }
     }
 
     fn cue(&mut self, c: Cue) {
         use Wave::*;
+        let v = &mut self.voices;
         match c {
-            // "bee-boop!" then a pleased little "dee-dah"
+            // a rising fifth of glass bells over a soft swell: task complete
             Cue::Done => {
-                self.voices.push(Voice::new(Square, 0.0, 0.06, 1320.0, 1480.0, 0.10).pan(-0.3));
-                self.voices.push(Voice::new(Square, 0.075, 0.07, 1760.0, 2200.0, 0.10).pan(0.3));
-                self.voices.push(Voice::new(Vox(V::I, V::E), 0.17, 0.11, 260.0, 340.0, 0.13).vib(30.0, 0.02));
-                self.voices.push(Voice::new(Vox(V::E, V::A), 0.29, 0.16, 340.0, 300.0, 0.13).vib(30.0, 0.02));
+                v.push(Voice::bell(76.0, 0.0, 2.2, 0.16).pan(-0.25));
+                v.push(Voice::bell(83.0, 0.14, 2.6, 0.13).pan(0.25));
+                v.push(Voice::pad(52.0, 0.0, 2.0, 0.07).cut(300.0, 900.0));
+                v.push(Voice::pad(59.0, 0.05, 2.0, 0.05).cut(300.0, 900.0));
             }
-            // robot asking a question: "hm–hm?" plus an R2 warble
+            // incoming transmission: a doubled ping, then a low minor swell that asks for you
             Cue::Blocked => {
-                self.voices.push(Voice::new(Sine, 0.0, 0.28, 1700.0, 2600.0, 0.10).vib(14.0, 0.12).pan(0.4));
-                self.voices.push(Voice::new(Vox(V::U, V::O), 0.3, 0.14, 210.0, 190.0, 0.15).ring(55.0));
-                self.voices.push(Voice::new(Vox(V::O, V::I), 0.47, 0.26, 190.0, 330.0, 0.15).ring(55.0));
-                self.voices.push(Voice::new(Sine, 0.78, 0.12, 2400.0, 3200.0, 0.07).vib(20.0, 0.08).pan(-0.4));
-            }
-            // computer thinking: a burst of random-pitch data blips
-            Cue::Spawn => {
-                for i in 0..9 {
-                    let f = 900.0 + self.rnd() * 2600.0;
-                    let pan = self.rnd() * 1.4 - 0.7;
-                    self.voices.push(Voice::new(Square, i as f32 * 0.028, 0.022, f, f, 0.25).pan(pan));
+                v.push(Voice::bell(81.0, 0.0, 1.4, 0.15).pan(-0.2));
+                v.push(Voice::bell(81.0, 0.2, 1.8, 0.13).pan(0.2));
+                for (i, n) in [50.0, 53.0, 57.0].into_iter().enumerate() {
+                    v.push(Voice::pad(n, 0.3 + i as f32 * 0.04, 2.0, 0.07).att(0.35).cut(250.0, 1800.0).pan(i as f32 * 0.3 - 0.3));
                 }
+                v.push(Voice::new(Sine, 0.3, 1.8, hz(38.0), hz(38.0), 0.16).att(0.3).rel(0.5));
             }
-            // power-down sweep
+            // a ship launches: rising whoosh and sub, a high shimmer as it clears
+            Cue::Spawn => {
+                v.push(Voice::new(Noise, 0.0, 1.1, 250.0, 3500.0, 0.14).att(0.5).rel(0.7));
+                v.push(Voice::new(Sine, 0.0, 1.1, 45.0, 95.0, 0.1).att(0.3).rel(0.6));
+                v.push(Voice::bell(79.0, 0.75, 1.8, 0.07).pan(-0.4));
+                v.push(Voice::bell(86.0, 0.85, 1.8, 0.06).pan(0.4));
+            }
+            // a ship leaves: a dark chord sinking away, wind trailing off
             Cue::Gone => {
-                self.voices.push(Voice::new(Square, 0.0, 0.45, 900.0, 70.0, 0.08).ring(37.0));
-                self.voices.push(Voice::new(Vox(V::A, V::U), 0.05, 0.4, 220.0, 70.0, 0.1));
+                v.push(Voice::new(Pad { detune: 0.006 }, 0.0, 1.8, hz(48.0), hz(46.0), 0.08).att(0.05).cut(1400.0, 180.0).rel(0.4));
+                v.push(Voice::new(Pad { detune: 0.006 }, 0.0, 1.8, hz(55.0), hz(53.0), 0.06).att(0.05).cut(1400.0, 180.0).rel(0.4));
+                v.push(Voice::new(Noise, 0.0, 1.4, 2200.0, 220.0, 0.12).att(0.05).rel(0.4));
+                v.push(Voice::bell(67.0, 0.05, 1.6, 0.05));
+            }
+            // a world grows: synth brass rising I–V–I, timpani under, bells on the landing
+            Cue::Fanfare => {
+                let brass = |n: f32, at: f32, dur: f32, amp: f32| Voice::new(Pad { detune: 0.004 }, at, dur, hz(n), hz(n), amp).att(0.06).cut(500.0, 3200.0).rel(0.7);
+                for n in [60.0, 64.0, 67.0] {
+                    v.push(brass(n, 0.0, 0.75, 0.06));
+                }
+                for n in [62.0, 67.0, 71.0] {
+                    v.push(brass(n, 0.55, 0.75, 0.06));
+                }
+                for n in [48.0, 60.0, 64.0, 67.0, 72.0] {
+                    v.push(brass(n, 1.1, 2.6, 0.06));
+                }
+                for at in [0.0, 1.1] {
+                    v.push(Voice::new(Sine, at, 0.9, 95.0, 48.0, 0.3).decay(5.0));
+                }
+                v.push(Voice::bell(84.0, 1.15, 2.6, 0.07).pan(-0.3));
+                v.push(Voice::bell(88.0, 1.25, 2.6, 0.06).pan(0.3));
             }
         }
     }
@@ -300,20 +382,37 @@ impl Robo {
             r += s * (1.0 + v.pan);
         }
         self.voices.retain(|v| !v.finished());
+        let (wl, wr) = self.hall.run(l, r);
+        (((l + wl * 0.9) * 0.9).tanh() * 0.6, ((r + wr * 0.9) * 0.9).tanh() * 0.6)
+    }
+}
 
-        // digital grit: ~12 kHz sample-and-hold, 6-bit-ish crush
-        self.n = self.n.wrapping_add(1);
-        if self.n % 4 == 0 {
-            let q = 48.0;
-            self.hold = ((l * q).round() / q, (r * q).round() / q);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_cue_is_audible_unclipped_and_rings_out() {
+        let sr = 48000.0;
+        for c in ALL {
+            let mut s = Synth::new(sr);
+            s.cue(c);
+            let mut peak: f32 = 0.0;
+            for _ in 0..(sr * 4.0) as usize {
+                let (l, r) = s.tick();
+                assert!(l.is_finite() && r.is_finite(), "{c:?} went non-finite");
+                peak = peak.max(l.abs()).max(r.abs());
+            }
+            assert!(peak > 0.05, "{c:?} is too quiet: {peak}");
+            // the output stage tops out at 0.6; staying well under keeps it clean
+            assert!(peak < 0.45, "{c:?} is overdriven: {peak}");
+            // the hall tail fades well below the cue within a few more seconds
+            let mut tail: f32 = 0.0;
+            for _ in 0..(sr * 4.0) as usize {
+                let (l, r) = s.tick();
+                tail = tail.max(l.abs()).max(r.abs());
+            }
+            assert!(tail < peak * 0.05, "{c:?} rings on: {tail} after a {peak} peak");
         }
-        let (l, r) = self.hold;
-
-        // short ping-pong slapback for space
-        let (yl, yr) = (self.dl[self.dpos], self.dr[self.dpos]);
-        self.dl[self.dpos] = r * 0.35 + yr * 0.25;
-        self.dr[self.dpos] = l * 0.35 + yl * 0.25;
-        self.dpos = (self.dpos + 1) % self.dl.len();
-        (((l + yl) * 0.6).tanh() * 0.5, ((r + yr) * 0.6).tanh() * 0.5)
     }
 }
