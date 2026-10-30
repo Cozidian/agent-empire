@@ -6,7 +6,7 @@
 use crate::client::{Client, Cmd, Msg};
 use crate::draw;
 use crate::gfx::*;
-use crate::proto::{AgentView, Ask, Mission, Report, ScreenView};
+use crate::proto::{AgentView, Ask, Mission, Report, ScreenView, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crossterm::event::{
@@ -120,6 +120,7 @@ pub struct Agent {
     pub turns: u32,
     pub report: Report,
     pub ask: Option<Ask>,
+    pub war: Vec<War>,
     pub wpos: (f32, f32),
     /// In front of its planet (drawn after it).
     pub front: bool,
@@ -609,6 +610,18 @@ impl App {
                 a.turns = v.turns;
                 a.report = v.report.clone();
                 a.ask = v.ask.clone();
+                // a new border conflict (reported once, by the lower id of the pair)
+                let (old_war, kind, planet, pos) = (a.war.clone(), a.kind.clone(), base_name(&a.cwd), a.wpos);
+                for w in &v.war {
+                    if w.rival > v.id && !old_war.iter().any(|o| o.rival == w.rival) {
+                        let rival = self.agents.iter().find(|r| r.id == w.rival).map_or("another agent".into(), |r| r.kind.clone());
+                        self.say(format!("⚔ border conflict on {planet}: {kind} and {rival} both editing {}", w.files.join(", ")), v3(1.0, 0.45, 0.3));
+                        self.fx.push(Fx::Ring { x: pos.0, y: pos.1, t0: t, col: v3(1.0, 0.4, 0.2), speed: 50.0, dur: 1.2 });
+                        cues.push(Cue::Blocked);
+                    }
+                }
+                let a = &mut self.agents[i];
+                a.war = v.war.clone();
                 if !title.is_empty() {
                     a.title = title;
                 }
@@ -634,6 +647,7 @@ impl App {
                     turns: v.turns,
                     report: v.report.clone(),
                     ask: v.ask.clone(),
+                    war: v.war.clone(),
                     wpos: (0.0, 0.0),
                     front: true,
                 });
@@ -1597,6 +1611,15 @@ fn handle(
         KeyCode::Char('D') => match app.sel_planet() {
             Some(p) if app.moon_host(&p).is_some() => app.mode = Mode::Dock { moon: p },
             _ => app.toast("select a moon to dock it", t),
+        },
+        KeyCode::Char('P') => match app.sel {
+            Some(Sel::Agent(id)) if app.agent(id).is_some_and(|a| !a.war.is_empty()) => {
+                client.send(Cmd::Priority(id));
+                let a = app.agent(id).unwrap();
+                let msg = format!("☮ {} on {} has priority: its rivals were told to stand down", a.kind, base_name(&a.cwd));
+                app.say(msg, v3(0.6, 0.85, 1.0));
+            }
+            _ => app.toast("select an agent in a border conflict to give it priority", t),
         },
         KeyCode::Char('t') => match app.sel_planet() {
             Some(planet) => {

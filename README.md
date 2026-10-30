@@ -43,6 +43,7 @@ Agents also survive the daemon itself:
 | `b`              | **fleet order**: one order to every agent in the selected system or world |
 | `u`              | **moon**: found a git worktree off the selected world, with its own agent |
 | `D`              | **dock** the selected moon: merge its branch back in and retire it   |
+| `P`              | give the selected agent **priority** in a border conflict            |
 | `T`              | strike finished missions on the selected world from its log         |
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
@@ -90,6 +91,14 @@ commits are freighters on their way to it; your open pull requests (`gh pr list 
 couple of minutes) are docked around it, coloured by CI: green, amber while running, blinking red when
 failing. The station glows the colour of its worst PR, CI turning red or green is reported in the
 situation log, and world cards list unpushed commits and PRs under **trade**.
+
+## War
+
+Two agents on the same world editing the same file is a **border conflict**: the world flashes, the
+rivals trade laser fire and the card names the contested files. Claude reports every file it edits
+through a hook; for other agents the daemon reads "Edited src/a.rs" style lines off their screens.
+Select one of them and press `P` to give it **priority**: the others are told to leave those files
+alone.
 
 ## Answering from orbit
 

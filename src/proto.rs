@@ -26,7 +26,16 @@ pub enum Req {
     /// The player looked at this agent: a finished turn is no longer news.
     Seen { id: u32 },
     /// Reported by agent hooks (e.g. Claude Code's) from inside the agent.
-    Hook { id: u32, event: String, message: Option<String> },
+    Hook {
+        id: u32,
+        event: String,
+        message: Option<String>,
+        /// The file an edit tool is about to change.
+        #[serde(default)]
+        file: Option<String>,
+    },
+    /// Settle a border conflict: `id` keeps the contested files, its rivals are told to leave them.
+    Priority { id: u32 },
     /// Pick an option of the question an agent is asking (`key` as listed in its `Ask`).
     Answer { id: u32, key: String },
     /// What an agent tells us about itself (Claude Code, through its statusline).
@@ -65,6 +74,16 @@ pub struct AgentView {
     /// The question it's waiting on, when blocked.
     #[serde(default)]
     pub ask: Option<Ask>,
+    /// Border conflicts: other agents on this world editing the same files.
+    #[serde(default)]
+    pub war: Vec<War>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct War {
+    pub rival: u32,
+    /// Contested files, relative to the world.
+    pub files: Vec<String>,
 }
 
 /// A task written on a world, carried out by one of its agents.

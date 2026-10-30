@@ -306,6 +306,24 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         ships(true, fb);
     }
 
+    // border conflicts: rivals trade laser fire, their world flashes
+    for a in app.agents.iter().filter(|a| a.dying.is_none()) {
+        for war in a.war.iter().filter(|w| w.rival > a.id) {
+            let Some(b) = app.agents.iter().find(|b| b.id == war.rival && b.dying.is_none()) else { continue };
+            let (p, q) = (scr(a.wpos), scr(b.wpos));
+            let phase = fract(t * 1.7 + a.id as f32 * 0.3);
+            let (from, to) = if (t * 0.85) as i32 % 2 == 0 { (p, q) } else { (q, p) };
+            let hot = v3(1.0, 0.3, 0.15) * (0.4 + 0.6 * (1.0 - phase));
+            fb.line(from.0, from.1, to.0, to.1, hot * 0.5, hot);
+            fb.splat(mixf(from.0, to.0, phase), mixf(from.1, to.1, phase), v3(1.0, 0.85, 0.5));
+            if let Some(pl) = w.planet(&a.cwd) {
+                let (px, py) = scr(pl.wpos);
+                let flash = if (t * 4.0) as i32 % 2 == 0 { v3(1.0, 0.3, 0.15) } else { v3(1.0, 0.65, 0.2) };
+                circle(fb, px, py, (pl.r * z).max(2.5) + 5.0, flash * 0.6);
+            }
+        }
+    }
+
     for f in &app.fx {
         match *f {
             Fx::Ring { x, y, t0, col, speed, dur } => {
@@ -705,6 +723,13 @@ fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
         rows.push(("context", ctx));
     }
     fleet_row(&mut rows, app, &agents);
+    let mut files: Vec<String> = agents.iter().flat_map(|a| a.war.iter().flat_map(|w| w.files.clone())).collect();
+    files.sort();
+    files.dedup();
+    if !files.is_empty() {
+        let who: Vec<String> = agents.iter().filter(|a| !a.war.is_empty()).map(|a| a.kind.clone()).collect();
+        rows.push(("conflict", vec![(format!("⚔ {} ", who.join(" vs ")), v3(1.0, 0.45, 0.3)), (files.join(", "), TEXT)]));
+    }
     // the quest log: what's under way first, then what's waiting, then what's done
     let mut ms: Vec<&crate::proto::Mission> = app.missions.iter().filter(|m| m.cwd == p.key).collect();
     let rank = |m: &crate::proto::Mission| match m.state.as_str() {
@@ -843,6 +868,7 @@ fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {
         Some(_) => " · m mute",
     };
     let ctx = match &app.sel {
+        Some(Sel::Agent(id)) if app.agent(*id).is_some_and(|a| !a.war.is_empty()) => "⏎ comms · P give priority · x decommission · ",
         Some(Sel::Agent(_)) => "⏎ comms · t mission · e deploy here · x decommission · ",
         Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ comms · t mission · D dock · e deploy here · ",
         Some(Sel::Planet(_)) => "⏎ comms · t mission · b fleet order · u moon · e deploy here · ",

@@ -32,6 +32,7 @@ pub enum Cmd {
     Broadcast(Vec<u32>, String),
     Moon { cwd: String, branch: String, kind: String },
     Dock(String),
+    Priority(u32),
 }
 
 pub struct Client {
@@ -127,6 +128,7 @@ impl Client {
                     Cmd::Broadcast(ids, text) => (Req::Broadcast { ids, text }, None),
                     Cmd::Moon { cwd, branch, kind } => (Req::Moon { cwd, branch: branch.clone(), kind: kind.clone() }, Some((kind, format!("moon {branch}")))),
                     Cmd::Dock(cwd) => (Req::Dock { cwd }, None),
+                    Cmd::Priority(id) => (Req::Priority { id }, None),
                 };
                 let msg = match c.call(&req) {
                     Ok(Resp::Spawned { id }) => spawn.map(|(kind, cwd)| Msg::Spawned { id, kind, cwd }),

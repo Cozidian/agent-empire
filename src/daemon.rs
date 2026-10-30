@@ -24,6 +24,8 @@ const BOOT: f32 = 4.0;
 const ECHO: f32 = 0.4;
 /// Lines of history kept per agent for scrolling back in comms.
 const HISTORY: usize = 5000;
+/// How long an edit counts toward a border conflict.
+const WAR_MEMORY: u64 = 600;
 /// Turns shorter than this finishing aren't worth a desktop notification.
 const DESKTOP_TURN: u64 = 15;
 /// The build this daemon was started from (see `build_id`).
@@ -146,6 +148,10 @@ struct Agent {
     exited: Option<Instant>,
     turns: u32,
     report: Report,
+    /// Files it edited lately (absolute path → when), for spotting border conflicts.
+    touched: HashMap<String, Instant>,
+    /// Screen lines already read for edits.
+    edits_seen: HashSet<String>,
     /// The status we last told the desktop about.
     told: Status,
     /// When the current turn started.
@@ -217,6 +223,31 @@ impl Agent {
         }
         let question = lines[qi].clone();
         Some(Ask { question, context, options })
+    }
+
+    /// A path as the agent named it, made absolute against its world.
+    fn resolve(&self, f: &str) -> String {
+        let p = std::path::Path::new(f);
+        let p = if p.is_absolute() { p.to_path_buf() } else { std::path::Path::new(&self.cwd).join(p) };
+        p.to_string_lossy().into_owned()
+    }
+
+    /// Agents without edit hooks: pick edits off the screen ("• Edited src/a.rs (+3 -1)",
+    /// "⏺ Update(src/a.rs)", "Added …", "Wrote …").
+    fn scan_edits(&mut self) {
+        let text = self.parser.screen().contents();
+        let now = Instant::now();
+        for line in text.lines() {
+            let l = line.trim().trim_start_matches(['•', '●', '⏺', '·', '-', '*', ' ']);
+            let rest = ["Edited ", "Added ", "Updated ", "Created ", "Wrote ", "Deleted ", "Update(", "Write(", "Edit("].iter().find_map(|p| l.strip_prefix(p));
+            let Some(rest) = rest else { continue };
+            let path: String = rest.chars().take_while(|c| !c.is_whitespace() && !"()".contains(*c)).collect();
+            if path.is_empty() || !(path.contains('/') || path.contains('.')) || !self.edits_seen.insert(line.trim().to_string()) {
+                continue;
+            }
+            let f = self.resolve(&path);
+            self.touched.insert(f, now);
+        }
     }
 
     /// TUI agents print an interrupt hint only while they're busy.
@@ -308,6 +339,7 @@ impl Agent {
             turns: self.turns,
             report: self.report.clone(),
             ask: if self.status == Status::Blocked { self.ask() } else { None },
+            war: Vec::new(),
         }
     }
 
@@ -473,6 +505,8 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         answered: None,
         turns: 0,
         report: Report::default(),
+        touched: HashMap::new(),
+        edits_seen: HashSet::new(),
         told: Status::Booting,
         worked_at: None,
         status: Status::Booting,
@@ -949,6 +983,27 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             let list: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
             let mut agents: Vec<AgentView> = list.iter().map(|a| a.lock().unwrap().view(now)).collect();
             agents.sort_by_key(|a| a.id);
+            // border conflicts: agents on one world that edited the same files lately
+            let touched: Vec<(u32, String, HashSet<String>)> = list
+                .iter()
+                .map(|a| {
+                    let g = a.lock().unwrap();
+                    (g.id, g.cwd.clone(), g.touched.keys().cloned().collect())
+                })
+                .collect();
+            for v in agents.iter_mut() {
+                let Some((_, cwd, mine)) = touched.iter().find(|t| t.0 == v.id) else { continue };
+                for (rid, rcwd, theirs) in &touched {
+                    if *rid == v.id || rcwd != cwd {
+                        continue;
+                    }
+                    let mut files: Vec<String> = mine.intersection(theirs).map(|f| f.strip_prefix(&format!("{cwd}/")).unwrap_or(f).to_string()).collect();
+                    if !files.is_empty() {
+                        files.sort();
+                        v.war.push(War { rival: *rid, files });
+                    }
+                }
+            }
             let missions = hub.lock().unwrap().missions.clone();
             Resp::Agents { agents, missions }
         }
@@ -1045,6 +1100,36 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             }
             None => missing(id),
         },
+        Req::Priority { id } => {
+            let Some(me) = get(id) else { return missing(id) };
+            let (cwd, mine) = {
+                let g = me.lock().unwrap();
+                (g.cwd.clone(), g.touched.keys().cloned().collect::<HashSet<String>>())
+            };
+            let rivals: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().filter(|a| !Arc::ptr_eq(a, &me)).cloned().collect();
+            let mut told = 0;
+            for r in rivals {
+                let files: Vec<String> = {
+                    let mut g = r.lock().unwrap();
+                    // (one waiting on a question would take the message as its answer)
+                    if g.cwd != cwd || g.status == Status::Blocked {
+                        continue;
+                    }
+                    let f: Vec<String> = g.touched.keys().filter(|k| mine.contains(*k)).cloned().collect();
+                    for k in &f {
+                        g.touched.remove(k);
+                    }
+                    f
+                };
+                if files.is_empty() {
+                    continue;
+                }
+                let names: Vec<&str> = files.iter().map(|f| f.strip_prefix(&format!("{cwd}/")).unwrap_or(f)).collect();
+                order(r, format!("Heads up: another agent in this folder is working on {} and has priority there. Please leave those files alone; work around them or wait until they're done.", names.join(", ")));
+                told += 1;
+            }
+            if told == 0 { Resp::Err { msg: "no conflict to settle".into() } } else { Resp::Ok }
+        }
         Req::Answer { id, key } => match get(id) {
             Some(a) => {
                 let mut g = a.lock().unwrap();
@@ -1102,9 +1187,13 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             }
             None => missing(id),
         },
-        Req::Hook { id, event, message } => match get(id) {
+        Req::Hook { id, event, message, file } => match get(id) {
             Some(a) => {
                 let mut g = a.lock().unwrap();
+                if let Some(f) = file {
+                    let f = g.resolve(&f);
+                    g.touched.insert(f, Instant::now());
+                }
                 let msg = message.unwrap_or_default().to_lowercase();
                 g.hook = match event.as_str() {
                     "working" => Some(Status::Working),
@@ -1199,6 +1288,13 @@ pub fn run() -> io::Result<()> {
         loop {
             tick += 1;
             if tick % 10 == 0 {
+                for a in h.lock().unwrap().agents.values() {
+                    let mut g = a.lock().unwrap();
+                    if !g.hooked() {
+                        g.scan_edits();
+                    }
+                    g.touched.retain(|_, t| t.elapsed() < Duration::from_secs(WAR_MEMORY));
+                }
                 discover_sessions(&h);
                 save_registry(&h, &mut saved);
             }
@@ -1243,10 +1339,11 @@ pub fn hook(event: &str) {
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
     let Some(id) = std::env::var("EMPIRE_AGENT_ID").ok().and_then(|s| s.parse().ok()) else { return };
-    let message = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
-        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from));
-    let _ = call(&Req::Hook { id, event: event.into(), message });
+    let v = serde_json::from_str::<serde_json::Value>(&input).unwrap_or_default();
+    let message = v.get("message").and_then(|m| m.as_str()).map(String::from);
+    let edit = matches!(v["tool_name"].as_str(), Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit"));
+    let file = edit.then(|| v["tool_input"]["file_path"].as_str().or(v["tool_input"]["notebook_path"].as_str()).map(String::from)).flatten();
+    let _ = call(&Req::Hook { id, event: event.into(), message, file });
 }
 
 /// `empire statusline`: Claude Code's statusline command inside the empire. Reports
