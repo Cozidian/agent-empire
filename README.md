@@ -39,6 +39,8 @@ Agents also survive the daemon itself:
 | `⏎` / click twice | **comms**: a live, interactive terminal with the agent             |
 | `Ctrl-]` / `F12` | leave comms, back to the galaxy                                     |
 | `⇥`              | jump to the next agent that needs you                               |
+| `t`              | **mission**: write a task for the selected world (launch a ship with it, or queue it) |
+| `T`              | strike finished missions on the selected world from its log         |
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
 | `wasd` / drag    | pan · `±` / wheel zoom · `z` fit galaxy · `f` focus selection        |
@@ -59,6 +61,13 @@ no "done" for turns shorter than a few seconds, and a blocked agent re-pings eve
 | **blocked** | flashing red ship, shockwaves, red planet ring  | robot "hm–hm?"        |
 | done        | green burst, green planet ring until you look   | "bee-boop"            |
 | launching   | blinking amber                                  | data burst on arrival |
+
+## Missions
+
+Every world keeps a quest log. Press `t` on a world and write what should happen there: either a new
+ship launches with it as its opening prompt, or it waits in the queue and the next agent there that
+is free gets it. A mission is complete when its agent finishes the turn; the world card lists what's
+under way (◆), waiting (○) and done (★). Missions survive restarts.
 
 ## Answering from orbit
 

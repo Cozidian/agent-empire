@@ -3,7 +3,7 @@
 //! commands in order.
 
 use crate::daemon;
-use crate::proto::{AgentView, Conn, Req, Resp, ScreenView};
+use crate::proto::{AgentView, Conn, Mission, Req, Resp, ScreenView};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 pub enum Msg {
-    Agents(Vec<AgentView>),
+    Agents(Vec<AgentView>, Vec<Mission>),
     Down(String),
     Screen(u32, ScreenView),
     Spawned { id: u32, kind: String, cwd: String },
@@ -25,6 +25,8 @@ pub enum Cmd {
     Resize(u32, u16, u16),
     Seen(u32),
     Answer(u32, String),
+    Mission { cwd: String, text: String, kind: String, launch: bool },
+    Scrub(u32),
 }
 
 pub struct Client {
@@ -50,7 +52,7 @@ impl Client {
                     conn = Conn::open().ok().or_else(|| daemon::ensure_running().ok().and_then(|_| Conn::open().ok()));
                 }
                 let msg = match conn.as_mut().map(|c| c.call(&Req::List)) {
-                    Some(Ok(Resp::Agents { agents })) => Msg::Agents(agents),
+                    Some(Ok(Resp::Agents { agents, missions })) => Msg::Agents(agents, missions),
                     Some(Ok(_)) => Msg::Down("unexpected reply".into()),
                     Some(Err(e)) => {
                         conn = None;
@@ -111,6 +113,8 @@ impl Client {
                     Cmd::Resize(id, cols, rows) => (Req::Resize { id, cols, rows }, None),
                     Cmd::Seen(id) => (Req::Seen { id }, None),
                     Cmd::Answer(id, key) => (Req::Answer { id, key }, None),
+                    Cmd::Mission { cwd, text, kind, launch } => (Req::Mission { cwd, text, kind, launch }, None),
+                    Cmd::Scrub(id) => (Req::Scrub { id }, None),
                 };
                 let msg = match c.call(&req) {
                     Ok(Resp::Spawned { id }) => spawn.map(|(kind, cwd)| Msg::Spawned { id, kind, cwd }),
