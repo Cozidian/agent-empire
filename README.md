@@ -40,6 +40,7 @@ Agents also survive the daemon itself:
 | `Ctrl-]` / `F12` | leave comms, back to the galaxy                                     |
 | `⇥`              | jump to the next agent that needs you                               |
 | `t`              | **mission**: write a task for the selected world (launch a ship with it, or queue it) |
+| `b`              | **fleet order**: one order to every agent in the selected system or world |
 | `T`              | strike finished missions on the selected world from its log         |
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
@@ -68,6 +69,9 @@ Every world keeps a quest log. Press `t` on a world and write what should happen
 ship launches with it as its opening prompt, or it waits in the queue and the next agent there that
 is free gets it. A mission is complete when its agent finishes the turn; the world card lists what's
 under way (◆), waiting (○) and done (★). Missions survive restarts.
+
+A **fleet order** (`b` on a system or world) goes to every ship there at once (except ones waiting
+on an answer). The cards show its progress, and the situation log reports when the whole fleet is done.
 
 ## Answering from orbit
 

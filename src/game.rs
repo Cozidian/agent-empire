@@ -174,7 +174,7 @@ pub struct Cam {
 }
 
 /// A one-line text editor.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Line {
     pub s: String,
     pub cur: usize,
@@ -271,6 +271,8 @@ pub enum Mode {
     Colonize(Colonize),
     Deploy { planet: String, kind: usize },
     Confirm { id: u32 },
+    /// One order for every agent in a system or on a world.
+    Fleet { target: Sel, text: Line },
     /// Writing a mission for a world: hand it to a new ship now, or queue it.
     Brief { planet: String, text: Line, kind: usize, launch: bool },
     Help,
@@ -470,6 +472,16 @@ impl App {
         }
     }
 
+    /// Live agents in a system or on a world.
+    pub fn fleet(&self, w: &World, target: &Sel) -> Vec<&Agent> {
+        let planets: Vec<&Planet> = match target {
+            Sel::Sys(k) => w.systems.iter().filter(|s| &s.key == k).flat_map(|s| s.planets.iter().map(|&i| &w.planets[i])).collect(),
+            Sel::Planet(k) => w.planet(k).into_iter().collect(),
+            Sel::Agent(_) => Vec::new(),
+        };
+        planets.iter().flat_map(|p| p.agents.iter().map(|&i| &self.agents[i])).filter(|a| a.dying.is_none() && a.status != Status::Exited).collect()
+    }
+
     /// New mission log from the daemon; announce what changed.
     fn track(&mut self, missions: Vec<Mission>) {
         if self.loaded && !self.missions.is_empty() {
@@ -485,6 +497,16 @@ impl App {
                     "done" => self.say(format!("★ mission complete on {place}: {what}"), v3(1.0, 0.85, 0.4)),
                     _ => {}
                 }
+            }
+        }
+        // a fleet order is done when all its missions are
+        let fleets: std::collections::BTreeSet<u32> = missions.iter().filter_map(|m| m.fleet).collect();
+        for f in fleets {
+            let all: Vec<&Mission> = missions.iter().filter(|m| m.fleet == Some(f)).collect();
+            let was_done = self.missions.iter().filter(|m| m.fleet == Some(f)).all(|m| m.state == "done") && self.missions.iter().any(|m| m.fleet == Some(f));
+            if self.loaded && all.iter().all(|m| m.state == "done") && !was_done {
+                let what = clip(&all[0].text, 40);
+                self.say(format!("★ fleet order complete · {} ships · {what}", all.len()), v3(1.0, 0.85, 0.4));
             }
         }
         self.missions = missions;
@@ -1238,6 +1260,23 @@ fn handle(
             app.mode = Mode::Galaxy;
             return false;
         }
+        Mode::Fleet { target, text } => {
+            match k.code {
+                KeyCode::Esc => app.mode = Mode::Galaxy,
+                KeyCode::Enter if !text.s.trim().is_empty() => {
+                    let (target, text) = (target.clone(), text.clone());
+                    let ids: Vec<u32> = app.fleet(w, &target).iter().filter(|a| a.status != Status::Blocked).map(|a| a.id).collect();
+                    let n = ids.len();
+                    client.send(Cmd::Broadcast(ids, text.s.trim().to_string()));
+                    app.mode = Mode::Galaxy;
+                    app.toast(format!("fleet order sent to {n} ship{}", if n == 1 { "" } else { "s" }), t);
+                }
+                _ => {
+                    text.key(&k);
+                }
+            }
+            return false;
+        }
         Mode::Brief { planet, text, kind, launch } => {
             match k.code {
                 KeyCode::Esc => app.mode = Mode::Galaxy,
@@ -1387,6 +1426,10 @@ fn handle(
             let comps = complete(&path.s);
             app.mode = Mode::Colonize(Colonize { path, kind, comps, comp_i: 0, mkdir: false });
         }
+        KeyCode::Char('b') => match app.sel.clone() {
+            Some(s @ (Sel::Sys(_) | Sel::Planet(_))) if !app.fleet(w, &s).is_empty() => app.mode = Mode::Fleet { target: s, text: Line::default() },
+            _ => app.toast("select a system or world with ships in orbit to give a fleet order", t),
+        },
         KeyCode::Char('t') => match app.sel_planet() {
             Some(planet) => {
                 // queue it if someone's there to take it, otherwise send a ship

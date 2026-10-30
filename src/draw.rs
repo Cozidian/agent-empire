@@ -59,6 +59,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Confirm { id } => confirm(fb, app, *id, l),
         Mode::Help => help(fb, l),
         Mode::Brief { planet, text, kind, launch } => brief(fb, app, planet, text, *kind, *launch, l, t),
+        Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
         _ => {}
     }
     if !app.online {
@@ -586,6 +587,7 @@ fn planet_rows(app: &App, p: &Planet, t: f32) -> Rows {
     if !ctx.is_empty() {
         rows.push(("context", ctx));
     }
+    fleet_row(&mut rows, app, &agents);
     // the quest log: what's under way first, then what's waiting, then what's done
     let mut ms: Vec<&crate::proto::Mission> = app.missions.iter().filter(|m| m.cwd == p.key).collect();
     let rank = |m: &crate::proto::Mission| match m.state.as_str() {
@@ -618,6 +620,7 @@ fn system_rows(app: &App, w: &World, s: &System, t: f32) -> Rows {
         rows.push(("capital", vec![(cap.name.clone(), planet_color(cap))]));
     }
     economy(&mut rows, &agents, t);
+    fleet_row(&mut rows, app, &agents);
     let surveyed: Vec<(&Planet, &survey::World)> = planets.iter().filter_map(|p| app.survey.worlds.get(&p.key).filter(|g| g.git).map(|g| (*p, g))).collect();
     let dirty: u32 = surveyed.iter().map(|(_, g)| g.dirty).sum();
     let restless = surveyed.iter().filter(|(_, g)| g.dirty > 0).count();
@@ -719,8 +722,8 @@ fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {
     };
     let ctx = match &app.sel {
         Some(Sel::Agent(_)) => "⏎ comms · t mission · e deploy here · x decommission · ",
-        Some(Sel::Planet(_)) => "⏎ comms · t mission · e deploy here · ",
-        Some(Sel::Sys(_)) => "⏎ zoom in · ",
+        Some(Sel::Planet(_)) => "⏎ comms · t mission · b fleet order · e deploy here · ",
+        Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
         None => "",
     };
     let s = format!(" {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit");
@@ -897,6 +900,55 @@ fn deploy(fb: &mut Fb, app: &App, planet: &str, kind: usize, l: &Lay) {
     seg(fb, x + 3, y + 2, &trunc(&tilde(planet), (w - 6) as usize), w - 6, DIM, Some(BOX));
     species(fb, app, x + 3, y + 4, kind);
     seg(fb, x + 3, y + h - 2, "⏎ deploy · ←→ species · esc cancel", w - 6, DIM, Some(BOX));
+}
+
+/// A text field with a blinking block cursor.
+fn field(fb: &mut Fb, x: i32, row: i32, width: i32, text: &Line, accent: V3, t: f32) {
+    let x1 = seg(fb, x, row, "› ", 2, accent, Some(BOX));
+    let room = (width - 2).max(1) as usize;
+    let chars: Vec<char> = text.s.chars().collect();
+    let start = text.cur.saturating_sub(room - 1);
+    for (k, ch) in chars.iter().enumerate().skip(start).take(room) {
+        fb.put_bg(x1 + (k - start) as i32, row, *ch, TEXT, Some(BOX));
+    }
+    if fract(t * 1.6) < 0.6 {
+        let ch = chars.get(text.cur).copied().unwrap_or(' ');
+        fb.put_bg(x1 + (text.cur - start) as i32, row, ch, BOX, Some(accent));
+    }
+}
+
+fn fleet_order(fb: &mut Fb, app: &App, w: &World, target: &Sel, text: &Line, l: &Lay, t: f32) {
+    let (x, y, bw, h) = centered(l, 72, 11);
+    let accent = v3(0.45, 0.85, 1.0);
+    let name = match target {
+        Sel::Sys(k) => format!("{} SYSTEM", base_name(k).to_uppercase()),
+        Sel::Planet(k) => base_name(k).to_uppercase(),
+        Sel::Agent(_) => String::new(),
+    };
+    frame_box(fb, x, y, bw, h, &format!("◆ FLEET ORDER · {name}"), accent);
+    let ships = app.fleet(w, target);
+    let free = ships.iter().filter(|a| a.status != Status::Blocked).count();
+    let mut note = format!("Every ship here gets this order: {free} of {}", ships.len());
+    if free < ships.len() {
+        note.push_str(" (the rest are waiting on your answer)");
+    }
+    seg(fb, x + 3, y + 2, &note, bw - 6, DIM, Some(BOX));
+    field(fb, x + 3, y + 4, bw - 6, text, accent, t);
+    let mut cx = x + 3;
+    for a in ships.iter().take(8) {
+        cx = seg(fb, cx, y + 6, &format!("{} {} ", a.status.glyph(t), a.kind), bw - 6 - (cx - x - 3), kind_color(&a.kind), Some(BOX)) + 1;
+    }
+    seg(fb, x + 3, y + h - 2, "⏎ send to the fleet · esc cancel", bw - 6, DIM, Some(BOX));
+}
+
+/// Progress of the latest fleet order among these agents.
+fn fleet_row(rows: &mut Rows, app: &App, agents: &[&Agent]) {
+    let ids: Vec<u32> = agents.iter().map(|a| a.id).collect();
+    let Some(f) = app.missions.iter().filter(|m| m.agent.is_some_and(|a| ids.contains(&a))).filter_map(|m| m.fleet).max() else { return };
+    let all: Vec<&crate::proto::Mission> = app.missions.iter().filter(|m| m.fleet == Some(f)).collect();
+    let done = all.iter().filter(|m| m.state == "done").count();
+    let col = if done == all.len() { v3(1.0, 0.85, 0.4) } else { v3(0.4, 0.85, 1.0) };
+    rows.push(("fleet order", vec![(format!("{} {done}/{} ", meter(done as f32 / all.len() as f32, 5), all.len()), col), (clip(&all[0].text, 30), DIM)]));
 }
 
 #[allow(clippy::too_many_arguments)]
