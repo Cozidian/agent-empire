@@ -145,7 +145,10 @@ Click the **GitHub station or its label** to browse projects in the current gala
 PRs. It also appears in the outliner for keyboard selection. `⇥` switches between **all open PRs**,
 those **waiting on your review**, and **your PRs**. Projects with failing checks of yours come
 first, then those with reviews waiting on you; each lists your PRs, then reviews asked of you
-(marked ◆, with the author), then everyone else's, with CI status. Use arrows or
+(marked ◆, with the author), then everyone else's, with CI status. `t` on a PR opens the mission
+composer for its project with a brief ready to send: review someone else's PR (read-only, nothing
+posted without asking), fix your PR's failing checks, or address the review feedback on it. On a
+project row, `t` starts a blank mission there. Use arrows or
 the mouse wheel to scroll, and Enter (or a second click on a selected row) to focus a project or
 open a PR in your browser. Esc returns to the galaxy.
 

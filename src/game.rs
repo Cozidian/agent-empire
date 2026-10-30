@@ -400,6 +400,19 @@ pub struct TradeRow {
     pub pr: Option<survey::Pr>,
 }
 
+/// A ready-to-send mission for a pull request: review someone else's, fix or finish your own.
+pub fn pr_brief(pr: &survey::Pr, mine: bool) -> String {
+    let (n, title) = (pr.number, &pr.title);
+    // agents may be at work in this checkout, so nobody switches its branch
+    if !mine {
+        format!("Review PR #{n} \"{title}\" by @{}. Read it with `gh pr view {n}` and `gh pr diff {n}` (don't switch this checkout's branch; use a temporary git worktree if you need to run it). Then give me a review: what it does, bugs and risks, and suggestions, most important first. Don't post anything to GitHub until I say so.", pr.author)
+    } else if pr.ci == "fail" {
+        format!("Fix the failing checks on my PR #{n} \"{title}\". Find out why with `gh pr checks {n}` and `gh run view --log-failed`, fix it in a temporary git worktree on the PR's branch (don't switch this checkout's branch), and push the fix to the PR.")
+    } else {
+        format!("Address the review feedback on my PR #{n} \"{title}\". Read it with `gh pr view {n} --comments`, make the changes in a temporary git worktree on the PR's branch (don't switch this checkout's branch), and push them to the PR. Tell me what you changed and anything you disagreed with.")
+    }
+}
+
 /// Which pull requests the GitHub station lists.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum TradeView {
@@ -638,6 +651,19 @@ impl App {
             rows.extend(prs.into_iter().map(|pr| TradeRow { path: path.clone(), pr: Some(pr) }));
         }
         rows
+    }
+
+    /// Open the mission composer for a station row: a fitting brief for a PR, a blank one for a project.
+    fn trade_mission(&mut self, w: &World, index: usize) {
+        let Some(row) = self.trade_rows(w).into_iter().nth(index) else { return };
+        let mine = row.pr.as_ref().is_some_and(|pr| self.survey.worlds.get(&row.path).is_some_and(|s| s.prs.iter().any(|m| m.number == pr.number)));
+        let mut text = Line::default();
+        if let Some(pr) = &row.pr {
+            text.set(pr_brief(pr, mine));
+        }
+        // queue it if someone's there to take it, otherwise send a ship
+        let crewed = self.agents.iter().any(|a| a.cwd == row.path && a.dying.is_none());
+        self.mode = Mode::Brief { planet: row.path, text, kind: 0, launch: !crewed, attachments: Vec::new(), sending: false };
     }
 
     fn open_trade_row(&mut self, w: &World, index: usize, client: &Client, t: f32) {
@@ -2027,6 +2053,10 @@ fn handle(
                     app.trade_view = app.trade_view.next();
                     selected = 0;
                 }
+                KeyCode::Char('t') => {
+                    app.trade_mission(w, selected);
+                    return false;
+                }
                 _ => {}
             },
             Event::Mouse(me) => match me.kind {
@@ -2793,6 +2823,33 @@ mod station_tests {
         app.trade_view = TradeView::All;
         let projects: Vec<_> = app.trade_rows(&world).iter().filter(|r| r.pr.is_none()).map(|r| r.path.clone()).collect();
         assert_eq!(projects, ["/beta", "/alpha"]);
+    }
+
+    #[test]
+    fn t_on_a_pr_opens_a_fitting_mission_for_its_world() {
+        let (mut app, world) = fixture();
+        app.survey.worlds.get_mut("/alpha").unwrap().others = vec![survey::Pr { number: 21, title: "Theirs".into(), ci: "pass", author: "ana".into(), asks_you: true, draft: false }];
+        let rows = app.trade_rows(&world);
+        let brief = |app: &mut App, number: u32| {
+            let i = rows.iter().position(|r| r.pr.as_ref().is_some_and(|p| p.number == number) && r.path == "/alpha").unwrap();
+            app.trade_mission(&world, i);
+            match &app.mode {
+                Mode::Brief { planet, text, launch, .. } => (planet.clone(), text.s.clone(), *launch),
+                _ => panic!("no composer"),
+            }
+        };
+        let (planet, text, launch) = brief(&mut app, 21);
+        assert_eq!(planet, "/alpha");
+        assert!(text.starts_with("Review PR #21") && text.contains("@ana") && text.contains("Don't post"));
+        assert!(launch, "no one is on /alpha, so a ship is sent");
+        let (_, text, _) = brief(&mut app, 7);
+        assert!(text.starts_with("Address the review feedback on my PR #7"));
+        let failing = survey::Pr { number: 9, title: "Broken".into(), ci: "fail", ..Default::default() };
+        assert!(pr_brief(&failing, true).starts_with("Fix the failing checks on my PR #9"));
+        // a project row opens a blank composer
+        let p = rows.iter().position(|r| r.pr.is_none() && r.path == "/alpha").unwrap();
+        app.trade_mission(&world, p);
+        assert!(matches!(&app.mode, Mode::Brief { text, .. } if text.s.is_empty()));
     }
 
     #[test]
