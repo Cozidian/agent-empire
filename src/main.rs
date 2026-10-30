@@ -15,7 +15,9 @@ const HELP: &str = "empire — a galaxy of coding agents
 
   empire           open the galaxy (starts the daemon if needed)
   empire daemon    run the agent host in the foreground
-  empire stop      shut down the daemon and every agent in it
+  empire upgrade   swap a running daemon for this build, keeping every agent
+                   (the galaxy does this by itself when it starts)
+  empire stop      shut down the daemon and every agent in it (they won't come back)
   empire sounds    play every sound cue once";
 
 fn main() -> io::Result<()> {
@@ -28,6 +30,13 @@ fn main() -> io::Result<()> {
         }
         Some("statusline") => {
             daemon::statusline();
+            Ok(())
+        }
+        Some("upgrade") => {
+            match daemon::ensure_current() {
+                None => println!("daemon is up to date; every agent kept"),
+                Some(e) => println!("{e}"),
+            }
             Ok(())
         }
         Some("stop") => call(&Req::Shutdown).map(|_| println!("daemon stopped; all agents recalled")),

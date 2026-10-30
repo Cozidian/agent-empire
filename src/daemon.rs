@@ -3,14 +3,18 @@
 //! as the daemon does, so the game UI can come and go.
 
 use crate::proto::*;
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use std::collections::HashMap;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::num::NonZeroU16;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
@@ -20,6 +24,8 @@ const BOOT: f32 = 4.0;
 const ECHO: f32 = 0.4;
 /// Lines of history kept per agent for scrolling back in comms.
 const HISTORY: usize = 5000;
+/// The build this daemon was started from (see `build_id`).
+static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Status {
@@ -32,6 +38,17 @@ enum Status {
 }
 
 impl Status {
+    fn parse(s: &str) -> Self {
+        match s {
+            "working" => Status::Working,
+            "blocked" => Status::Blocked,
+            "done" => Status::Done,
+            "idle" => Status::Idle,
+            "exited" => Status::Exited,
+            _ => Status::Booting,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Status::Booting => "booting",
@@ -84,14 +101,37 @@ impl vt100::Callbacks for Cb {
     }
 }
 
+/// The daemon's end of an agent's terminal: the pty master and the child's pid.
+/// Plain fds and pids survive the daemon exec'ing a newer version of itself.
+struct Pty {
+    master: File,
+    pid: i32,
+}
+
+impl Pty {
+    fn write_all(&mut self, b: &[u8]) -> io::Result<()> {
+        self.master.write_all(b)
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+    }
+
+    fn kill(&self) {
+        unsafe { libc::kill(self.pid, libc::SIGHUP) };
+    }
+}
+
 struct Agent {
     id: u32,
     kind: String,
     cwd: String,
     parser: vt100::Parser<Cb>,
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    writer: Pty,
+    /// The agent's own session id, for resuming it after a reboot.
+    session: Option<String>,
+    born: SystemTime,
     started: Instant,
     last_out: Instant,
     last_in: Instant,
@@ -367,26 +407,72 @@ fn claude_hooks(exe: &str) -> String {
     .to_string()
 }
 
-fn command(kind: &str, exe: &str) -> (String, Vec<String>) {
-    match kind {
-        "claude" => ("claude".into(), vec!["--settings".into(), claude_hooks(exe)]),
+fn command(kind: &str, exe: &str, resume: Option<&str>) -> (String, Vec<String>) {
+    let mut args: Vec<String> = Vec::new();
+    let prog = match kind {
+        "claude" => {
+            if let Some(id) = resume {
+                args.extend(["--resume".into(), id.into()]);
+            }
+            args.extend(["--settings".into(), claude_hooks(exe)]);
+            "claude".into()
+        }
         // inline mode keeps its output in the scrollback, so comms can scroll it
-        "codex" => ("codex".into(), vec!["--no-alt-screen".into()]),
-        "cursor" => ("cursor-agent".into(), vec![]),
-        "shell" => (std::env::var("SHELL").unwrap_or_else(|_| "bash".into()), vec![]),
-        k => (k.into(), vec![]),
+        "codex" => {
+            args.push("--no-alt-screen".into());
+            if let Some(id) = resume {
+                args.extend(["resume".into(), id.into()]);
+            }
+            "codex".into()
+        }
+        "grok" => {
+            if let Some(id) = resume {
+                args.extend(["--resume".into(), id.into()]);
+            }
+            "grok".into()
+        }
+        "cursor" => "cursor-agent".into(),
+        "shell" => std::env::var("SHELL").unwrap_or_else(|_| "bash".into()),
+        k => k.into(),
+    };
+    (prog, args)
+}
+
+fn next_id(hub: &Shared) -> u32 {
+    let mut h = hub.lock().unwrap();
+    h.next += 1;
+    h.next
+}
+
+fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) -> Agent {
+    let now = Instant::now();
+    Agent {
+        id,
+        kind: kind.into(),
+        cwd: cwd.into(),
+        parser: vt100::Parser::new_with_callbacks(NonZeroU16::new(rows).unwrap(), NonZeroU16::new(cols).unwrap(), HISTORY, Cb::default()),
+        writer,
+        session: None,
+        born: SystemTime::now(),
+        started: now,
+        last_out: now,
+        last_in: now,
+        hook: None,
+        answered: None,
+        turns: 0,
+        report: Report::default(),
+        status: Status::Booting,
+        since: now,
+        exited: None,
     }
 }
 
-fn spawn(hub: &Shared, kind: &str, cwd: &str) -> anyhow::Result<u32> {
-    let id = {
-        let mut h = hub.lock().unwrap();
-        h.next += 1;
-        h.next
-    };
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+/// Launch an agent in `cwd`, picking up its old session if we have one.
+fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>) -> anyhow::Result<u32> {
+    let id = next_id(hub);
+    let exe = exe_path().to_string_lossy().into_owned();
     let pty = native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })?;
-    let (prog, args) = command(kind, &exe);
+    let (prog, args) = command(kind, &exe, resume);
     let mut cmd = CommandBuilder::new(&prog);
     cmd.args(&args);
     cmd.cwd(cwd);
@@ -401,29 +487,25 @@ fn spawn(hub: &Shared, kind: &str, cwd: &str) -> anyhow::Result<u32> {
     cmd.env("COLORTERM", "truecolor");
     cmd.env("EMPIRE_AGENT_ID", id.to_string());
     cmd.env("EMPIRE_SOCK", socket_path());
-    let mut child = pty.slave.spawn_command(cmd)?;
+    let child = pty.slave.spawn_command(cmd)?;
     drop(pty.slave);
-    let mut reader = pty.master.try_clone_reader()?;
-    let now = Instant::now();
-    let agent = Arc::new(Mutex::new(Agent {
-        id,
-        kind: kind.into(),
-        cwd: cwd.into(),
-        parser: vt100::Parser::new_with_callbacks(NonZeroU16::new(ROWS).unwrap(), NonZeroU16::new(COLS).unwrap(), HISTORY, Cb::default()),
-        writer: pty.master.take_writer()?,
-        killer: child.clone_killer(),
-        master: pty.master,
-        started: now,
-        last_out: now,
-        last_in: now,
-        hook: None,
-        answered: None,
-        turns: 0,
-        report: Report::default(),
-        status: Status::Booting,
-        since: now,
-        exited: None,
-    }));
+    let pid = child.process_id().ok_or_else(|| anyhow::anyhow!("no pid"))? as i32;
+    drop(child); // we reap it ourselves (waitpid), which also works after an exec
+    let fd = pty.master.as_raw_fd().ok_or_else(|| anyhow::anyhow!("no pty fd"))?;
+    let master = unsafe { File::from_raw_fd(libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3)) };
+    drop(pty.master);
+    let mut agent = new_agent(id, kind, cwd, Pty { master, pid }, ROWS, COLS);
+    agent.session = resume.map(String::from);
+    watch(hub, agent)?;
+    Ok(id)
+}
+
+/// Start pumping an agent's output and waiting for it to exit.
+fn watch(hub: &Shared, agent: Agent) -> io::Result<()> {
+    let mut reader = agent.writer.master.try_clone()?;
+    let pid = agent.writer.pid;
+    let agent = Arc::new(Mutex::new(agent));
+    let id = agent.lock().unwrap().id;
     hub.lock().unwrap().agents.insert(id, agent.clone());
 
     // pump output into the terminal emulator, answering queries as we go
@@ -447,17 +529,252 @@ fn spawn(hub: &Shared, kind: &str, cwd: &str) -> anyhow::Result<u32> {
         a.lock().unwrap().exited = Some(Instant::now());
     });
     thread::spawn(move || {
-        let _ = child.wait();
+        let mut st = 0;
+        unsafe { libc::waitpid(pid, &mut st, 0) };
         agent.lock().unwrap().exited.get_or_insert(Instant::now());
     });
-    Ok(id)
+    Ok(())
+}
+
+// ───────────────────────── surviving restarts ──────────────────────────
+
+/// The binary we're running (cargo may have replaced it since: "/path (deleted)").
+pub fn exe_path() -> PathBuf {
+    let p = std::env::current_exe().unwrap_or_else(|_| "empire".into());
+    let s = p.to_string_lossy();
+    PathBuf::from(s.strip_suffix(" (deleted)").unwrap_or(&s).to_string())
+}
+
+/// A fingerprint of the binary on disk, so a running daemon can tell it's out of date.
+pub fn build_id() -> String {
+    std::fs::metadata(exe_path())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or_else(|| env!("CARGO_PKG_VERSION").into(), |d| format!("{}-{}", env!("CARGO_PKG_VERSION"), d.as_millis()))
+}
+
+/// Everything an agent needs to carry over into the new daemon.
+#[derive(Serialize, Deserialize)]
+struct Handoff {
+    id: u32,
+    kind: String,
+    cwd: String,
+    fd: i32,
+    pid: i32,
+    rows: u16,
+    cols: u16,
+    screen: String,
+    title: String,
+    status: String,
+    age: f32,
+    turns: u32,
+    report: Report,
+    session: Option<String>,
+}
+
+/// Replace this daemon with the binary on disk, keeping every agent: same pid,
+/// so the agents stay our children, and their pty fds survive the exec.
+fn upgrade(hub: &Shared) -> io::Result<()> {
+    let h = hub.lock().unwrap();
+    let now = Instant::now();
+    let mut out = Vec::new();
+    for a in h.agents.values() {
+        let g = a.lock().unwrap();
+        if g.exited.is_some() {
+            continue;
+        }
+        let fd = unsafe { libc::dup(g.writer.master.as_raw_fd()) }; // no CLOEXEC: this one crosses over
+        let s = g.parser.screen();
+        let (rows, cols) = s.size();
+        let screen = format!("{}{}", s.input_mode_formatted(), s.contents_formatted());
+        out.push(Handoff {
+            id: g.id,
+            kind: g.kind.clone(),
+            cwd: g.cwd.clone(),
+            fd,
+            pid: g.writer.pid,
+            rows: rows.get(),
+            cols: cols.get(),
+            screen,
+            title: g.parser.callbacks().title.clone(),
+            status: g.status.name().into(),
+            age: (now - g.since).as_secs_f32(),
+            turns: g.turns,
+            report: g.report.clone(),
+            session: g.session.clone(),
+        });
+    }
+    let file = dirs_state().join("handoff.json");
+    std::fs::write(&file, serde_json::to_string(&(h.next, out))?)?;
+    let _ = std::fs::remove_file(socket_path());
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(exe_path()).arg("daemon").env("EMPIRE_HANDOFF", &file).exec();
+    Err(err)
+}
+
+/// The other half of `upgrade`: pick the agents back up.
+fn adopt(hub: &Shared, file: &str) -> anyhow::Result<()> {
+    let (next, list): (u32, Vec<Handoff>) = serde_json::from_str(&std::fs::read_to_string(file)?)?;
+    let _ = std::fs::remove_file(file);
+    hub.lock().unwrap().next = next;
+    let now = Instant::now();
+    for h in list {
+        let master = unsafe { File::from_raw_fd(h.fd) };
+        unsafe { libc::fcntl(h.fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        let mut a = new_agent(h.id, &h.kind, &h.cwd, Pty { master, pid: h.pid }, h.rows.max(2), h.cols.max(2));
+        a.parser.process(h.screen.as_bytes());
+        a.parser.callbacks_mut().title = h.title;
+        a.parser.callbacks_mut().replies.clear();
+        a.status = Status::parse(&h.status);
+        a.since = now.checked_sub(Duration::from_secs_f32(h.age)).unwrap_or(now);
+        a.started = now.checked_sub(Duration::from_secs(60)).unwrap_or(now); // long past booting
+        a.turns = h.turns;
+        a.report = h.report;
+        a.session = h.session;
+        watch(hub, a)?;
+    }
+    Ok(())
+}
+
+/// Who should come back after a reboot or a crash: written as agents come and go,
+/// cleared by `empire stop`.
+#[derive(Serialize, Deserialize, PartialEq, Clone)]
+struct Saved {
+    kind: String,
+    cwd: String,
+    session: Option<String>,
+}
+
+fn registry_file() -> PathBuf {
+    dirs_state().join("agents.json")
+}
+
+fn save_registry(hub: &Shared, last: &mut Vec<Saved>) {
+    let mut now: Vec<(u32, Saved)> = hub
+        .lock()
+        .unwrap()
+        .agents
+        .values()
+        .filter_map(|a| {
+            let g = a.lock().unwrap();
+            g.exited.is_none().then(|| (g.id, Saved { kind: g.kind.clone(), cwd: g.cwd.clone(), session: g.session.clone() }))
+        })
+        .collect();
+    now.sort_by_key(|(id, _)| *id);
+    let now: Vec<Saved> = now.into_iter().map(|(_, s)| s).collect();
+    if now != *last {
+        let _ = std::fs::create_dir_all(dirs_state());
+        let _ = std::fs::write(registry_file(), serde_json::to_string(&now).unwrap_or_default());
+        *last = now;
+    }
+}
+
+/// Relaunch whoever was running when the daemon last went down unexpectedly.
+fn resurrect(hub: &Shared) {
+    let Ok(s) = std::fs::read_to_string(registry_file()) else { return };
+    let list: Vec<Saved> = serde_json::from_str(&s).unwrap_or_default();
+    for a in list {
+        if std::path::Path::new(&a.cwd).is_dir() {
+            // a claude that never got a prompt has nothing to resume
+            let session = a.session.filter(|s| a.kind != "claude" || claude_transcript(s));
+            if let Err(e) = spawn(hub, &a.kind, &a.cwd, session.as_deref()) {
+                eprintln!("could not bring back {} in {}: {e}", a.kind, a.cwd);
+            }
+        }
+    }
+}
+
+fn claude_transcript(session: &str) -> bool {
+    let home = crate::game::home();
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
+    std::fs::read_dir(dir.join("projects")).into_iter().flatten().flatten().any(|p| p.path().join(format!("{session}.jsonl")).is_file())
+}
+
+/// Codex and grok don't tell us their session id; find the session they just
+/// started in this folder.
+fn discover_sessions(hub: &Shared) {
+    let agents: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
+    let mut claimed: HashSet<String> = agents.iter().filter_map(|a| a.lock().unwrap().session.clone()).collect();
+    for a in agents {
+        let (kind, cwd, born, has) = {
+            let g = a.lock().unwrap();
+            (g.kind.clone(), g.cwd.clone(), g.born, g.session.is_some())
+        };
+        if has || !matches!(kind.as_str(), "codex" | "grok") {
+            continue;
+        }
+        let found = if kind == "codex" { codex_session(&cwd, born, &claimed) } else { grok_session(&cwd, born, &claimed) };
+        if let Some(s) = found {
+            claimed.insert(s.clone());
+            a.lock().unwrap().session = Some(s);
+        }
+    }
+}
+
+fn recent_entries(dir: &std::path::Path, since: SystemTime) -> Vec<(SystemTime, PathBuf)> {
+    let mut v: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            let t = m.created().or_else(|_| m.modified()).ok()?;
+            (t + Duration::from_secs(2) >= since).then(|| (t, e.path()))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn codex_session(cwd: &str, born: SystemTime, claimed: &HashSet<String>) -> Option<String> {
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| crate::game::home().join(".codex"));
+    let day = |t: SystemTime| {
+        let secs = t.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs() as i64;
+        let tm = unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&secs, &mut tm);
+            tm
+        };
+        Some(home.join(format!("sessions/{:04}/{:02}/{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)))
+    };
+    let dirs: Vec<PathBuf> = [day(born), day(SystemTime::now())].into_iter().flatten().collect();
+    for dir in dirs {
+        for (_, f) in recent_entries(&dir, born) {
+            let Ok(file) = File::open(&f) else { continue };
+            let mut first = String::new();
+            let _ = BufReader::new(file).read_line(&mut first);
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&first) else { continue };
+            let p = &v["payload"];
+            if p["cwd"].as_str() == Some(cwd)
+                && let Some(id) = p["id"].as_str()
+                && !claimed.contains(id)
+            {
+                return Some(id.into());
+            }
+        }
+    }
+    None
+}
+
+fn grok_session(cwd: &str, born: SystemTime, claimed: &HashSet<String>) -> Option<String> {
+    let enc: String = cwd
+        .bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect();
+    let dir = crate::game::home().join(".grok/sessions").join(enc);
+    recent_entries(&dir, born)
+        .into_iter()
+        .filter(|(_, p)| p.is_dir())
+        .filter_map(|(_, p)| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .find(|n| !claimed.contains(n))
 }
 
 fn handle(hub: &Shared, req: Req) -> Resp {
     let get = |id: u32| hub.lock().unwrap().agents.get(&id).cloned();
     let missing = |id: u32| Resp::Err { msg: format!("no agent #{id}") };
     match req {
-        Req::Ping => Resp::Pong { version: env!("CARGO_PKG_VERSION").into() },
+        Req::Ping => Resp::Pong { version: BUILD.get().cloned().unwrap_or_default() },
         Req::List => {
             let now = Instant::now();
             let list: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
@@ -465,13 +782,23 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             agents.sort_by_key(|a| a.id);
             Resp::Agents { agents }
         }
-        Req::Spawn { kind, cwd } => match spawn(hub, &kind, &cwd) {
+        Req::Upgrade => {
+            let h = hub.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                if let Err(e) = upgrade(&h) {
+                    eprintln!("upgrade failed: {e}");
+                }
+            });
+            Resp::Ok
+        }
+        Req::Spawn { kind, cwd } => match spawn(hub, &kind, &cwd, None) {
             Ok(id) => Resp::Spawned { id },
             Err(e) => Resp::Err { msg: format!("could not launch {kind}: {e}") },
         },
         Req::Kill { id } => match get(id) {
             Some(a) => {
-                let _ = a.lock().unwrap().killer.kill();
+                a.lock().unwrap().writer.kill();
                 Resp::Ok
             }
             None => missing(id),
@@ -527,7 +854,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             Some(a) => {
                 let mut g = a.lock().unwrap();
                 let (cols, rows) = (cols.clamp(20, 400), rows.clamp(5, 200));
-                let _ = g.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                g.writer.resize(rows, cols);
                 g.parser.set_size(NonZeroU16::new(rows).unwrap(), NonZeroU16::new(cols).unwrap());
                 Resp::Ok
             }
@@ -569,14 +896,20 @@ fn handle(hub: &Shared, req: Req) -> Resp {
         },
         Req::Report { id, report } => match get(id) {
             Some(a) => {
-                a.lock().unwrap().report = report;
+                let mut g = a.lock().unwrap();
+                if report.session.is_some() {
+                    g.session = report.session.clone();
+                }
+                g.report = report;
                 Resp::Ok
             }
             None => missing(id),
         },
         Req::Shutdown => {
+            // a deliberate stop: nobody comes back next time
+            let _ = std::fs::remove_file(registry_file());
             for a in hub.lock().unwrap().agents.values() {
-                let _ = a.lock().unwrap().killer.kill();
+                a.lock().unwrap().writer.kill();
             }
             thread::spawn(|| {
                 thread::sleep(Duration::from_millis(200));
@@ -612,11 +945,29 @@ pub fn run() -> io::Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     let hub: Shared = Arc::default();
+    let _ = BUILD.set(build_id());
+    match std::env::var("EMPIRE_HANDOFF") {
+        Ok(f) => {
+            unsafe { std::env::remove_var("EMPIRE_HANDOFF") };
+            match adopt(&hub, &f) {
+                Ok(()) => eprintln!("upgraded in place, {} agents carried over", hub.lock().unwrap().agents.len()),
+                Err(e) => eprintln!("handoff failed: {e}"),
+            }
+        }
+        Err(_) => resurrect(&hub),
+    }
 
     // status bookkeeping, and reaping agents a while after they exit
     let h = hub.clone();
     thread::spawn(move || {
+        let mut saved = Vec::new();
+        let mut tick = 0u32;
         loop {
+            tick += 1;
+            if tick % 10 == 0 {
+                discover_sessions(&h);
+                save_registry(&h, &mut saved);
+            }
             let now = Instant::now();
             let list: Vec<(u32, Arc<Mutex<Agent>>)> = h.lock().unwrap().agents.iter().map(|(k, v)| (*k, v.clone())).collect();
             let mut dead = Vec::new();
@@ -679,6 +1030,7 @@ pub fn statusline() {
             cost: num(&["cost", "total_cost_usd"]).map(|x| x as f32),
             added: num(&["cost", "total_lines_added"]).map(|x| x as u32),
             removed: num(&["cost", "total_lines_removed"]).map(|x| x as u32),
+            session: f(&["session_id"]).and_then(|s| s.as_str()).map(String::from),
         };
         let _ = call(&Req::Report { id, report });
     }
@@ -698,6 +1050,30 @@ pub fn statusline() {
             let _ = child.wait();
         }
     }
+}
+
+/// Make sure the running daemon is this build, upgrading it in place (agents and
+/// all) if not. Returns a complaint if the daemon is too old to upgrade itself.
+pub fn ensure_current() -> Option<String> {
+    let want = build_id();
+    match call(&Req::Ping) {
+        Ok(Resp::Pong { version }) if version == want => return None,
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+    match call(&Req::Upgrade) {
+        Ok(Resp::Ok) => {}
+        _ => return Some("the daemon is too old to upgrade itself: `empire stop` once to restart it".into()),
+    }
+    for _ in 0..60 {
+        thread::sleep(Duration::from_millis(100));
+        if let Ok(Resp::Pong { version }) = call(&Req::Ping)
+            && version == want
+        {
+            return None;
+        }
+    }
+    Some("the daemon didn't come back from its upgrade; see ~/.local/state/empire/daemon.log".into())
 }
 
 /// Start the daemon in the background (own session, detached from this terminal).

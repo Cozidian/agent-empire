@@ -977,6 +977,7 @@ fn is_leave(k: &KeyEvent) -> bool {
 pub fn run() -> io::Result<()> {
     // the daemon must be up before we take over the terminal (it may log)
     crate::daemon::ensure_running()?;
+    let stale = crate::daemon::ensure_current();
     let client = Client::start();
     let sound = Sound::start();
 
@@ -988,7 +989,7 @@ pub fn run() -> io::Result<()> {
         restore();
         hook(info);
     }));
-    let r = game_loop(&mut out, &client, sound.as_ref());
+    let r = game_loop(&mut out, &client, sound.as_ref(), stale);
     restore();
     r
 }
@@ -999,8 +1000,11 @@ fn restore() {
     let _ = terminal::disable_raw_mode();
 }
 
-fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>) -> io::Result<()> {
+fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: Option<String>) -> io::Result<()> {
     let mut app = App::new();
+    if let Some(e) = stale {
+        app.say(format!("✖ {e}"), v3(1.0, 0.4, 0.3));
+    }
     let (c, r) = terminal::size()?;
     let mut fb = Fb::new(c as usize, r as usize);
     let mut out = Out::new(fb.cols * fb.rows);

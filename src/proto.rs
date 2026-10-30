@@ -30,6 +30,8 @@ pub enum Req {
     /// What an agent tells us about itself (Claude Code, through its statusline).
     Report { id: u32, report: Report },
     Shutdown,
+    /// Exec the binary on disk in place of the running daemon, keeping every agent.
+    Upgrade,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -78,6 +80,8 @@ pub struct Report {
     pub cost: Option<f32>,
     pub added: Option<u32>,
     pub removed: Option<u32>,
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 /// A run of terminal cells sharing colours. `t` has one char per cell; wide
