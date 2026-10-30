@@ -130,6 +130,7 @@ pub struct Agent {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sel {
+    GitHub,
     Sys(String),
     Planet(String),
     Agent(u32),
@@ -296,14 +297,17 @@ pub struct Colonize {
 
 pub enum Mode {
     Galaxy,
+    Trade { sel: usize },
     Comms(u32),
     Colonize(Colonize),
     Deploy { planet: String, kind: usize },
     Confirm { id: u32 },
+    /// A ship's card: what it's doing, and what you can do with it.
+    Ship { id: u32, sel: usize },
     /// What a world needs, as a menu of quick actions.
     Actions { planet: String, sel: usize },
-    /// Every mission in the empire, grouped by `App::log_sort`; `open` ones show in full.
-    Log { sel: usize, open: HashSet<u32> },
+    /// A world's missions (its moons' too), grouped by `App::log_sort`; `open` ones show in full.
+    Log { world: String, sel: usize, open: HashSet<u32> },
     /// Founding a moon (git worktree) off a world.
     Moon { planet: String, branch: Line, kind: usize },
     /// Merging a moon back into its world.
@@ -320,16 +324,19 @@ pub enum Mode {
 pub enum LogSort {
     Status,
     Planet,
-    System,
     Fleet,
+}
+
+pub struct TradeRow {
+    pub path: String,
+    pub pr: Option<survey::Pr>,
 }
 
 impl LogSort {
     pub fn next(self) -> Self {
         match self {
             Self::Status => Self::Planet,
-            Self::Planet => Self::System,
-            Self::System => Self::Fleet,
+            Self::Planet => Self::Fleet,
             Self::Fleet => Self::Status,
         }
     }
@@ -337,7 +344,6 @@ impl LogSort {
         match self {
             Self::Status => "status",
             Self::Planet => "world",
-            Self::System => "system",
             Self::Fleet => "fleet",
         }
     }
@@ -516,6 +522,34 @@ impl Lay {
 // ──────────────────────────────── app ──────────────────────────────────
 
 impl App {
+    /// Projects currently in this galaxy; worktrees share their host's PRs.
+    pub fn trade_rows(&self, w: &World) -> Vec<TradeRow> {
+        let mut projects: Vec<_> = w.planets.iter().filter(|p| p.host.is_none())
+            .filter_map(|p| self.survey.worlds.get(&p.key).filter(|s| s.github).map(|s| (&p.key, s))).collect();
+        projects.sort_by_key(|(key, s)| (!s.prs.iter().any(|p| p.ci == "fail"), *key));
+        let mut rows = Vec::new();
+        for (path, s) in projects {
+            rows.push(TradeRow { path: path.clone(), pr: None });
+            let mut prs = s.prs.clone();
+            prs.sort_by_key(|p| (match p.ci { "fail" => 0, "pending" => 1, "pass" => 2, _ => 3 }, p.number));
+            rows.extend(prs.into_iter().map(|pr| TradeRow { path: path.clone(), pr: Some(pr) }));
+        }
+        rows
+    }
+
+    fn open_trade_row(&mut self, w: &World, index: usize, client: &Client, t: f32) {
+        if let Some(row) = self.trade_rows(w).get(index) {
+            if let Some(pr) = &row.pr {
+                client.open_pr(row.path.clone(), pr.number);
+                self.toast(format!("opening PR #{} in browser", pr.number), t);
+            } else {
+                self.sel = Some(Sel::Planet(row.path.clone()));
+                self.mode = Mode::Galaxy;
+                self.glide_to_sel(w);
+            }
+        }
+    }
+
     fn new() -> Self {
         Self {
             agents: Vec::new(),
@@ -616,28 +650,25 @@ impl App {
 
     /// Missions in log order, each with its group heading. Within a group: under way,
     /// then queued (in dispatch order), then done (newest first).
-    pub fn mission_log(&self) -> Vec<(String, &Mission)> {
+    pub fn mission_log(&self, world: &str) -> Vec<(String, &Mission)> {
         let rank = |m: &Mission| match m.state.as_str() {
             "active" | "sent" => 0,
             "queued" => 1,
             _ => 2,
         };
-        // (sort key, heading) of a mission's group; moons file under their world's system
+        // (sort key, heading) of a mission's group
         let group = |m: &Mission| -> (String, String) {
             match self.log_sort {
                 LogSort::Status => (rank(m).to_string(), ["UNDER WAY", "QUEUED", "DONE"][rank(m)].into()),
                 LogSort::Planet => (m.cwd.clone(), format!("● {}", base_name(&m.cwd).to_uppercase())),
-                LogSort::System => {
-                    let sys = parent(&self.moon_host(&m.cwd).unwrap_or_else(|| m.cwd.clone()));
-                    (sys.clone(), format!("✶ {}", base_name(&sys).to_uppercase()))
-                }
                 LogSort::Fleet => match m.fleet {
                     Some(f) => (format!("0{f:010}"), format!("⚑ FLEET ORDER #{f}")),
                     None => ("1".into(), "SINGLE MISSIONS".into()),
                 },
             }
         };
-        let mut v: Vec<((String, String), &Mission)> = self.missions.iter().map(|m| (group(m), m)).collect();
+        let ours = |m: &&Mission| m.cwd == world || self.moon_host(&m.cwd).as_deref() == Some(world);
+        let mut v: Vec<((String, String), &Mission)> = self.missions.iter().filter(ours).map(|m| (group(m), m)).collect();
         v.sort_by_key(|(g, m)| (g.0.clone(), rank(m), if rank(m) == 2 { std::cmp::Reverse(m.done_at.unwrap_or(m.at)) } else { std::cmp::Reverse(0) }, m.id));
         v.into_iter().map(|((_, head), m)| (head, m)).collect()
     }
@@ -693,6 +724,31 @@ impl App {
     }
 
     /// The world a selection is a moon of, if it is one.
+    /// The ship card's menu; priority only matters in a border conflict.
+    pub fn ship_acts(&self, id: u32) -> Vec<ShipAct> {
+        let Some(a) = self.agent(id) else { return Vec::new() };
+        let mut v = vec![ShipAct::Comms, ShipAct::Mission];
+        if !a.war.is_empty() {
+            v.push(ShipAct::Priority);
+        }
+        v.push(ShipAct::Decommission);
+        v
+    }
+
+    fn ship_act(&mut self, id: u32, act: ShipAct, client: &Client, l: &Lay, t: f32) {
+        let Some(a) = self.agent(id) else {
+            self.mode = Mode::Galaxy;
+            return;
+        };
+        let cwd = a.cwd.clone();
+        match act {
+            ShipAct::Comms => self.open_comms(id, client, l),
+            ShipAct::Mission => self.mode = Mode::Brief { planet: cwd, text: Line::default(), kind: 0, launch: false, attachments: Vec::new(), sending: false },
+            ShipAct::Priority => self.act(&cwd, Act::Priority(id), client, l, t),
+            ShipAct::Decommission => self.mode = Mode::Confirm { id },
+        }
+    }
+
     pub fn moon_host(&self, key: &str) -> Option<String> {
         self.survey.worlds.get(key)?.host.clone()
     }
@@ -708,7 +764,7 @@ impl App {
                 .map(|i| &w.planets[i])
                 .collect(),
             Sel::Planet(k) => w.planet(k).into_iter().collect(),
-            Sel::Agent(_) => Vec::new(),
+            Sel::Agent(_) | Sel::GitHub => Vec::new(),
         };
         planets.iter().flat_map(|p| p.agents.iter().map(|&i| &self.agents[i])).filter(|a| a.dying.is_none() && a.status != Status::Exited).collect()
     }
@@ -1055,6 +1111,7 @@ impl App {
     /// Outliner order: systems, their planets, their agents (most urgent first).
     pub fn rows(&self, w: &World) -> Vec<Sel> {
         let mut v = Vec::new();
+        if w.station.is_some() { v.push(Sel::GitHub); }
         for s in &w.systems {
             v.push(Sel::Sys(s.key.clone()));
             for &pi in &s.planets {
@@ -1072,6 +1129,7 @@ impl App {
 
     pub fn sel_pos(&self, w: &World) -> Option<(f32, f32)> {
         match self.sel.as_ref()? {
+            Sel::GitHub => w.station,
             Sel::Sys(k) => w.systems.iter().find(|s| &s.key == k).map(|s| s.wpos),
             Sel::Planet(k) => w.planet(k).map(|p| p.wpos),
             Sel::Agent(id) => self.agent(*id).map(|a| a.wpos),
@@ -1083,7 +1141,7 @@ impl App {
         match self.sel.as_ref()? {
             Sel::Planet(k) => Some(k.clone()),
             Sel::Agent(id) => self.agent(*id).map(|a| a.cwd.clone()),
-            Sel::Sys(_) => None,
+            Sel::Sys(_) | Sel::GitHub => None,
         }
     }
 
@@ -1237,7 +1295,8 @@ impl App {
     /// Enter on the current selection.
     fn activate(&mut self, w: &World, l: &Lay, client: &Client) {
         match self.sel.clone() {
-            Some(Sel::Agent(id)) => self.open_comms(id, client, l),
+            Some(Sel::GitHub) => self.mode = Mode::Trade { sel: 0 },
+            Some(Sel::Agent(id)) => self.mode = Mode::Ship { id, sel: 0 },
             Some(Sel::Planet(k)) => {
                 if let Some(id) = self.lead_agent(&k) {
                     self.sel = Some(Sel::Agent(id));
@@ -1313,6 +1372,26 @@ pub enum Act {
     /// Open comms with an agent.
     Comms(u32),
     Priority(u32),
+}
+
+/// What the ship card offers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ShipAct {
+    Comms,
+    Mission,
+    Priority,
+    Decommission,
+}
+
+impl ShipAct {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Comms => "open comms",
+            Self::Mission => "give its world a mission",
+            Self::Priority => "give priority in its border conflict",
+            Self::Decommission => "decommission",
+        }
+    }
 }
 
 const AMBER: V3 = v3(1.0, 0.75, 0.3);
@@ -1577,6 +1656,12 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             app.close_comms(client);
         }
 
+        if let Mode::Ship { id, .. } = app.mode
+            && app.agent(id).is_none()
+        {
+            app.mode = Mode::Galaxy;
+        }
+
         while event::poll(Duration::ZERO)? {
             let ev = event::read()?;
             if let Event::Resize(c, r) = ev {
@@ -1699,11 +1784,45 @@ fn handle(
         }
         return false;
     }
+    if let Mode::Trade { sel } = app.mode {
+        let rows = app.trade_rows(w);
+        let max = rows.len().saturating_sub(1);
+        let mut selected = sel.min(max);
+        let mut activate = false;
+        match &ev {
+            Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::Galaxy; return false; }
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(max),
+                KeyCode::Home => selected = 0,
+                KeyCode::End => selected = max,
+                KeyCode::PageUp => selected = selected.saturating_sub((l.rows - 10).max(1) as usize),
+                KeyCode::PageDown => selected = (selected + (l.rows - 10).max(1) as usize).min(max),
+                KeyCode::Enter => activate = true,
+                _ => {}
+            },
+            Event::Mouse(me) => match me.kind {
+                MouseEventKind::ScrollUp => selected = selected.saturating_sub(1),
+                MouseEventKind::ScrollDown => selected = (selected + 1).min(max),
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(row) = draw::trade_hit(l, rows.len(), selected, me.column as i32, me.row as i32) {
+                        activate = row == selected;
+                        selected = row;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        app.mode = Mode::Trade { sel: selected };
+        if activate { app.open_trade_row(w, selected, client, t); }
+        return false;
+    }
     let Event::Key(k) = ev else {
         if let Event::Mouse(me) = ev
             && !matches!(app.mode, Mode::Brief { .. })
         {
-            mouse(app, w, l, client, me, drag);
+            mouse(app, w, l, client, me, drag, t);
         }
         return false;
     };
@@ -1728,6 +1847,37 @@ fn handle(
                 }
             }
             app.mode = Mode::Galaxy;
+            return false;
+        }
+        Mode::Ship { id, sel } => {
+            let (id, mut s) = (*id, *sel);
+            let acts = app.ship_acts(id);
+            let pick = match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.mode = Mode::Galaxy;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    s = s.saturating_sub(1);
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    s = (s + 1).min(acts.len().saturating_sub(1));
+                    None
+                }
+                KeyCode::Char(d @ '1'..='9') => acts.get(d as usize - '1' as usize).copied(),
+                KeyCode::Enter | KeyCode::Char('c') => acts.get(s).copied(),
+                KeyCode::Char('t') => Some(ShipAct::Mission),
+                KeyCode::Char('x') => Some(ShipAct::Decommission),
+                KeyCode::Char('P') if acts.contains(&ShipAct::Priority) => Some(ShipAct::Priority),
+                _ => None,
+            };
+            if let Mode::Ship { sel, .. } = &mut app.mode {
+                *sel = s;
+            }
+            if let Some(a) = pick {
+                app.ship_act(id, a, client, l, t);
+            }
             return false;
         }
         Mode::Actions { planet, sel } => {
@@ -1758,10 +1908,10 @@ fn handle(
             }
             return false;
         }
-        Mode::Log { sel, open } => {
-            let mut s = *sel;
+        Mode::Log { world, sel, open } => {
+            let (world, mut s) = (world.clone(), *sel);
             let mut open = std::mem::take(open);
-            let log: Vec<(u32, Option<u32>)> = app.mission_log().iter().map(|(_, m)| (m.id, m.agent)).collect();
+            let log: Vec<(u32, Option<u32>)> = app.mission_log(&world).iter().map(|(_, m)| (m.id, m.agent)).collect();
             match k.code {
                 KeyCode::Esc | KeyCode::Char('L') | KeyCode::Char('q') => app.mode = Mode::Galaxy,
                 KeyCode::Up | KeyCode::Char('k') => s = s.saturating_sub(1),
@@ -1807,11 +1957,11 @@ fn handle(
                 KeyCode::Char('s') | KeyCode::Tab => {
                     app.log_sort = app.log_sort.next();
                     let id = log.get(s).map(|m| m.0);
-                    s = app.mission_log().iter().position(|(_, m)| Some(m.id) == id).unwrap_or(0);
+                    s = app.mission_log(&world).iter().position(|(_, m)| Some(m.id) == id).unwrap_or(0);
                 }
                 _ => {}
             }
-            if let Mode::Log { sel, open: o } = &mut app.mode {
+            if let Mode::Log { sel, open: o, .. } = &mut app.mode {
                 *sel = s;
                 *o = open;
             }
@@ -1963,7 +2113,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Galaxy | Mode::Comms(_) => {}
+        Mode::Galaxy | Mode::Comms(_) | Mode::Trade { .. } => {}
     }
 
     // ── galaxy
@@ -1988,6 +2138,7 @@ fn handle(
         // the transmission on screen takes Enter, unless you've picked another agent
         KeyCode::Enter
             if let Some(id) = app.transmission().map(|a| a.id)
+                && app.sel != Some(Sel::GitHub)
                 && !matches!(app.sel, Some(Sel::Agent(s)) if s != id) =>
         {
             app.sel = Some(Sel::Agent(id));
@@ -2060,7 +2211,11 @@ fn handle(
             Some(p) => app.toast(format!("{} needs nothing from you right now ✓", base_name(&p)), t),
             None => app.toast("select a world to see what it needs", t),
         },
-        KeyCode::Char('L') => app.mode = Mode::Log { sel: 0, open: HashSet::new() },
+        KeyCode::Char('L') => match app.sel_planet() {
+            // a moon's log is its world's, so the family's work reads together
+            Some(p) => app.mode = Mode::Log { world: app.moon_host(&p).unwrap_or(p), sel: 0, open: HashSet::new() },
+            None => app.toast("select a world to see its mission log", t),
+        },
         KeyCode::Char('X') => match app.sel_planet() {
             Some(p) if w.planet(&p).is_some_and(|p| p.dormant) => {
                 app.history.remove(&p);
@@ -2130,7 +2285,7 @@ fn handle(
     false
 }
 
-fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEvent, drag: &mut Option<((u16, u16), (f32, f32), bool)>) {
+fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEvent, drag: &mut Option<((u16, u16), (f32, f32), bool)>, t: f32) {
     let (mc, mr) = (me.column, me.row);
     let px = (mc as f32 * 2.0 + 1.0, mr as f32 * 4.0 + 2.0);
     let in_panel = l.pw > 0 && mc as i32 >= l.cols - l.pw;
@@ -2151,6 +2306,19 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
                 }
             }
         }
+        MouseEventKind::Up(MouseButton::Left) if matches!(app.mode, Mode::Ship { .. }) => {
+            drag.take();
+            let Mode::Ship { id, .. } = app.mode else { return };
+            match draw::ship_hit(app, id, l, mc as i32, mr as i32) {
+                Some(Some(i)) => {
+                    if let Some(&a) = app.ship_acts(id).get(i) {
+                        app.ship_act(id, a, client, l, t);
+                    }
+                }
+                Some(None) => {}
+                None => app.mode = Mode::Galaxy,
+            }
+        }
         MouseEventKind::Up(MouseButton::Left) => {
             let was_drag = drag.take().is_some_and(|d| d.2);
             if was_drag {
@@ -2158,6 +2326,11 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
             }
             let hit = if in_panel { draw::panel_hit(app, w, l, mr as i32) } else { pick_at(app, w, l, px) };
             if let Some(h) = hit {
+                if h == Sel::GitHub {
+                    app.sel = Some(h);
+                    app.mode = Mode::Trade { sel: 0 };
+                    return;
+                }
                 if app.sel.as_ref() == Some(&h) {
                     app.activate(w, l, client);
                 } else {
@@ -2184,7 +2357,13 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
     let ships = app.agents.iter().filter(|a| a.dying.is_none()).map(|a| (dist(a.wpos), 6.0 * z.clamp(0.7, 2.2), Sel::Agent(a.id))).collect();
     let planets = w.planets.iter().map(|p| (dist(p.wpos), (p.r * z).max(4.0) + 3.0, Sel::Planet(p.key.clone()))).collect();
     let stars = w.systems.iter().map(|s| (dist(s.wpos), (9.0 * z).max(4.0) + 4.0, Sel::Sys(s.key.clone()))).collect();
-    nearest(ships).or_else(|| nearest(planets)).or_else(|| nearest(stars))
+    nearest(ships).or_else(|| nearest(planets)).or_else(|| nearest(stars)).or_else(|| {
+        let station = w.station?;
+        let (c, r, label) = draw::station_label(app, w, l)?;
+        let label_hit = px >= c as f32 * 2.0 && px < (c + label.chars().count() as i32) as f32 * 2.0
+            && py >= r as f32 * 4.0 && py < (r + 1) as f32 * 4.0;
+        (dist(station) < (13.0 * z).max(5.0) * 2.2 + 3.0 || label_hit).then_some(Sel::GitHub)
+    })
 }
 
 #[cfg(test)]
@@ -2233,5 +2412,175 @@ mod screenshot_tests {
         assert!(rows.iter().any(|r| r.contains("queue it")));
         assert!(rows.iter().any(|r| r.contains("Ctrl+V") && r.contains("Ctrl+X")));
         assert!(rows.iter().any(|r| r.contains("give orders")));
+    }
+}
+
+#[cfg(test)]
+mod station_tests {
+    use super::*;
+
+    fn fixture() -> (App, World) {
+        let mut app = App::new();
+        let mut world = World { systems: vec![], planets: vec![], lanes: vec![], station: Some((0.0, 0.0)) };
+        for (key, github, ci, host) in [("/alpha", true, "pass", None), ("/beta", true, "fail", None), ("/local", false, "none", None), ("/moon", true, "fail", Some(0))] {
+            world.planets.push(Planet { key: key.into(), name: base_name(key), agents: vec![], terrain: 0, seed: 0.5, wpos: (80.0, 70.0), r: 10.0, host, moons: vec![], level: 0, dormant: false, fog: 0.0, last_seen: 0 });
+            app.survey.worlds.insert(key.into(), survey::World { github, prs: vec![survey::Pr { number: 7, title: format!("Fix {key}"), ci }], prs_checked: Some(survey::now()), ..Default::default() });
+        }
+        app.survey.worlds.insert("/forgotten".into(), survey::World { github: true, ..Default::default() });
+        (app, world)
+    }
+
+    #[test]
+    fn station_shows_only_galaxy_projects_and_prioritizes_failed_prs() {
+        let (app, world) = fixture();
+        let rows = app.trade_rows(&world);
+        let projects: Vec<_> = rows.iter().filter(|r| r.pr.is_none()).map(|r| r.path.as_str()).collect();
+        assert_eq!(projects, ["/beta", "/alpha"]);
+        assert_eq!(rows[1].pr.as_ref().unwrap().ci, "fail");
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn station_label_click_and_keyboard_activation_open_the_overview() {
+        let (mut app, world) = fixture();
+        let fb = Fb::new(120, 40);
+        let l = Lay::new(&fb, false);
+        let client = Client::isolated();
+        let (col, row, _) = draw::station_label(&app, &world, &l).unwrap();
+        assert_eq!(pick_at(&app, &world, &l, (col as f32 * 2.0 + 1.0, row as f32 * 4.0 + 2.0)), Some(Sel::GitHub));
+        mouse(&mut app, &world, &l, &client, event::MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: col as u16, row: row as u16, modifiers: KeyModifiers::NONE }, &mut None, 1.0);
+        assert!(matches!(app.mode, Mode::Trade { sel: 0 }));
+        app.mode = Mode::Galaxy;
+        assert!(app.rows(&world).contains(&Sel::GitHub));
+        app.sel = Some(Sel::GitHub);
+        app.activate(&world, &l, &client);
+        assert!(matches!(app.mode, Mode::Trade { sel: 0 }));
+        app.open_trade_row(&world, 0, &client, 0.0);
+        assert_eq!(app.sel, Some(Sel::Planet("/beta".into())));
+        assert!(matches!(app.mode, Mode::Galaxy));
+    }
+
+    #[test]
+    fn overview_displays_ci_and_distinguishes_failed_fetch_from_empty_prs() {
+        let (mut app, world) = fixture();
+        app.survey.worlds.get_mut("/beta").unwrap().prs_error = Some("GitHub refresh failed".into());
+        app.mode = Mode::Trade { sel: 0 };
+        let mut fb = Fb::new(100, 30);
+        let l = Lay::new(&fb, false);
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let rendered: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(rendered.contains("2 projects · 2 PRs"));
+        assert!(rendered.contains("PRs unavailable"));
+        assert!(rendered.contains("GitHub refresh failed"));
+        assert!(rendered.contains("failing"));
+        assert!(rendered.contains("passing"));
+    }
+
+    #[test]
+    fn station_overview_scrolls_to_last_row_and_hits_the_visible_row() {
+        let (mut app, world) = fixture();
+        app.survey.worlds.get_mut("/beta").unwrap().prs = (1..=40).map(|number| survey::Pr { number, title: format!("Change {number}"), ci: "fail" }).collect();
+        app.mode = Mode::Trade { sel: 0 };
+        let mut fb = Fb::new(80, 24);
+        let l = Lay::new(&fb, false);
+        let client = Client::isolated();
+        handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)), 1.0, &mut None);
+        let last = app.trade_rows(&world).len() - 1;
+        assert!(matches!(app.mode, Mode::Trade { sel } if sel == last));
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let row = fb.txt.chunks(fb.cols).position(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>().contains("Fix /alpha")).unwrap();
+        assert_eq!(draw::trade_hit(&l, last + 1, last, 6, row as i32), Some(last));
+        handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)), 1.0, &mut None);
+        assert!(matches!(app.mode, Mode::Trade { sel: 0 }));
+        handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), 1.0, &mut None);
+        assert!(matches!(app.mode, Mode::Galaxy));
+    }
+
+    #[test]
+    fn github_station_body_is_a_pick_target_at_every_zoom() {
+        let mut app = App::new();
+        let fb = Fb::new(120, 40);
+        let l = Lay::new(&fb, false);
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: Some((25.0, -10.0)) };
+        for zoom in [0.12, 1.0, 6.0] {
+            app.cam.z = zoom;
+            let point = l.to_screen(&app.cam, world.station.unwrap());
+            assert_eq!(pick_at(&app, &world, &l, point), Some(Sel::GitHub), "station is not clickable at zoom {zoom}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ship_card_tests {
+    use super::*;
+
+    fn ship(id: u32, war: bool) -> Agent {
+        Agent {
+            id,
+            kind: "claude".into(),
+            cwd: "/home/me/world".into(),
+            title: "fixing the outliner".into(),
+            status: Status::Working,
+            since: 0.0,
+            born: 0.0,
+            dying: None,
+            seed: 0.5,
+            last_ping: 0.0,
+            busy_at: 0.0,
+            turns: 3,
+            report: Default::default(),
+            ask: None,
+            war: if war { vec![crate::proto::War { rival: 9, files: vec!["src/a.rs".into()] }] } else { vec![] },
+            wpos: (0.0, 0.0),
+            front: true,
+        }
+    }
+
+    fn screen(app: &mut App) -> (Lay, Vec<String>) {
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let mut fb = Fb::new(100, 30);
+        let l = Lay::new(&fb, false);
+        crate::draw::frame(&mut fb, app, &world, &l, 1.0, None);
+        (l, fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect())
+    }
+
+    #[test]
+    fn priority_is_offered_only_in_a_border_conflict() {
+        let mut app = App::new();
+        app.agents = vec![ship(1, false), ship(2, true)];
+        assert_eq!(app.ship_acts(1), vec![ShipAct::Comms, ShipAct::Mission, ShipAct::Decommission]);
+        assert_eq!(app.ship_acts(2), vec![ShipAct::Comms, ShipAct::Mission, ShipAct::Priority, ShipAct::Decommission]);
+        assert!(app.ship_acts(7).is_empty());
+    }
+
+    #[test]
+    fn card_shows_the_ship_and_clicks_land_on_its_menu() {
+        let mut app = App::new();
+        app.agents = vec![ship(1, false)];
+        app.mode = Mode::Ship { id: 1, sel: 0 };
+        let (l, rows) = screen(&mut app);
+        assert!(rows.iter().any(|r| r.contains("CLAUDE · WORLD")));
+        assert!(rows.iter().any(|r| r.contains("fixing the outliner")));
+        let comms = rows.iter().position(|r| r.contains("open comms")).unwrap() as i32;
+        let col = rows[comms as usize].chars().position(|c| c == 'o').unwrap() as i32;
+        assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms), Some(Some(0)));
+        assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms + 2), Some(Some(2)));
+        assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms - 2), Some(None));
+        assert_eq!(crate::draw::ship_hit(&app, 1, &l, 0, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod mission_log_tests {
+    use super::*;
+
+    #[test]
+    fn a_worlds_log_shows_only_its_own_missions() {
+        let mut app = App::new();
+        let m = |id, cwd: &str| Mission { id, cwd: cwd.into(), text: format!("job {id}"), state: "queued".into(), ..Mission::default() };
+        app.missions = vec![m(1, "/a"), m(2, "/b"), m(3, "/a")];
+        let ids: Vec<u32> = app.mission_log("/a").iter().map(|(_, m)| m.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert!(app.mission_log("/c").is_empty());
     }
 }

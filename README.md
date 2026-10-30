@@ -51,7 +51,7 @@ the galaxy. Ship status colours and development indicators still show the same i
 | `P`              | give the selected agent **priority** in a border conflict            |
 | `X`              | forget the selected dormant world                                   |
 | `r`              | what the selected world **needs**, as quick actions                |
-| `L`              | the **mission log**: under way, queued (in order), done             |
+| `L`              | the selected world's **mission log**: under way, queued, done       |
 | `T`              | strike finished missions on the selected world from its log         |
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
@@ -96,10 +96,10 @@ disappear. The agent receives local image paths with instructions to inspect the
 viewing tools to use them. Submitted images are retained, and their names appear in the expanded
 mission log.
 
-`L` opens the **mission log**: what's under way (and who's on it), what's queued and in what order,
-and what's done. `⏎` opens comms with a mission's agent, `x` calls a queued one off. `␣` expands a
+`L` opens the selected world's **mission log** (its moons' missions included): what's under way
+(and who's on it), what's queued and in what order, and what's done. `⏎` opens comms with a mission's agent, `x` calls a queued one off. `␣` expands a
 mission to its full text, its world, fleet order, agent and times (`e` expands them all), and `s`
-groups the log by status, world, solar system or fleet order.
+groups the log by status, world or moon, or fleet order.
 
 ## Needs and quick actions
 
@@ -127,6 +127,16 @@ commits are freighters on their way to it; your open pull requests (`gh pr list 
 couple of minutes) are docked around it, coloured by CI: green, amber while running, blinking red when
 failing. The station glows the colour of its worst PR, CI turning red or green is reported in the
 situation log, and world cards list unpushed commits and PRs under **trade**.
+
+Click the **GitHub station or its label** to browse projects in the current galaxy and your open
+PRs. It also appears in the outliner for keyboard selection. Projects with failing checks appear
+first; each project shows its unpushed commits, followed by PR titles and CI status. Use arrows or
+the mouse wheel to scroll, and Enter (or a second click on a selected row) to focus a project or
+open a PR in your browser. Esc returns to the galaxy.
+
+The station uses `gh` to refresh up to 100 of **your** open PRs per project every 150 seconds.
+It shows when results were last checked and keeps cached PRs visible if GitHub is unavailable.
+Projects outside the current galaxy are not included.
 
 ## War
 

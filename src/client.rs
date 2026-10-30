@@ -38,12 +38,20 @@ pub enum Cmd {
 
 pub struct Client {
     pub rx: Receiver<Msg>,
+    events: Sender<Msg>,
     tx: Sender<Cmd>,
     watch: Arc<Mutex<Option<u32>>>,
     scroll: Arc<AtomicUsize>,
 }
 
 impl Client {
+    #[cfg(test)]
+    pub fn isolated() -> Self {
+        let (events, rx) = mpsc::channel();
+        let (tx, _) = mpsc::channel();
+        Self { rx, tx, events, watch: Arc::default(), scroll: Arc::default() }
+    }
+
     pub fn start() -> Self {
         let (mtx, rx) = mpsc::channel();
         let (tx, crx) = mpsc::channel::<Cmd>();
@@ -103,6 +111,7 @@ impl Client {
         });
 
         // commands, strictly in order (keystrokes must not overtake each other)
+        let events = mtx.clone();
         thread::spawn(move || {
             let mut conn: Option<Conn> = None;
             for cmd in crx {
@@ -161,7 +170,21 @@ impl Client {
             }
         });
 
-        Self { rx, tx, watch, scroll }
+        Self { rx, tx, events, watch, scroll }
+    }
+
+    pub fn open_pr(&self, path: String, number: u32) {
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let result = std::process::Command::new("gh").args(["pr", "view", &number.to_string(), "--web"])
+                .current_dir(path).output();
+            let error = match result {
+                Ok(out) if out.status.success() => return,
+                Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            let _ = events.send(Msg::Error(format!("Could not open PR #{number}: {error}")));
+        });
     }
 
     pub fn send(&self, c: Cmd) {
