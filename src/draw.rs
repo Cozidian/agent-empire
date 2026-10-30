@@ -1645,23 +1645,17 @@ fn fleet_row(rows: &mut Rows, app: &App, agents: &[&Agent]) {
 
 #[allow(clippy::too_many_arguments)]
 fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch: bool, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
-    let visible = attachments.len().min((l.rows - 17).max(1) as usize);
-    let (x, y, w, h) = centered(l, 80, 15 + visible as i32);
+    let w = 80.min(l.cols - 2);
+    // the text grows to eight lines, then scrolls
+    let lines = (layout(&text.s, w - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 19).max(1));
+    let visible = attachments.len().min((l.rows - 16 - lines).max(1) as usize);
+    let (x, y, w, h) = centered(l, w, 14 + lines + visible as i32);
     let accent = v3(1.0, 0.85, 0.4);
     frame_box(fb, x, y, w, h, &format!("★ NEW MISSION FOR {}", base_name(planet).to_uppercase()), accent);
     seg(fb, x + 3, y + 2, "What should be done here?", w - 6, DIM, Some(BOX));
-    let row = y + 4;
-    let x1 = seg(fb, x + 3, row, "› ", 2, accent, Some(BOX));
-    let room = (w - 8) as usize;
-    let chars: Vec<char> = text.s.chars().collect();
-    let start = text.cur.saturating_sub(room - 1);
-    for (k, ch) in chars.iter().enumerate().skip(start).take(room) {
-        fb.put_bg(x1 + (k - start) as i32, row, *ch, TEXT, Some(BOX));
-    }
-    if fract(t * 1.6) < 0.6 {
-        let ch = chars.get(text.cur).copied().unwrap_or(' ');
-        fb.put_bg(x1 + (text.cur - start) as i32, row, ch, BOX, Some(accent));
-    }
+    seg(fb, x + 3, y + 4, "› ", 2, accent, Some(BOX));
+    area(fb, (x + 5, y + 4, w - 8, lines), text, accent, t);
+    let y = y + lines - 1; // the rest sits below the text
     let crew = app.agents.iter().filter(|a| a.cwd == planet && a.dying.is_none()).count();
     let (now, later) = if launch { (TEXT, DIM) } else { (DIM, TEXT) };
     for (i, image) in attachments.iter().skip(attachments.len() - visible).enumerate() {
@@ -1677,8 +1671,54 @@ fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch:
     let xx = seg(fb, x + 3, r + 1, if launch { "○ " } else { "● " }, 2, accent, Some(BOX));
     let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it: the first free one of the {crew} here takes it (b gives all of them an order)") };
     seg(fb, xx, r + 1, &note, w - 8, later, Some(BOX));
+    let y = y - lines + 1;
     seg(fb, x + 3, y + h - 4, "Drop image · Ctrl+V clipboard · Ctrl+O attach path · Ctrl+X remove last", w - 6, DIM, Some(BOX));
-    seg(fb, x + 3, y + h - 2, if sending { "Sending mission…" } else { "⏎ give orders · ⇥ launch/queue · ↑↓ species · esc cancel" }, w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + h - 2, if sending { "Sending mission…" } else { "⏎ give orders · Shift/Alt+⏎ or Ctrl+J new line · ⇥ launch/queue · ↑↓ species · esc" }, w - 6, DIM, Some(BOX));
+}
+
+
+/// Where each character of `s` lands when wrapped to `width` columns, as (row, column),
+/// plus one more entry for the end of the text.
+pub fn layout(s: &str, width: i32) -> Vec<(i32, i32)> {
+    let width = width.max(1);
+    let (mut r, mut c) = (0, 0);
+    let mut out = Vec::new();
+    for ch in s.chars() {
+        if c >= width {
+            (r, c) = (r + 1, 0);
+        }
+        out.push((r, c));
+        if ch == '\n' {
+            (r, c) = (r + 1, 0);
+        } else {
+            c += 1;
+        }
+    }
+    if c >= width {
+        (r, c) = (r + 1, 0);
+    }
+    out.push((r, c));
+    out
+}
+
+/// A text area that wraps and keeps the cursor in view.
+fn area(fb: &mut Fb, (x, y, width, rows): (i32, i32, i32, i32), text: &Line, accent: V3, t: f32) {
+    let chars: Vec<char> = text.s.chars().collect();
+    let pos = layout(&text.s, width);
+    let cur = pos[text.cur.min(chars.len())];
+    let off = (cur.0 - rows + 1).max(0);
+    for (ch, &(r, c)) in chars.iter().zip(&pos) {
+        if *ch != '\n' && r >= off && r < off + rows {
+            fb.put_bg(x + c, y + r - off, *ch, TEXT, Some(BOX));
+        }
+    }
+    if off > 0 {
+        seg(fb, x - 2, y, "↑", 1, DIM, Some(BOX));
+    }
+    if fract(t * 1.6) < 0.6 {
+        let ch = chars.get(text.cur).copied().filter(|&c| c != '\n').unwrap_or(' ');
+        fb.put_bg(x + cur.1, y + cur.0 - off, ch, BOX, Some(accent));
+    }
 }
 
 /// The ship card's frame: five lines about the ship, then its menu.

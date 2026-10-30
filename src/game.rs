@@ -273,6 +273,38 @@ impl Line {
         self.cur += clean.chars().count();
     }
 
+    /// Paste keeping line breaks, for text that can span lines.
+    fn paste_lines(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
+        let clean: String = text.chars().filter(|&c| c == '\n' || !c.is_control()).collect();
+        let byte = self.byte(self.cur);
+        self.s.insert_str(byte, &clean);
+        self.cur += clean.chars().count();
+    }
+
+    /// Move to the line above or below, keeping the column; false if there isn't one.
+    fn vertical(&mut self, up: bool) -> bool {
+        let chars: Vec<char> = self.s.chars().collect();
+        let start = |i: usize| chars[..i].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1);
+        let end = |i: usize| chars[i..].iter().position(|&c| c == '\n').map_or(chars.len(), |p| i + p);
+        let here = start(self.cur);
+        let col = self.cur - here;
+        let to = if up {
+            if here == 0 {
+                return false;
+            }
+            start(here - 1)
+        } else {
+            let e = end(self.cur);
+            if e == chars.len() {
+                return false;
+            }
+            e + 1
+        };
+        self.cur = (to + col).min(end(to));
+        true
+    }
+
     fn byte(&self, i: usize) -> usize {
         self.s.char_indices().nth(i).map_or(self.s.len(), |(b, _)| b)
     }
@@ -1893,7 +1925,7 @@ fn paste_brief(text: &mut Line, attachments: &mut Vec<Attachment>, pasted: &str,
     if let Some(paths) = screenshots::dropped_paths(pasted) {
         attach_paths(attachments, &paths, dir)
     } else {
-        text.paste(pasted);
+        text.paste_lines(pasted);
         Ok(())
     }
 }
@@ -2295,8 +2327,16 @@ fn handle(
                         }
                     } else { app.toast("Type an image file path, then Ctrl+O to attach it", t); }
                 }
-                KeyCode::Up => *kind = (*kind + nk - 1) % nk,
-                KeyCode::Down => *kind = (*kind + 1) % nk,
+                // a new line: Shift/Alt+Enter, or Ctrl+J where the terminal can't tell those apart
+                KeyCode::Enter if k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => text.paste_lines("\n"),
+                KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => text.paste_lines("\n"),
+                // ↑↓ move through the lines; past the first or last they pick the species
+                KeyCode::Up | KeyCode::Down => {
+                    let up = k.code == KeyCode::Up;
+                    if !text.vertical(up) {
+                        *kind = if up { (*kind + nk - 1) % nk } else { (*kind + 1) % nk };
+                    }
+                }
                 KeyCode::Tab => *launch = !*launch,
                 KeyCode::Enter if !text.s.trim().is_empty() || !attachments.is_empty() => {
                     let prompt = if text.s.trim().is_empty() { "Review the attached screenshots." } else { text.s.trim() };
@@ -2747,11 +2787,11 @@ mod screenshot_tests {
         text.set("Fix æ layout".into());
         text.cur = 5;
         let mut images = Vec::new();
-        paste_brief(&mut text, &mut images, "new\n", &dir.join("stored")).unwrap();
-        assert_eq!(text.s, "Fix ænew  layout");
+        paste_brief(&mut text, &mut images, "new\r\n", &dir.join("stored")).unwrap();
+        assert_eq!(text.s, "Fix ænew\n layout");
         paste_brief(&mut text, &mut images, &format!("'{}'", source.display()), &dir.join("stored")).unwrap();
         assert_eq!(images.len(), 1);
-        assert_eq!(text.s, "Fix ænew  layout");
+        assert_eq!(text.s, "Fix ænew\n layout");
         assert_ne!(images[0].path, source.to_str().unwrap());
         let original = images.clone();
         assert!(paste_brief(&mut text, &mut images, "/missing/shot.png", &dir).is_err());
@@ -3069,5 +3109,30 @@ mod situation_tests {
         assert!(rendered.contains("1 alerts 1"));
         assert!(rendered.contains("codex on alpha awaits orders"));
         assert!(rendered.contains("#9 · has left"));
+    }
+}
+
+#[cfg(test)]
+mod multiline_tests {
+    use super::*;
+
+    #[test]
+    fn mission_text_moves_between_lines_keeping_the_column() {
+        let mut text = Line::default();
+        text.paste_lines("first line\r\nab\n\tthird");
+        assert_eq!(text.s, "first line\nab\n    third");
+        text.cur = 8; // "first li|ne"
+        assert!(!text.vertical(true));
+        assert!(text.vertical(false));
+        assert_eq!(text.cur, 13); // clamped to the end of "ab"
+        assert!(text.vertical(false));
+        assert_eq!(text.cur, 16); // column 2 of "    third"
+        assert!(!text.vertical(false));
+    }
+
+    #[test]
+    fn wrapped_text_places_the_cursor_after_breaks_and_wraps() {
+        let pos = draw::layout("abcd\nef", 3);
+        assert_eq!(pos, vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)]);
     }
 }
