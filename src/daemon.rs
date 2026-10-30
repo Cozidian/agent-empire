@@ -740,6 +740,78 @@ fn order(a: Arc<Mutex<Agent>>, text: String) {
     });
 }
 
+// ──────────────────────────────── moons ────────────────────────────────
+
+fn git(dir: &str, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("git failed").to_string())
+    }
+}
+
+fn moons_dir() -> PathBuf {
+    let home = crate::game::home();
+    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share")).join("empire/moons")
+}
+
+/// A worktree of the repo at `cwd` on `branch` (new or existing), with an agent on it.
+fn launch_moon(hub: &Shared, cwd: &str, branch: &str, kind: &str) -> Result<u32, String> {
+    let top = git(cwd, &["rev-parse", "--show-toplevel"]).map_err(|_| "only a git world can have moons".to_string())?;
+    let slug: String = branch.chars().map(|c| if c.is_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect();
+    let h = top.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    let path = moons_dir().join(format!("{}-{:08x}", crate::game::base_name(&top), h as u32)).join(&slug);
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let p = path.to_string_lossy().into_owned();
+    // the moon is still there (its crew left): just send a ship back
+    if path.is_dir() && git(&p, &["rev-parse", "--git-dir"]).is_ok() {
+        return spawn(hub, kind, &p, None, None).map_err(|e| e.to_string());
+    }
+    let exists = git(&top, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
+    if exists {
+        git(&top, &["worktree", "add", &p, branch])?;
+    } else {
+        git(&top, &["worktree", "add", "-b", branch, &p])?;
+    }
+    spawn(hub, kind, &p, None, None).map_err(|e| e.to_string())
+}
+
+/// Merge a moon's branch into its world, then recall its agents and remove it.
+/// A merge conflict is a collision: the merge is aborted and nothing changes.
+fn dock(hub: &Shared, moon: &str) -> Result<String, String> {
+    let common = git(moon, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let own = git(moon, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+    let host = common.strip_suffix("/.git").filter(|_| common != own).ok_or("that world isn't a moon")?.to_string();
+    let branch = git(moon, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        return Err("the moon isn't on a branch".into());
+    }
+    if !git(moon, &["status", "--porcelain"])?.is_empty() {
+        return Err("the moon has uncommitted work: have its agent commit first".into());
+    }
+    if !git(&host, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
+        return Err(format!("{} has uncommitted changes: commit or stash them before docking", crate::game::base_name(&host)));
+    }
+    if git(&host, &["merge", "--no-ff", "-m", &format!("Dock moon {branch}"), &branch]).is_err() {
+        let files = git(&host, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+        let _ = git(&host, &["merge", "--abort"]);
+        let files: Vec<&str> = files.lines().collect();
+        return Err(format!("collision! {} conflict{} ({})", files.len(), if files.len() == 1 { "" } else { "s" }, files.join(", ")));
+    }
+    // recall the moon's crew before taking the ground out from under them
+    for a in hub.lock().unwrap().agents.values() {
+        let g = a.lock().unwrap();
+        if g.cwd == moon {
+            g.writer.kill();
+        }
+    }
+    thread::sleep(Duration::from_millis(400));
+    git(&host, &["worktree", "remove", "--force", moon])?;
+    let _ = git(&host, &["branch", "-d", &branch]);
+    Ok(host)
+}
+
 fn registry_file() -> PathBuf {
     dirs_state().join("agents.json")
 }
@@ -927,6 +999,17 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             }
             if sent == 0 { Resp::Err { msg: "no agent free to take the order".into() } } else { Resp::Ok }
         }
+        Req::Moon { cwd, branch, kind } => match launch_moon(hub, &cwd, &branch, &kind) {
+            Ok(id) => Resp::Spawned { id },
+            Err(msg) => Resp::Err { msg },
+        },
+        Req::Dock { cwd } => match dock(hub, &cwd) {
+            Ok(host) => {
+                eprintln!("docked {cwd} into {host}");
+                Resp::Ok
+            }
+            Err(msg) => Resp::Err { msg },
+        },
         Req::Scrub { id } => {
             hub.lock().unwrap().missions.retain(|m| m.id != id);
             Resp::Ok

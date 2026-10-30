@@ -27,6 +27,8 @@ const NAG: f32 = 120.0;
 /// A turn shorter than this finishing is not worth a sound.
 const SHORT_TURN: f32 = 6.0;
 const FPS: u64 = 30;
+/// Default names for new moons (they become branch names).
+const MOONS: [&str; 12] = ["luna", "phobos", "deimos", "io", "europa", "ganymede", "callisto", "titan", "rhea", "triton", "charon", "oberon"];
 /// Radius of a system's first planetary orbit, and the gap between orbits.
 const ORBIT0: f32 = 70.0;
 const ORBIT_STEP: f32 = 42.0;
@@ -138,6 +140,9 @@ pub struct Planet {
     pub seed: f32,
     pub wpos: (f32, f32),
     pub r: f32,
+    /// A moon (git worktree) orbits this planet instead of a star.
+    pub host: Option<usize>,
+    pub moons: Vec<usize>,
 }
 
 pub struct System {
@@ -160,7 +165,8 @@ impl World {
         self.planets.iter().find(|p| p.key == key)
     }
     pub fn system_of(&self, planet: usize) -> Option<&System> {
-        self.systems.iter().find(|s| s.planets.contains(&planet))
+        let p = self.planets[planet].host.unwrap_or(planet);
+        self.systems.iter().find(|s| s.planets.contains(&p))
     }
 }
 
@@ -271,6 +277,10 @@ pub enum Mode {
     Colonize(Colonize),
     Deploy { planet: String, kind: usize },
     Confirm { id: u32 },
+    /// Founding a moon (git worktree) off a world.
+    Moon { planet: String, branch: Line, kind: usize },
+    /// Merging a moon back into its world.
+    Dock { moon: String },
     /// One order for every agent in a system or on a world.
     Fleet { target: Sel, text: Line },
     /// Writing a mission for a world: hand it to a new ship now, or queue it.
@@ -472,10 +482,32 @@ impl App {
         }
     }
 
+    /// Rings and sparks: docking, collisions.
+    fn burst(&mut self, (x, y): (f32, f32), col: V3, t: f32, n: u32) {
+        self.fx.push(Fx::Ring { x, y, t0: t, col, speed: 45.0, dur: 1.2 });
+        self.fx.push(Fx::Ring { x, y, t0: t + 0.15, col, speed: 25.0, dur: 1.0 });
+        for i in 0..n {
+            let a = rnd(i * 7 + (t * 100.0) as u32) * TAU;
+            let sp = 10.0 + rnd(i * 13 + 5) * 30.0;
+            self.fx.push(Fx::Spark { x, y, vx: a.cos() * sp, vy: a.sin() * sp, t0: t, life: 0.6 + rnd(i * 3) * 1.0, col });
+        }
+    }
+
+    /// The world a selection is a moon of, if it is one.
+    pub fn moon_host(&self, key: &str) -> Option<String> {
+        self.survey.worlds.get(key)?.host.clone()
+    }
+
     /// Live agents in a system or on a world.
     pub fn fleet(&self, w: &World, target: &Sel) -> Vec<&Agent> {
         let planets: Vec<&Planet> = match target {
-            Sel::Sys(k) => w.systems.iter().filter(|s| &s.key == k).flat_map(|s| s.planets.iter().map(|&i| &w.planets[i])).collect(),
+            Sel::Sys(k) => w
+                .systems
+                .iter()
+                .filter(|s| &s.key == k)
+                .flat_map(|s| s.planets.iter().flat_map(|&i| std::iter::once(i).chain(w.planets[i].moons.iter().copied())))
+                .map(|i| &w.planets[i])
+                .collect(),
             Sel::Planet(k) => w.planet(k).into_iter().collect(),
             Sel::Agent(_) => Vec::new(),
         };
@@ -671,8 +703,13 @@ impl App {
         for (i, a) in self.agents.iter().enumerate() {
             pmap.entry(a.cwd.clone()).or_default().push(i);
         }
+        // worktrees are moons of the world they were split from (which shows up even if empty)
+        let host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
+        for h in host_of.values() {
+            pmap.entry(h.clone()).or_default();
+        }
         let mut smap: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for k in pmap.keys() {
+        for k in pmap.keys().filter(|k| !host_of.contains_key(*k)) {
             smap.entry(parent(k)).or_default().push(k.clone());
         }
         let n = smap.len();
@@ -716,9 +753,37 @@ impl App {
                 }
                 sys.orbits.push(orbit);
                 sys.planets.push(planets.len());
-                planets.push(Planet { key: pkey.clone(), name: base_name(pkey), agents: members, terrain: (h >> 8) as u8 % 7, seed, wpos, r });
+                planets.push(Planet { key: pkey.clone(), name: base_name(pkey), agents: members, terrain: (h >> 8) as u8 % 7, seed, wpos, r, host: None, moons: Vec::new() });
             }
             systems.push(sys);
+        }
+        // moons, in close orbit around their worlds
+        for (mkey, hkey) in &host_of {
+            let Some(hi) = planets.iter().position(|p| &p.key == hkey) else { continue };
+            let q = planets[hi].moons.len() as f32;
+            let (hpos, hr) = (planets[hi].wpos, planets[hi].r);
+            let h = hash(mkey);
+            let seed = rnd(h);
+            let orbit = hr + 22.0 + 12.0 * q;
+            let ang = seed * TAU + t * 0.18 / (1.0 + 0.5 * q);
+            let wpos = (hpos.0 + ang.cos() * orbit, hpos.1 + ang.sin() * orbit * 0.55);
+            let mut members = pmap[mkey].clone();
+            members.sort_by_key(|&i| self.agents[i].id);
+            let live = members.iter().filter(|&&i| self.agents[i].dying.is_none()).count();
+            let r = 5.0 + 1.0 * live.min(4) as f32;
+            let m = members.len().max(1) as f32;
+            for (q, &ai) in members.iter().enumerate() {
+                let a = &mut self.agents[ai];
+                let ang = t * (0.6 + a.seed * 0.3) + q as f32 * TAU / m;
+                let orb = r + 5.0;
+                a.wpos = (wpos.0 + ang.cos() * orb, wpos.1 + ang.sin() * orb * 0.55);
+                a.front = ang.sin() > 0.0;
+            }
+            let name = self.survey.worlds.get(mkey).map(|w| w.branch.clone()).filter(|b| !b.is_empty()).unwrap_or_else(|| base_name(mkey));
+            let idx = planets.len();
+            planets[hi].moons.push(idx);
+            // moons are grey, cratered rock
+            planets.push(Planet { key: mkey.clone(), name, agents: members, terrain: 3, seed, wpos, r, host: Some(hi), moons: Vec::new() });
         }
         let mut lanes = Vec::new();
         for i in 0..systems.len() {
@@ -747,10 +812,12 @@ impl App {
             v.push(Sel::Sys(s.key.clone()));
             for &pi in &s.planets {
                 let p = &w.planets[pi];
-                v.push(Sel::Planet(p.key.clone()));
-                let mut ags: Vec<&Agent> = p.agents.iter().map(|&i| &self.agents[i]).filter(|a| a.dying.is_none()).collect();
-                ags.sort_by_key(|a| (a.status, a.id));
-                v.extend(ags.iter().map(|a| Sel::Agent(a.id)));
+                for p in std::iter::once(p).chain(p.moons.iter().map(|&m| &w.planets[m])) {
+                    v.push(Sel::Planet(p.key.clone()));
+                    let mut ags: Vec<&Agent> = p.agents.iter().map(|&i| &self.agents[i]).filter(|a| a.dying.is_none()).collect();
+                    ags.sort_by_key(|a| (a.status, a.id));
+                    v.extend(ags.iter().map(|a| Sel::Agent(a.id)));
+                }
             }
         }
         v
@@ -1098,6 +1165,30 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                         app.open_comms(id, client, &Lay::new(&fb, app.panel));
                     }
                 }
+                Msg::Docked { moon, result } => {
+                    let at = app.agents.iter().find(|a| a.cwd == moon).map_or((0.0, 0.0), |a| a.wpos);
+                    let name = app.survey.worlds.get(&moon).map(|w| w.branch.clone()).unwrap_or_else(|| base_name(&moon));
+                    let host = app.survey.worlds.get(&moon).and_then(|w| w.host.clone()).map(|h| base_name(&h)).unwrap_or_default();
+                    match result {
+                        Ok(()) => {
+                            app.burst(at, v3(0.6, 0.85, 1.0), t, 48);
+                            app.say(format!("⚓ moon {name} docked with {host}: its branch is merged"), v3(0.6, 0.85, 1.0));
+                            app.toast(format!("⚓ {name} docked"), t);
+                            if app.sel == Some(Sel::Planet(moon.clone())) {
+                                app.sel = None;
+                            }
+                        }
+                        Err(e) => {
+                            let crash = e.starts_with("collision");
+                            if crash {
+                                app.burst(at, v3(1.0, 0.35, 0.2), t, 80);
+                                cues.push(Cue::Blocked);
+                            }
+                            app.say(format!("{} {name}: {e}", if crash { "💥" } else { "✖" }), v3(1.0, 0.4, 0.3));
+                            app.toast(format!("docking failed: {e}"), t);
+                        }
+                    }
+                }
                 Msg::Error(e) => {
                     app.say(format!("✖ {e}"), v3(1.0, 0.4, 0.3));
                     app.toast(format!("✖ {e}"), t);
@@ -1256,6 +1347,32 @@ fn handle(
                     let msg = format!("✖ decommissioned {} on {}", a.kind, base_name(&a.cwd));
                     app.say(msg, v3(1.0, 0.5, 0.35));
                 }
+            }
+            app.mode = Mode::Galaxy;
+            return false;
+        }
+        Mode::Moon { planet, branch, kind } => {
+            match k.code {
+                KeyCode::Esc => app.mode = Mode::Galaxy,
+                KeyCode::Up => *kind = (*kind + nk - 1) % nk,
+                KeyCode::Down => *kind = (*kind + 1) % nk,
+                KeyCode::Enter if !branch.s.trim().is_empty() => {
+                    let cmd = Cmd::Moon { cwd: planet.clone(), branch: branch.s.trim().to_string(), kind: app.kinds[*kind].clone() };
+                    let msg = format!("☾ founding moon {}…", branch.s.trim());
+                    client.send(cmd);
+                    app.mode = Mode::Galaxy;
+                    app.toast(msg, t);
+                }
+                _ => {
+                    branch.key(&k);
+                }
+            }
+            return false;
+        }
+        Mode::Dock { moon } => {
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                client.send(Cmd::Dock(moon.clone()));
+                app.toast("⚓ docking…", t);
             }
             app.mode = Mode::Galaxy;
             return false;
@@ -1429,6 +1546,25 @@ fn handle(
         KeyCode::Char('b') => match app.sel.clone() {
             Some(s @ (Sel::Sys(_) | Sel::Planet(_))) if !app.fleet(w, &s).is_empty() => app.mode = Mode::Fleet { target: s, text: Line::default() },
             _ => app.toast("select a system or world with ships in orbit to give a fleet order", t),
+        },
+        KeyCode::Char('u') => match app.sel_planet() {
+            Some(p) => {
+                let host = app.moon_host(&p).unwrap_or(p);
+                if app.survey.worlds.get(&host).is_some_and(|w| w.git) {
+                    let taken: Vec<String> = app.survey.worlds.values().filter(|w| w.host.as_ref() == Some(&host)).map(|w| w.branch.clone()).collect();
+                    let name = MOONS.iter().find(|m| !taken.iter().any(|b| b == *m)).copied().unwrap_or("moon");
+                    let mut branch = Line::default();
+                    branch.set(name.to_string());
+                    app.mode = Mode::Moon { planet: host, branch, kind: 0 };
+                } else {
+                    app.toast("only git worlds can have moons", t);
+                }
+            }
+            None => app.toast("select a world to found a moon (git worktree) off it", t),
+        },
+        KeyCode::Char('D') => match app.sel_planet() {
+            Some(p) if app.moon_host(&p).is_some() => app.mode = Mode::Dock { moon: p },
+            _ => app.toast("select a moon to dock it", t),
         },
         KeyCode::Char('t') => match app.sel_planet() {
             Some(planet) => {

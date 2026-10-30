@@ -16,6 +16,8 @@ pub enum Msg {
     Screen(u32, ScreenView),
     Spawned { id: u32, kind: String, cwd: String },
     Error(String),
+    /// A docking attempt: `Err` holds why it failed.
+    Docked { moon: String, result: Result<(), String> },
 }
 
 pub enum Cmd {
@@ -28,6 +30,8 @@ pub enum Cmd {
     Mission { cwd: String, text: String, kind: String, launch: bool },
     Scrub(u32),
     Broadcast(Vec<u32>, String),
+    Moon { cwd: String, branch: String, kind: String },
+    Dock(String),
 }
 
 pub struct Client {
@@ -107,6 +111,10 @@ impl Client {
                     let _ = mtx.send(Msg::Error("daemon offline".into()));
                     continue;
                 };
+                let dock = match &cmd {
+                    Cmd::Dock(m) => Some(m.clone()),
+                    _ => None,
+                };
                 let (req, spawn) = match cmd {
                     Cmd::Spawn { kind, cwd } => (Req::Spawn { kind: kind.clone(), cwd: cwd.clone() }, Some((kind, cwd))),
                     Cmd::Kill(id) => (Req::Kill { id }, None),
@@ -117,10 +125,16 @@ impl Client {
                     Cmd::Mission { cwd, text, kind, launch } => (Req::Mission { cwd, text, kind, launch }, None),
                     Cmd::Scrub(id) => (Req::Scrub { id }, None),
                     Cmd::Broadcast(ids, text) => (Req::Broadcast { ids, text }, None),
+                    Cmd::Moon { cwd, branch, kind } => (Req::Moon { cwd, branch: branch.clone(), kind: kind.clone() }, Some((kind, format!("moon {branch}")))),
+                    Cmd::Dock(cwd) => (Req::Dock { cwd }, None),
                 };
                 let msg = match c.call(&req) {
                     Ok(Resp::Spawned { id }) => spawn.map(|(kind, cwd)| Msg::Spawned { id, kind, cwd }),
-                    Ok(_) => None,
+                    Ok(Resp::Err { msg }) => Some(match dock {
+                        Some(moon) => Msg::Docked { moon, result: Err(msg) },
+                        None => Msg::Error(msg),
+                    }),
+                    Ok(_) => dock.map(|moon| Msg::Docked { moon, result: Ok(()) }),
                     Err(e) => {
                         conn = None;
                         Some(Msg::Error(e.to_string()))

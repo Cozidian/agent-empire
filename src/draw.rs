@@ -60,6 +60,8 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Help => help(fb, l),
         Mode::Brief { planet, text, kind, launch } => brief(fb, app, planet, text, *kind, *launch, l, t),
         Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
+        Mode::Moon { planet, branch, kind } => moon(fb, app, planet, branch, *kind, l, t),
+        Mode::Dock { moon } => dock(fb, app, moon, l),
         _ => {}
     }
     if !app.online {
@@ -410,7 +412,8 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         if !in_view(c, r) || !in_view(c + len, r) {
             continue;
         }
-        c = seg(fb, c, r, &p.name, len, if selected { s3(1.0) } else { TEXT }, None);
+        let name = if p.host.is_some() { format!("☾ {}", p.name) } else { p.name.clone() };
+        c = seg(fb, c, r, &name, len + 2, if selected { s3(1.0) } else { TEXT }, None);
         for (s, col) in parts {
             c = seg(fb, c + 1, r, &s, 8, col, None);
         }
@@ -437,7 +440,9 @@ fn top_bar(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         fb.put_bg(k as i32, 0, ch, hsv(0.52 + k as f32 * 0.015 - t * 0.04, 0.45, 1.0), Some(BAR));
     }
     let live: Vec<&Agent> = app.agents.iter().filter(|a| a.dying.is_none()).collect();
-    let stats = format!("  {} systems · {} worlds · {} agents  ", w.systems.len(), w.planets.len(), live.len());
+    let moons = w.planets.iter().filter(|p| p.host.is_some()).count();
+    let moons = if moons > 0 { format!(" · {moons} moon{}", if moons == 1 { "" } else { "s" }) } else { String::new() };
+    let stats = format!("  {} systems · {} worlds{moons} · {} agents  ", w.systems.len(), w.planets.len() - w.planets.iter().filter(|p| p.host.is_some()).count(), live.len());
     let mut x = seg(fb, title.chars().count() as i32, 0, &stats, l.cols, DIM, Some(BAR));
     for (s, c) in tally(live.iter().copied(), t) {
         x = seg(fb, x, 0, &format!("{s}  "), l.cols - x, c, Some(BAR));
@@ -643,8 +648,13 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         _ => None,
     };
     let (title, sub, accent, rows) = if let Some(p) = planet_key.as_deref().and_then(|k| w.planet(k)) {
-        let class = CLASSES[p.terrain as usize % CLASSES.len()];
-        (format!("◉ {}", p.name.to_uppercase()), format!("{class} world · {}", tilde(&p.key)), planet_color(p), planet_rows(app, p, t))
+        if let Some(h) = p.host {
+            let sub = format!("moon of {} · worktree at {}", w.planets[h].name, tilde(&p.key));
+            (format!("☾ {}", p.name.to_uppercase()), sub, planet_color(p), planet_rows(app, p, t))
+        } else {
+            let class = CLASSES[p.terrain as usize % CLASSES.len()];
+            (format!("◉ {}", p.name.to_uppercase()), format!("{class} world · {}", tilde(&p.key)), planet_color(p), planet_rows(app, p, t))
+        }
     } else if let Some(Sel::Sys(k)) = &app.sel
         && let Some(s) = w.systems.iter().find(|s| &s.key == k)
     {
@@ -722,7 +732,8 @@ fn footer(fb: &mut Fb, app: &App, l: &Lay, sound: Option<&Sound>) {
     };
     let ctx = match &app.sel {
         Some(Sel::Agent(_)) => "⏎ comms · t mission · e deploy here · x decommission · ",
-        Some(Sel::Planet(_)) => "⏎ comms · t mission · b fleet order · e deploy here · ",
+        Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ comms · t mission · D dock · e deploy here · ",
+        Some(Sel::Planet(_)) => "⏎ comms · t mission · b fleet order · u moon · e deploy here · ",
         Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
         None => "",
     };
@@ -783,8 +794,9 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 let Some(p) = w.planet(key) else { continue };
                 let parts = tally(p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none()), t);
                 let tw: usize = parts.iter().map(|(s, _)| s.chars().count() + 1).sum();
-                let x = seg(fb, c0 + 1, row, "● ", 2, planet_color(p), Some(bg));
-                seg(fb, x, row, &pad(&p.name, inner.saturating_sub(4 + tw)), pw, TEXT, Some(bg));
+                let (glyph, indent) = if p.host.is_some() { ("☾ ", 3) } else { ("● ", 1) };
+                let x = seg(fb, c0 + indent, row, glyph, 2, planet_color(p), Some(bg));
+                seg(fb, x, row, &pad(&p.name, inner.saturating_sub(2 + indent as usize + tw)), pw, TEXT, Some(bg));
                 let mut x = x0 + pw - 1 - tw as i32;
                 for (s, c) in parts {
                     x = seg(fb, x, row, &s, 8, c, Some(bg)) + 1;
@@ -939,6 +951,31 @@ fn fleet_order(fb: &mut Fb, app: &App, w: &World, target: &Sel, text: &Line, l: 
         cx = seg(fb, cx, y + 6, &format!("{} {} ", a.status.glyph(t), a.kind), bw - 6 - (cx - x - 3), kind_color(&a.kind), Some(BOX)) + 1;
     }
     seg(fb, x + 3, y + h - 2, "⏎ send to the fleet · esc cancel", bw - 6, DIM, Some(BOX));
+}
+
+fn moon(fb: &mut Fb, app: &App, planet: &str, branch: &Line, kind: usize, l: &Lay, t: f32) {
+    let (x, y, w, h) = centered(l, 72, 12);
+    let accent = v3(0.75, 0.8, 0.9);
+    frame_box(fb, x, y, w, h, &format!("☾ NEW MOON FOR {}", base_name(planet).to_uppercase()), accent);
+    seg(fb, x + 3, y + 2, "A moon is a git worktree on its own branch, with its own agent:", w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + 3, "parallel work that can't step on the world's toes. Branch name:", w - 6, DIM, Some(BOX));
+    field(fb, x + 3, y + 5, w - 6, branch, accent, t);
+    species(fb, app, x + 3, y + 7, kind);
+    seg(fb, x + 3, y + h - 2, "⏎ found it · ↑↓ species · esc cancel", w - 6, DIM, Some(BOX));
+}
+
+fn dock(fb: &mut Fb, app: &App, moon: &str, l: &Lay) {
+    let (x, y, w, h) = centered(l, 66, 10);
+    let accent = v3(0.6, 0.85, 1.0);
+    let s = app.survey.worlds.get(moon);
+    let branch = s.map_or(String::new(), |s| s.branch.clone());
+    let host = s.and_then(|s| s.host.clone()).map(|h| base_name(&h)).unwrap_or_default();
+    frame_box(fb, x, y, w, h, &format!("⚓ DOCK MOON {}", branch.to_uppercase()), accent);
+    seg(fb, x + 3, y + 2, &format!("Merge branch {branch} into {host}, then recall the moon's"), w - 6, TEXT, Some(BOX));
+    seg(fb, x + 3, y + 3, "agents and remove its worktree.", w - 6, TEXT, Some(BOX));
+    seg(fb, x + 3, y + 5, "Both need to be committed. A merge conflict is a collision:", w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + 6, "the merge is called off and nothing changes.", w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + h - 2, "y dock · any other key cancels", w - 6, accent, Some(BOX));
 }
 
 /// Progress of the latest fleet order among these agents.
