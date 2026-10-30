@@ -700,7 +700,7 @@ fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usiz
             else { format!("{} · waiting for GitHub survey", tilde(&row.path)) };
         seg(fb, x + 3, y + height - 3, &clip(&note, (width - 6).max(1) as usize), width - 6, DIM, Some(BOX));
     }
-    seg(fb, x + 3, y + height - 2, "↑↓ / wheel select · ⇥ view · ⏎ project: focus / PR: browser · esc close", width - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + height - 2, "↑↓ select · ⇥ view · t mission (review / fix a PR) · ⏎ focus / open PR · esc close", width - 6, DIM, Some(BOX));
 }
 
 fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
