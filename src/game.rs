@@ -393,6 +393,7 @@ pub struct Colonize {
 
 pub enum Mode {
     Galaxy,
+    Commander,
     Trade { sel: usize },
     /// Talking to an agent in a popup over the galaxy: its terminal, and a line to write in.
     Chat { id: u32, text: Line },
@@ -539,6 +540,9 @@ pub struct App {
     pub sit: SitFilter,
     pub toast: Option<(String, f32)>,
     pub mode: Mode,
+    pub commander: String,
+    pub commander_detail: usize,
+    commander_return: bool,
     pub kinds: Vec<String>,
     pub screen: Option<(u32, ScreenView)>,
     pub panel: bool,
@@ -760,6 +764,9 @@ impl App {
             sit: SitFilter::default(),
             toast: None,
             mode: Mode::Galaxy,
+            commander: String::new(),
+            commander_detail: 0,
+            commander_return: false,
             kinds: detect_kinds(),
             screen: None,
             panel: true,
@@ -1602,7 +1609,7 @@ impl App {
     fn close_comms(&mut self, client: &Client) {
         client.watch(None);
         self.screen = None;
-        self.mode = Mode::Galaxy;
+        self.mode = if std::mem::take(&mut self.commander_return) { Mode::Commander } else { Mode::Galaxy };
     }
 
     /// Enter on the current selection.
@@ -1676,6 +1683,133 @@ pub struct Need {
     pub label: String,
     pub col: V3,
     pub act: Option<Act>,
+}
+
+pub enum AttentionTarget {
+    Agent(u32),
+    Needs,
+    Pr(survey::Pr),
+    Deploy,
+}
+
+pub struct Attention {
+    pub id: String,
+    pub world: String,
+    pub kind: &'static str,
+    pub title: String,
+    pub detail: String,
+    pub target: AttentionTarget,
+    rank: u8,
+}
+
+impl App {
+    /// Only actionable work, across every charted system; ordinary git dirt is not an alert.
+    pub fn attention(&self, w: &World) -> Vec<Attention> {
+        let mut rows = Vec::new();
+        for a in self.agents.iter().filter(|a| a.dying.is_none() && a.status.needs_you()) {
+            let waiting = a.status == Status::Blocked;
+            let title = a.ask.as_ref().filter(|_| waiting).map_or_else(|| {
+                if a.title.is_empty() { format!("{} #{} {}", a.kind, a.id, if waiting { "needs your input" } else { "finished work" }) }
+                else { a.title.clone() }
+            }, |q| q.question.clone());
+            let mut detail = format!("{} #{} · {}\n{}", a.kind, a.id, a.status.label(), a.title);
+            if let Some(q) = a.ask.as_ref().filter(|_| waiting) {
+                detail.push_str(&format!("\n{}\n{}", q.context.join("\n"), q.question));
+                for o in &q.options { detail.push_str(&format!("\n{}: {}", o.key, o.label)); }
+            }
+            rows.push(Attention { id: format!("agent:{}", a.id), world: a.cwd.clone(), kind: if waiting { "Input" } else { "Finished" }, title, detail, target: AttentionTarget::Agent(a.id), rank: if waiting { 0 } else { 5 } });
+        }
+        for p in &w.planets {
+            let here: Vec<_> = self.agents.iter().filter(|a| a.cwd == p.key && a.dying.is_none()).collect();
+            let files: std::collections::BTreeSet<_> = here.iter().flat_map(|a| a.war.iter()).flat_map(|war| war.files.iter().cloned()).collect();
+            if !files.is_empty() {
+                rows.push(Attention { id: format!("conflict:{}", p.key), world: p.key.clone(), kind: "Conflict", title: "Agents are editing the same files".into(), detail: format!("Choose which agent should have priority.\n{}", files.into_iter().collect::<Vec<_>>().join("\n")), target: AttentionTarget::Needs, rank: 1 });
+            }
+            let queued = self.missions.iter().filter(|m| m.cwd == p.key && m.state == "queued").count();
+            if queued > 0 && !here.iter().any(|a| a.status != Status::Exited) {
+                rows.push(Attention { id: format!("uncrewed:{}", p.key), world: p.key.clone(), kind: "Unstaffed", title: format!("{queued} queued missions need an agent"), detail: self.missions.iter().filter(|m| m.cwd == p.key && m.state == "queued").map(|m| m.text.as_str()).collect::<Vec<_>>().join("\n\n"), target: AttentionTarget::Deploy, rank: 4 });
+            }
+            // Moons share their host's PRs: show each request only once.
+            if p.host.is_some() { continue; }
+            let Some(s) = self.survey.worlds.get(&p.key) else { continue };
+            for (pr, mine) in s.prs.iter().filter(|pr| pr.ci == "fail").map(|pr| (pr, true))
+                .chain(s.others.iter().filter(|pr| pr.asks_you).map(|pr| (pr, false))) {
+                let freshness = if let Some(error) = &s.prs_error { format!("Cached results · {error}") }
+                    else if let Some(at) = s.prs_checked { format!("Checked {} seconds ago", (survey::now() - at).max(0)) }
+                    else { "Waiting for GitHub survey".into() };
+                rows.push(Attention { id: format!("pr:{}:{}", p.key, pr.number), world: p.key.clone(), kind: if mine { "CI failed" } else { "Review" }, title: format!("#{} {}", pr.number, pr.title), detail: format!("{}\n{}\n{freshness}", if mine { "Your pull request has failing checks." } else { "Your review has been requested." }, pr.title), target: AttentionTarget::Pr(pr.clone()), rank: if mine { 2 } else { 3 } });
+            }
+        }
+        rows.sort_by(|a, b| (a.rank, &a.world, &a.id).cmp(&(b.rank, &b.world, &b.id)));
+        rows
+    }
+
+    pub fn attention_selection(&self, rows: &[Attention]) -> usize {
+        rows.iter().position(|r| r.id == self.commander).unwrap_or(0)
+    }
+
+    fn open_commander(&mut self, w: &World) {
+        let rows = self.attention(w);
+        let id = rows.get(self.attention_selection(&rows)).map_or(String::new(), |r| r.id.clone());
+        if self.commander != id { self.commander_detail = 0; }
+        self.commander = id;
+        self.mode = Mode::Commander;
+    }
+}
+
+fn commander_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event) {
+    let rows = app.attention(w);
+    let mut sel = app.attention_selection(&rows);
+    let mut open = false;
+    let mut mission = false;
+    match ev {
+        Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => { app.mode = Mode::Galaxy; return; }
+            KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => sel = (sel + 1).min(rows.len().saturating_sub(1)),
+            KeyCode::Home => sel = 0,
+            KeyCode::End => sel = rows.len().saturating_sub(1),
+            KeyCode::PageUp => app.commander_detail = app.commander_detail.saturating_sub(4),
+            KeyCode::PageDown => app.commander_detail = app.commander_detail.saturating_add(4),
+            KeyCode::Enter => open = true,
+            KeyCode::Char('t') => mission = true,
+            _ => {}
+        },
+        Event::Mouse(me) => match me.kind {
+            MouseEventKind::ScrollUp => sel = sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => sel = (sel + 1).min(rows.len().saturating_sub(1)),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(i) = draw::commander_hit(l, rows.len(), sel, me.column as i32, me.row as i32) {
+                    open = i == sel;
+                    sel = i;
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    let Some(row) = rows.get(sel) else { app.commander.clear(); app.commander_detail = 0; return };
+    if app.commander != row.id { app.commander_detail = 0; }
+    app.commander = row.id.clone();
+    if mission && let AttentionTarget::Pr(pr) = &row.target {
+        let mine = app.survey.worlds.get(&row.world).is_some_and(|s| s.prs.iter().any(|p| p.number == pr.number));
+        let mut text = Line::default();
+        text.set(pr_brief(pr, mine));
+        let crewed = app.agents.iter().any(|a| a.cwd == row.world && a.dying.is_none() && a.status != Status::Exited);
+        app.mode = Mode::Brief { planet: row.world.clone(), text, kind: 0, launch: !crewed, role: 0, to: None, attachments: vec![], sending: false };
+    } else if open {
+        app.sel = Some(Sel::Planet(row.world.clone()));
+        match &row.target {
+            AttentionTarget::Agent(id) => {
+                app.sel = Some(Sel::Agent(*id));
+                app.commander_return = true;
+                app.open_comms(*id, client, l);
+            }
+            AttentionTarget::Needs => app.mode = Mode::Actions { planet: row.world.clone(), sel: 0 },
+            AttentionTarget::Deploy => app.mode = Mode::Deploy { planet: row.world.clone(), kind: 0 },
+            AttentionTarget::Pr(pr) => client.open_pr(row.world.clone(), pr.number),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2163,6 +2297,10 @@ fn handle(
         }
         return false;
     }
+    if matches!(app.mode, Mode::Commander) {
+        commander_input(app, w, l, client, &ev);
+        return false;
+    }
     if let Mode::Situation { id, typing } = app.mode {
         situation_input(app, w, l, client, &ev, id, typing, t);
         return false;
@@ -2553,7 +2691,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Galaxy | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
+        Mode::Galaxy | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
     // ── galaxy
@@ -2569,6 +2707,7 @@ fn handle(
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
         KeyCode::Char('q') => return true,
+        KeyCode::Char('C') => app.open_commander(w),
         KeyCode::Char('c') if ctrl => return true,
         KeyCode::Esc => app.sel = None,
         KeyCode::Down | KeyCode::Char('j') => pick(app, cur.map_or(0, |c| (c + 1).min(rows.len().saturating_sub(1)))),
@@ -2863,6 +3002,10 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
         MouseEventKind::Up(MouseButton::Left) => {
             let was_drag = drag.take().is_some_and(|d| d.2);
             if was_drag {
+                return;
+            }
+            if mr as i32 == l.rows - 1 && (mc as usize) < draw::commander_button(app, w).chars().count() {
+                app.open_commander(w);
                 return;
             }
             if in_panel && let Some(id) = draw::panel_log_hit(app, w, l, mr as i32) {
@@ -3162,6 +3305,152 @@ mod ship_card_tests {
         assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms + 2), Some(Some(2)));
         assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms - 2), Some(None));
         assert_eq!(crate::draw::ship_hit(&app, 1, &l, 0, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod commander_tests {
+    use super::*;
+
+    fn fixture() -> (App, World, Lay) {
+        let mut app = App::new();
+        app.history.clear();
+        app.online = true;
+        for (id, cwd, status) in [(1, "/alpha/api", Status::Blocked), (2, "/beta/web", Status::Done), (3, "/beta/worker", Status::Working)] {
+            let mut a = ship_card_tests::ship(id, false);
+            a.cwd = cwd.into();
+            a.status = status;
+            a.title = format!("task for ship {id}");
+            app.agents.push(a);
+        }
+        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![] });
+        app.sel = Some(Sel::Sys("/beta".into()));
+        let world = app.world(0.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 40), false);
+        (app, world, l)
+    }
+
+    fn key(app: &mut App, w: &World, l: &Lay, code: KeyCode) {
+        handle(app, w, l, &Client::isolated(), None, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 1.0, &mut None);
+    }
+
+    fn rendered(app: &mut App, w: &World) -> String {
+        let mut fb = Fb::new(120, 40);
+        let l = Lay::new(&fb, false);
+        draw::frame(&mut fb, app, w, &l, 1.0, None);
+        fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn commander_opens_across_systems_and_returns_after_comms() {
+        let (mut app, w, l) = fixture();
+        key(&mut app, &w, &l, KeyCode::Char('C'));
+        let screen = rendered(&mut app, &w);
+        assert!(screen.contains("COMMANDER"));
+        assert!(screen.contains("May I run the migration?"));
+        assert!(screen.contains("task for ship 2"));
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Chat { id: 1, .. }));
+        key(&mut app, &w, &l, KeyCode::Esc);
+        assert!(rendered(&mut app, &w).contains("COMMANDER"));
+    }
+
+    #[test]
+    fn commander_empty_state_reflects_resolved_work() {
+        let (mut app, w, l) = fixture();
+        key(&mut app, &w, &l, KeyCode::Char('C'));
+        app.agents[0].status = Status::Working;
+        app.agents[1].status = Status::Idle;
+        assert!(rendered(&mut app, &w).contains("Nothing needs your attention"));
+    }
+
+    #[test]
+    fn attention_prioritizes_requests_without_duplicate_moon_prs_or_routine_work() {
+        let (mut app, _, _) = fixture();
+        app.agents[2].war = vec![War { rival: 8, files: vec!["src/main.rs".into()] }];
+        app.survey.worlds.insert("/alpha/api".into(), survey::World {
+            github: true, dirty: 7, ahead: 2,
+            prs: vec![survey::Pr { number: 7, title: "Broken checks".into(), ci: "fail", ..Default::default() }],
+            others: vec![survey::Pr { number: 8, title: "Please review".into(), asks_you: true, ..Default::default() }],
+            ..Default::default()
+        });
+        let mut moon = ship_card_tests::ship(4, false);
+        moon.cwd = "/moons/api".into();
+        app.agents.push(moon);
+        let mut survey = app.survey.worlds["/alpha/api"].clone();
+        survey.host = Some("/alpha/api".into());
+        app.survey.worlds.insert("/moons/api".into(), survey);
+        app.survey.worlds.insert("/unmapped".into(), app.survey.worlds["/alpha/api"].clone());
+        let w = app.world(0.0, 0.0);
+        let rows = app.attention(&w);
+        assert_eq!(rows.iter().map(|r| r.kind).collect::<Vec<_>>(), ["Input", "Conflict", "CI failed", "Review", "Finished"]);
+        assert!(rows.iter().filter(|r| matches!(r.target, AttentionTarget::Pr(_))).all(|r| r.world == "/alpha/api"));
+        app.agents[0].dying = Some(0.0);
+        assert!(!app.attention(&w).iter().any(|r| r.id == "agent:1"));
+    }
+
+    #[test]
+    fn selection_stays_on_the_same_request_when_alerts_arrive() {
+        let (mut app, w, l) = fixture();
+        key(&mut app, &w, &l, KeyCode::Char('C'));
+        key(&mut app, &w, &l, KeyCode::Down);
+        let mut newcomer = ship_card_tests::ship(9, false);
+        newcomer.cwd = "/aaa/new".into();
+        newcomer.status = Status::Blocked;
+        app.agents.push(newcomer);
+        assert_eq!(app.attention(&w)[app.attention_selection(&app.attention(&w))].id, "agent:2");
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Chat { id: 2, .. }));
+    }
+
+    #[test]
+    fn commander_lists_unstaffed_missions_and_prepares_pr_work_without_sending_it() {
+        let (mut app, w, l) = fixture();
+        app.agents[2].status = Status::Exited;
+        app.missions.push(Mission { cwd: "/beta/worker".into(), text: "Build the service".into(), state: "queued".into(), ..Default::default() });
+        assert!(app.attention(&w).iter().any(|r| r.kind == "Unstaffed"));
+        app.survey.worlds.insert("/alpha/api".into(), survey::World {
+            others: vec![survey::Pr { number: 42, asks_you: true, title: "Review authentication".into(), ..Default::default() }],
+            ..Default::default()
+        });
+        key(&mut app, &w, &l, KeyCode::Char('C'));
+        key(&mut app, &w, &l, KeyCode::Down);
+        key(&mut app, &w, &l, KeyCode::Char('t'));
+        assert!(matches!(&app.mode, Mode::Brief { planet, text, sending: false, .. } if planet == "/alpha/api" && text.s.contains("42") && text.s.contains("review")));
+    }
+
+    #[test]
+    fn long_queue_scrolls_and_mouse_hit_matches_the_visible_request() {
+        let (mut app, w, _) = fixture();
+        for id in 10..40 {
+            let mut a = ship_card_tests::ship(id, false);
+            a.status = Status::Blocked;
+            a.title = format!("Request number {id}");
+            app.agents.push(a);
+        }
+        let mut fb = Fb::new(80, 24);
+        let l = Lay::new(&fb, false);
+        key(&mut app, &w, &l, KeyCode::Char('C'));
+        key(&mut app, &w, &l, KeyCode::End);
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let items = app.attention(&w);
+        let sel = items.len() - 1;
+        let text: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+        let row = text.iter().position(|r| r.contains("task for ship 2")).unwrap();
+        assert_eq!(draw::commander_hit(&l, items.len(), sel, 20, row as i32), Some(sel));
+        assert!(text.iter().any(|r| r.contains("Esc galaxy")));
+        assert_eq!(draw::commander_hit(&l, items.len(), sel, 20, l.rows - 4), None);
+    }
+
+    #[test]
+    fn long_question_details_scroll_to_the_end_and_back() {
+        let (mut app, w, l) = fixture();
+        app.agents[0].ask.as_mut().unwrap().context = (0..40).map(|i| format!("context line {i}")).collect();
+        key(&mut app, &w, &l, KeyCode::Char('C'));
+        for _ in 0..20 { key(&mut app, &w, &l, KeyCode::PageDown); rendered(&mut app, &w); }
+        assert!(rendered(&mut app, &w).contains("context line 39"));
+        for _ in 0..20 { key(&mut app, &w, &l, KeyCode::PageUp); }
+        assert!(rendered(&mut app, &w).contains("context line 0"));
     }
 }
 

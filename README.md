@@ -44,6 +44,7 @@ the galaxy. Ship status colours and development indicators still show the same i
 | `⏎` / click twice | **comms**: a chat popup with the agent's live terminal; `⇥` goes full screen |
 | `Ctrl-]` / `F12` | leave comms, back to the galaxy                                     |
 | `⇥`              | jump to the next agent that needs you                               |
+| `C`              | **commander**: your attention queue across all star systems         |
 | `t`              | **mission**: write a task for the selected world (launch a ship with it, or queue it) |
 | `b`              | **fleet order**: one order to every agent in the selected system or world |
 | `u`              | **moon**: found a git worktree off the selected world, with its own agent |
@@ -142,6 +143,22 @@ worlds, errors), `w` narrows to the selected entry's world and its moons, and `/
 `x` clears the filters. The pane below the list spells out the selected entry: its full text, when it
 happened, its world and the agent involved, if that agent is still around. `⏎` goes to that agent or world,
 and `c` opens comms with the agent.
+
+## Commander
+
+Press `C` or click **commander** in the footer to see what needs your attention across all
+charted star systems, regardless of the selected system. The footer shows the number waiting.
+Questions and approvals come first, then file conflicts, your failing PR checks, PR reviews
+requested from you, missions queued without an agent, and finished agent work to inspect.
+Working agents and ordinary uncommitted files do not fill the queue.
+
+Use `↑↓` / `j k` or the wheel to select an item. Its world, question, context and available
+choices appear below; `PgUp/PgDn` scroll the details. `⏎` (or a second click) opens the relevant
+agent, world actions, PR, or deployment dialog. For PRs, `t` prepares a review or fix mission.
+Answer questions and approve actions in the agent's comms; closing comms returns to Commander.
+Items update as agents and PR surveys change. Reading the list alone does not dismiss anything;
+finished work leaves the queue when opened in comms, and questions remain until resolved.
+`Esc` returns to the galaxy.
 
 ## Needs and quick actions
 
