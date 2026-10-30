@@ -24,6 +24,8 @@ pub struct World {
     pub commits: u32,
     pub files: u32,
     pub lang: String,
+    /// For a linked worktree (a moon): the main worktree it belongs to.
+    pub host: Option<String>,
 }
 
 /// One usage window of one provider, e.g. claude's 5-hour window.
@@ -133,6 +135,11 @@ fn status(path: &str, w: &mut World) {
         }
     }
     w.last_commit = git(path, &["log", "-1", "--format=%ct"]).and_then(|s| s.trim().parse().ok());
+    w.host = git(path, &["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"]).and_then(|s| {
+        let mut l = s.lines();
+        let (own, common) = (l.next()?.to_string(), l.next()?.to_string());
+        (own != common).then(|| common.strip_suffix("/.git").map(String::from)).flatten()
+    });
 }
 
 fn size(path: &str, w: &mut World) {

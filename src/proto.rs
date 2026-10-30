@@ -37,6 +37,10 @@ pub enum Req {
     Mission { cwd: String, text: String, kind: String, launch: bool },
     /// One order to many agents at once, followed as one fleet order.
     Broadcast { ids: Vec<u32>, text: String },
+    /// Found a moon: a git worktree of the world at `cwd` on `branch`, with an agent on it.
+    Moon { cwd: String, branch: String, kind: String },
+    /// Merge a moon's branch back into its world and retire it.
+    Dock { cwd: String },
     /// Strike a mission from the log.
     Scrub { id: u32 },
     /// Exec the binary on disk in place of the running daemon, keeping every agent.

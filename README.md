@@ -41,6 +41,8 @@ Agents also survive the daemon itself:
 | `⇥`              | jump to the next agent that needs you                               |
 | `t`              | **mission**: write a task for the selected world (launch a ship with it, or queue it) |
 | `b`              | **fleet order**: one order to every agent in the selected system or world |
+| `u`              | **moon**: found a git worktree off the selected world, with its own agent |
+| `D`              | **dock** the selected moon: merge its branch back in and retire it   |
 | `T`              | strike finished missions on the selected world from its log         |
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
@@ -72,6 +74,14 @@ under way (◆), waiting (○) and done (★). Missions survive restarts.
 
 A **fleet order** (`b` on a system or world) goes to every ship there at once (except ones waiting
 on an answer). The cards show its progress, and the situation log reports when the whole fleet is done.
+
+## Moons
+
+A moon is a git worktree on its own branch with its own agent: parallel work that can't step on the
+world's toes. `u` on a world founds one (in `~/.local/share/empire/moons/`); it orbits its world
+with its own ships. Worktrees you made yourself show up as moons too. `D` docks a moon: its branch is
+merged back with `--no-ff`, its agents are recalled and the worktree removed. Both sides must be
+committed; a merge conflict is a **collision**: the merge is called off and nothing changes.
 
 ## Answering from orbit
 
