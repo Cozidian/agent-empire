@@ -36,6 +36,8 @@ pub struct World {
     pub prs_error: Option<String>,
     /// PRs seen merged since the galaxy opened (number, title), oldest first.
     pub merged: Vec<(u32, String)>,
+    /// AI resources built here: AGENTS.md, skills, MCP servers, …
+    pub structures: Vec<crate::structure::Built>,
 }
 
 #[derive(Clone, Default, Debug, PartialEq)]
@@ -101,6 +103,7 @@ impl Survey {
                     let mut w = d.lock().unwrap().worlds.get(path).cloned().unwrap_or_default();
                     if q {
                         status(path, &mut w);
+                        w.structures = crate::structure::survey(path);
                         quick.insert(path.clone(), Instant::now());
                     }
                     if s {

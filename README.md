@@ -59,6 +59,7 @@ select individual worlds and agents at any distance.
 | `P`              | give the selected agent **priority** in a border conflict            |
 | `X`              | forget the selected dormant world                                   |
 | `r`              | what the selected world **needs**, as quick actions                |
+| `B`              | the selected world's **structures**: build or renovate its AI resources |
 | `L`              | the selected world's **mission log**: under way, queued, done       |
 | `T`              | strike finished missions on the selected world from its log         |
 | `S`              | the **situation log** in full: filter it, read an entry's details   |
@@ -185,6 +186,29 @@ opens comms with an agent that's waiting, or settles a conflict.
 A **fleet order** (`b` on a system or world) goes to every ship there at once (except ones waiting
 on an answer). The cards show its progress, and the situation log reports when the whole fleet is done.
 
+## Structures
+
+A world's buildings are the AI resources in its folder: what it has built for the agents that work
+there. The survey finds them every few seconds, and each one stands as a spire on the planet's upper
+limb, in its own colour.
+
+| structure        | what it is                                                       |
+| ---------------- | ---------------------------------------------------------------- |
+| ⌂ charter hall   | `AGENTS.md`: instructions every species reads                    |
+| ▤ archive        | `CLAUDE.md` (also `.claude/CLAUDE.md`, `CLAUDE.local.md`)        |
+| ✧ academy        | skills: `SKILL.md` folders in `.claude/skills`, `.agents/skills`, `.codex/skills`, `.grok/skills` |
+| ⚑ barracks       | subagents in `.claude/agents`                                     |
+| ⌘ command post   | slash commands in `.claude/commands` and `.codex/prompts`        |
+| ⌁ relay          | MCP servers in `.mcp.json`, `.cursor/mcp.json` or `.vscode/mcp.json` |
+| ⚲ watchtower     | hooks in `.claude/settings.json` / `settings.local.json`         |
+| ⚐ embassy        | other agents' rules: `GEMINI.md`, Copilot, Cursor, Windsurf, Cline |
+
+The world card lists what stands and how many plots are free. `B` opens the world's structures:
+pick one and the mission composer opens with a construction order for a **builder** (or, for one
+that already stands, an order to renovate it against the code as it is now). Read it, change it if
+you like, and send it. When a structure goes up the situation log reports it and the world earns
++1 prestige (once per kind of structure); one that's removed is reported torn down.
+
 ## Moons
 
 A moon is a git worktree on its own branch with its own agent: parallel work that can't step on the
@@ -237,7 +261,7 @@ The map shows where your attention has been. `e` sends a ship back; `X` forgets 
 
 Worlds earn **prestige** for real progress: +2 for every completed mission, +1 when the work tree
 goes from dirty to all committed (with agents there), +1 when a PR's CI turns green, +5 for a merged
-PR. Prestige develops a world, with a fanfare on every level: **outpost → colony** (rings, at 4)
+PR, +1 for each new kind of structure. Prestige develops a world, with a fanfare on every level: **outpost → colony** (rings, at 4)
 **→ city world** (city lights on its night side, 12) **→ ecumenopolis** (25), whose star gets a
 Dyson swarm. The world card shows its development and how far the next level is.
 
@@ -290,6 +314,7 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
   live screen streaming and an ordered command queue.
 - `game.rs`: galaxy model, camera, input, colonize/deploy/decommission flows.
 - `draw.rs`: procedural dithered planets, ships, outliner, situation log, dialogs, comms.
+- `structure.rs`: structures (AI resources) a world has built, and their construction orders.
 - `survey.rs`: background git survey of every world (status, size, worktrees, PRs via `gh`) and
   Claude/Codex usage.
 - `gfx.rs` / `octant.rs`: the octant renderer from mission-control. `sound.rs`: robot cues.
