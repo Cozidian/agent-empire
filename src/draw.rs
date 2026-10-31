@@ -5,6 +5,7 @@ use crate::game::*;
 use crate::role::{ROLES, Role};
 use crate::gfx::*;
 use crate::sound::Sound;
+use crate::structure::KINDS;
 use crate::survey;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -68,6 +69,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
         Mode::Moon { planet, branch, kind } => moon(fb, app, planet, branch, *kind, l, t),
         Mode::Actions { planet, sel } => actions(fb, app, planet, *sel, l),
+        Mode::Build { planet, sel } => build_menu(fb, app, planet, *sel, l),
         Mode::Log { world, sel, open } => mission_log(fb, app, world, *sel, open, l, t),
         Mode::Dock { moon } => dock(fb, app, moon, l),
         Mode::Chat { id, text } => chat(fb, app, *id, text, l, t),
@@ -265,6 +267,25 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
                 fb.px[i] = mix(fb.px[i], v3(0.22, 0.14, 0.34), haze);
             }
         }
+    }
+}
+
+/// A world's structures, as spires standing on its upper limb, each with a beacon in its colour.
+fn spires(fb: &mut Fb, app: &App, p: &Planet, (px, py): (f32, f32), r: f32, t: f32) {
+    let Some(built) = app.survey.worlds.get(&p.key).map(|g| &g.structures).filter(|b| !b.is_empty()) else { return };
+    if r < 5.0 || p.fog > 0.6 {
+        return;
+    }
+    let n = built.len() as f32;
+    for (i, b) in built.iter().enumerate() {
+        // spread over the top of the planet, from 10 to 2 o'clock
+        let a = -PI / 2.0 + (i as f32 + 0.5 - n / 2.0) * (PI * 0.65 / n.max(3.0));
+        let (dx, dy) = (a.cos(), a.sin());
+        let h = 2.0 + (b.count.min(4) as f32) * 0.8;
+        let col = b.kind.color() * (1.0 - 0.7 * p.fog);
+        fb.line(px + dx * (r - 0.5), py + dy * (r - 0.5), px + dx * (r + h), py + dy * (r + h), col * 0.5, col * 0.8);
+        let pulse = 0.7 + 0.3 * (t * 1.5 + i as f32 * 1.3).sin();
+        fb.splat(px + dx * (r + h + 0.8), py + dy * (r + h + 0.8), col * pulse);
     }
 }
 
@@ -549,6 +570,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         ships(false, fb);
         rings(false, fb);
         sphere(fb, px, py, r, p, (lx / ll, ly / ll), t);
+        spires(fb, app, p, (px, py), r, t);
         rings(true, fb);
         let live = || p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none());
         if live().any(|a| a.status == Status::Blocked) {
@@ -1087,6 +1109,10 @@ fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
         }
         rows.push(("development", row));
     }
+    let built = app.survey.worlds.get(&p.key).map(|g| g.structures.clone()).unwrap_or_default();
+    let mut st: Vec<(String, V3)> = built.iter().map(|b| (format!("{} {}{} ", b.kind.glyph(), b.kind.what(), if b.count > 1 { format!(" ×{}", b.count) } else { String::new() }), b.kind.color())).collect();
+    st.push((if built.is_empty() { "no structures yet · B build".into() } else { format!("{} plots free · B", KINDS.len() - built.len()) }, DIM));
+    rows.push(("structures", st));
     if p.dormant && p.host.is_none() {
         let age = ago((survey::now() as u64).saturating_sub(p.last_seen) as f32);
         let txt = if p.fog > 0.8 { "lost in the nebula" } else if p.fog > 0.5 { "fading" } else { "dormant" };
@@ -1339,7 +1365,7 @@ fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
         Some(Sel::Agent(id)) if app.agent(*id).is_some_and(|a| !a.war.is_empty()) => "⏎ ship card · P give priority · L missions · x decommission · ",
         Some(Sel::Agent(_)) => "⏎ ship card · t mission · L missions · e deploy here · x decommission · ",
         Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ comms · t mission · L missions · D dock · e deploy here · ",
-        Some(Sel::Planet(_)) => "⏎ comms · r needs · t mission · L missions · b fleet · u moon · e deploy · ",
+        Some(Sel::Planet(_)) => "⏎ comms · r needs · t mission · B build · L missions · b fleet · u moon · e deploy · ",
         Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
         Some(Sel::GitHub) => "⏎ projects and pull requests · ",
         None => "",
@@ -1611,6 +1637,32 @@ fn actions(fb: &mut Fb, app: &App, planet: &str, sel: usize, l: &Lay) {
         seg(fb, x + 6, y + 4 + (acts.len() + i) as i32, &clip(&n.label, (w - 10) as usize), w - 10, n.col * 0.8, Some(BOX));
     }
     seg(fb, x + 3, y + h - 2, "1-9 / ⏎ act · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
+}
+
+/// A world's structures: what stands there, and what can still be built.
+fn build_menu(fb: &mut Fb, app: &App, planet: &str, sel: usize, l: &Lay) {
+    let (x, y, w, h) = centered(l, 84, KINDS.len() as i32 * 2 + 7);
+    let accent = v3(1.0, 0.85, 0.45);
+    frame_box(fb, x, y, w, h, &format!("⌂ {} STRUCTURES", base_name(planet).to_uppercase()), accent);
+    seg(fb, x + 3, y + 2, "The AI resources this world has built for its agents. Pick one to build.", w - 6, DIM, Some(BOX));
+    for (i, k) in KINDS.iter().enumerate() {
+        let r = y + 4 + i as i32 * 2;
+        let bg = if i == sel { SELBG } else { BOX };
+        fb.panel(x + 2, r, w - 4, 2, bg);
+        let built = app.structure(planet, *k);
+        let c = seg(fb, x + 3, r, &format!(" {} ", i + 1), 3, BOX, Some(k.color() * if built.is_some() { 0.9 } else { 0.4 }));
+        let c = seg(fb, c + 1, r, &format!("{} {:<13}", k.glyph(), k.name()), 16, if built.is_some() { k.color() } else { DIM }, Some(bg));
+        seg(fb, c + 1, r, k.what(), 22, TEXT, Some(bg));
+        let (state, what) = match built {
+            Some(b) => (if b.count > 1 { format!("built ×{}", b.count) } else { "built".into() }, "renovate"),
+            None => ("empty plot".into(), "construct"),
+        };
+        let tag = format!("{state} · {what}");
+        seg(fb, x + w - 3 - tag.chars().count() as i32, r, &tag, 24, if built.is_some() { v3(0.4, 0.95, 0.6) } else { DIM }, Some(bg));
+        let detail = built.map_or_else(|| k.about().to_string(), |b| b.files.join("  "));
+        seg(fb, x + 8, r + 1, &clip(&detail, (w - 12) as usize), w - 12, DIM, Some(bg));
+    }
+    seg(fb, x + 3, y + h - 2, "1-8 / ⏎ draft the order for a builder · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
 }
 
 /// A world's mission log, grouped by status, world or moon, or fleet order; open missions show in full.
@@ -2052,6 +2104,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("e", "deploy another agent to the selected world"),
         ("x", "decommission the selected agent"),
         ("r", "what the selected world needs, with quick actions"),
+        ("B", "structures: AGENTS.md, skills, MCP… build or renovate"),
         ("t / L", "give a world a mission / its mission log"),
         ("S", "situation log: filter it, read an entry in full"),
         ("b", "fleet order: one order to every agent in a system or world"),

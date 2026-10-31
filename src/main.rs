@@ -8,6 +8,7 @@ mod octant;
 mod proto;
 mod role;
 mod sound;
+mod structure;
 mod screenshots;
 mod survey;
 

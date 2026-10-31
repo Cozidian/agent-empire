@@ -7,6 +7,7 @@ use crate::client::{Client, Cmd, Msg};
 use crate::draw;
 use crate::gfx::*;
 use crate::role::{ROLES, Role};
+use crate::structure::{Built, KINDS, Kind};
 use crate::proto::{AgentView, Ask, Mission, Report, ScreenView, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
@@ -406,6 +407,8 @@ pub enum Mode {
     Ship { id: u32, sel: usize },
     /// What a world needs, as a menu of quick actions.
     Actions { planet: String, sel: usize },
+    /// A world's structures (its AI resources): what stands, and what can be built.
+    Build { planet: String, sel: usize },
     /// A world's missions (its moons' too), grouped by `App::log_sort`; `open` ones show in full.
     Log { world: String, sel: usize, open: HashSet<u32> },
     /// Founding a moon (git worktree) off a world.
@@ -851,6 +854,21 @@ impl App {
                 self.toast("priority given: its rivals were told to stand down", t);
             }
         }
+    }
+
+    /// The structure of `kind` standing on the world at `key`, if any.
+    pub fn structure(&self, key: &str, kind: Kind) -> Option<&Built> {
+        self.survey.worlds.get(key)?.structures.iter().find(|b| b.kind == kind)
+    }
+
+    /// Draft the order to build (or renovate) a structure, in the mission composer, for a
+    /// builder: the player reads it, edits it if they like, and sends it.
+    fn construct(&mut self, key: &str, kind: Kind) {
+        let mut text = Line::default();
+        text.set(kind.brief(self.structure(key, kind)));
+        let crewed = self.agents.iter().any(|a| a.cwd == key && a.dying.is_none() && a.status != Status::Exited);
+        let role = ROLES.iter().position(|r| *r == Role::Builder).unwrap_or(0);
+        self.mode = Mode::Brief { planet: key.to_string(), text, kind: 0, launch: !crewed, role, to: None, attachments: Vec::new(), sending: false };
     }
 
     /// Missions in log order, each with its group heading. Within a group: under way,
@@ -2087,6 +2105,18 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                         awards.push((path.clone(), format!("green-{path}-{}", pr.number), 1, format!("CI green on #{}", pr.number)));
                     }
                 }
+                // structures raised or torn down since the last survey
+                if let Some(had) = old.map(|o| o.structures.iter().map(|b| b.kind).collect::<Vec<Kind>>()) {
+                    for b in w.structures.iter().filter(|b| !had.contains(&b.kind)) {
+                        let k = b.kind;
+                        app.say(Ev::World, format!("{} {} raised on {} ({})", k.glyph(), k.name(), base_name(path), b.files.join(", ")), k.color()).on(path);
+                        let host = app.moon_host(path).unwrap_or_else(|| path.clone());
+                        awards.push((path.clone(), format!("built-{host}-{}", k.name()), 1, format!("{} built ({})", k.name(), k.what())));
+                    }
+                    for k in had.into_iter().filter(|k| !w.structures.iter().any(|b| b.kind == *k)) {
+                        app.say(Ev::World, format!("{} {} torn down on {}", k.glyph(), k.name(), base_name(path)), DIM_LOG).on(path);
+                    }
+                }
                 for pr in &w.prs {
                     let before = app.survey.worlds.get(path).and_then(|o| o.prs.iter().find(|p| p.number == pr.number)).map(|p| p.ci);
                     match (before, pr.ci) {
@@ -2474,6 +2504,33 @@ fn handle(
             }
             return false;
         }
+        Mode::Build { planet, sel } => {
+            let (planet, mut s) = (planet.clone(), *sel);
+            let pick = match k.code {
+                KeyCode::Esc | KeyCode::Char('B') => {
+                    app.mode = Mode::Galaxy;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    s = s.saturating_sub(1);
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    s = (s + 1).min(KINDS.len() - 1);
+                    None
+                }
+                KeyCode::Char(d @ '1'..='9') => KINDS.get(d as usize - '1' as usize).copied(),
+                KeyCode::Enter => KINDS.get(s).copied(),
+                _ => None,
+            };
+            if let Mode::Build { sel, .. } = &mut app.mode {
+                *sel = s;
+            }
+            if let Some(kind) = pick {
+                app.construct(&planet, kind);
+            }
+            return false;
+        }
         Mode::Log { world, sel, open } => {
             let (world, mut s) = (world.clone(), *sel);
             let mut open = std::mem::take(open);
@@ -2802,6 +2859,10 @@ fn handle(
             Some(p) if app.needs(&p).iter().any(|n| n.act.is_some()) => app.mode = Mode::Actions { planet: p, sel: 0 },
             Some(p) => app.toast(format!("{} needs nothing from you right now ✓", base_name(&p)), t),
             None => app.toast("select a world to see what it needs", t),
+        },
+        KeyCode::Char('B') => match app.sel_planet() {
+            Some(p) => app.mode = Mode::Build { planet: p, sel: 0 },
+            None => app.toast("select a world to see its structures and build more", t),
         },
         KeyCode::Char('L') => match app.sel_planet() {
             // a moon's log is its world's, so the family's work reads together
@@ -3775,5 +3836,43 @@ mod advisor_tests {
         app.advisor_answered("k".into(), Ok(Pick { ship: Some(4), ship_conf: 0.99, role: Role::None, role_conf: 0.0 }));
         assert_eq!(choice(&app), (true, None, Role::Scout));
         assert_eq!(app.advisor.pick.as_ref().and_then(|p| p.ship), Some(4)); // still shown
+    }
+}
+
+#[cfg(test)]
+mod structure_tests {
+    use super::*;
+
+    #[test]
+    fn b_shows_structures_and_drafts_a_construction_order_for_a_builder() {
+        let mut app = App::new();
+        let key = "/home/me/world".to_string();
+        let charter = Built { kind: Kind::Charter, count: 1, files: vec!["AGENTS.md".into()] };
+        app.survey.worlds.insert(key.clone(), survey::World { structures: vec![charter], ..Default::default() });
+        app.sel = Some(Sel::Planet(key.clone()));
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let mut fb = Fb::new(120, 40);
+        let l = Lay::new(&fb, false);
+        let client = Client::isolated();
+        let key_ev = |c| Event::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        handle(&mut app, &world, &l, &client, None, key_ev(KeyCode::Char('B')), 1.0, &mut None);
+        assert!(matches!(app.mode, Mode::Build { .. }));
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let text: String = fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>() + "\n").collect();
+        assert!(text.contains("STRUCTURES") && text.contains("renovate") && text.contains("construct"));
+        // the charter stands, so it's renovated; the archive is an empty plot, so it's built
+        handle(&mut app, &world, &l, &client, None, key_ev(KeyCode::Char('1')), 1.0, &mut None);
+        match &app.mode {
+            Mode::Brief { text, launch, role, .. } => {
+                assert!(text.s.starts_with("Renovate") && text.s.contains("AGENTS.md"));
+                assert!(*launch);
+                assert_eq!(ROLES[*role], Role::Builder);
+            }
+            _ => panic!("no composer"),
+        }
+        app.mode = Mode::Build { planet: key, sel: 0 };
+        handle(&mut app, &world, &l, &client, None, key_ev(KeyCode::Down), 1.0, &mut None);
+        handle(&mut app, &world, &l, &client, None, key_ev(KeyCode::Enter), 1.0, &mut None);
+        assert!(matches!(&app.mode, Mode::Brief { text, .. } if text.s.starts_with("Write a CLAUDE.md")));
     }
 }
