@@ -1,6 +1,6 @@
 //! Spacious grand-strategy UI cues: glassy FM bells, warm detuned synth pads and
-//! brass, sub swells and filtered-noise whooshes, all in a long reverb. Silent if
-//! there's no audio device.
+//! brass, sub swells and filtered-noise whooshes, all in a long reverb, plus an
+//! original looping ambient score. Silent if there's no audio device.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
@@ -41,11 +41,12 @@ pub const ALL: [Cue; 5] = [Cue::Done, Cue::Blocked, Cue::Spawn, Cue::Gone, Cue::
 pub struct Sound {
     tx: Sender<Cue>,
     pub muted: Arc<AtomicBool>,
+    pub music_muted: Arc<AtomicBool>,
     _stream: cpal::Stream,
 }
 
 impl Sound {
-    pub fn start() -> Option<Self> {
+    pub fn start(music: bool) -> Option<Self> {
         let dev = cpal::default_host().default_output_device()?;
         let cfg = dev.default_output_config().ok()?;
         let fmt = cfg.sample_format();
@@ -53,14 +54,16 @@ impl Sound {
         let (tx, rx) = mpsc::channel();
         let muted = Arc::new(AtomicBool::new(false));
         let m = muted.clone();
+        let music_muted = Arc::new(AtomicBool::new(!music));
+        let mm = music_muted.clone();
         let stream = match fmt {
-            SampleFormat::F32 => build::<f32>(&dev, cfg, rx, m),
-            SampleFormat::I16 => build::<i16>(&dev, cfg, rx, m),
-            SampleFormat::U16 => build::<u16>(&dev, cfg, rx, m),
-            SampleFormat::I32 => build::<i32>(&dev, cfg, rx, m),
+            SampleFormat::F32 => build::<f32>(&dev, cfg, rx, m, mm, music),
+            SampleFormat::I16 => build::<i16>(&dev, cfg, rx, m, mm, music),
+            SampleFormat::U16 => build::<u16>(&dev, cfg, rx, m, mm, music),
+            SampleFormat::I32 => build::<i32>(&dev, cfg, rx, m, mm, music),
             _ => None,
         }?;
-        Some(Self { tx, muted, _stream: stream })
+        Some(Self { tx, muted, music_muted, _stream: stream })
     }
 
     pub fn play(&self, c: Cue) {
@@ -73,9 +76,12 @@ fn build<T: SizedSample + FromSample<f32>>(
     cfg: cpal::StreamConfig,
     rx: Receiver<Cue>,
     muted: Arc<AtomicBool>,
+    music_muted: Arc<AtomicBool>,
+    music: bool,
 ) -> Option<cpal::Stream> {
     let ch = cfg.channels as usize;
     let mut synth = Synth::new(cfg.sample_rate as f32);
+    let mut music = music.then(|| Music::new(cfg.sample_rate as f32));
     let stream = dev
         .build_output_stream(
             cfg,
@@ -86,7 +92,12 @@ fn build<T: SizedSample + FromSample<f32>>(
                     }
                 }
                 for frame in data.chunks_mut(ch) {
-                    let (l, r) = synth.tick();
+                    let (mut l, mut r) = synth.tick();
+                    if let Some(music) = &mut music {
+                        let (ml, mr) = music.output(music_muted.load(Relaxed));
+                        l += ml;
+                        r += mr;
+                    }
                     for (i, s) in frame.iter_mut().enumerate() {
                         *s = T::from_sample(if i % 2 == 0 { l } else { r });
                     }
@@ -387,9 +398,116 @@ impl Synth {
     }
 }
 
+struct Music {
+    synth: Synth,
+    frame: u64,
+    beat_frames: u64,
+    gain: f32,
+}
+
+impl Music {
+    fn new(sr: f32) -> Self {
+        let mut synth = Synth::new(sr);
+        synth.voices.reserve(32);
+        Self { synth, frame: 0, beat_frames: (sr * 2.0).round() as u64, gain: 0.0 }
+    }
+
+    fn tick(&mut self) -> (f32, f32) {
+        // Eight slow chords, 64 seconds in all. Keep the hall and overlapping
+        // voices alive at the wrap, so the last chord dissolves into the first.
+        const CHORDS: [[f32; 4]; 8] = [
+            [45.0, 52.0, 59.0, 60.0], // Am(add9)
+            [41.0, 48.0, 57.0, 64.0], // Fmaj7
+            [48.0, 55.0, 59.0, 64.0], // Cmaj7
+            [43.0, 50.0, 57.0, 62.0], // G(add9)
+            [45.0, 52.0, 60.0, 67.0], // Am7
+            [41.0, 48.0, 55.0, 64.0], // Fmaj9
+            [38.0, 45.0, 53.0, 60.0], // Dm7
+            [43.0, 50.0, 57.0, 62.0], // G(add9), back to Am
+        ];
+        if self.frame % self.beat_frames == 0 {
+            let beat = (self.frame / self.beat_frames) as usize;
+            let chord = CHORDS[beat / 4];
+            let voices = &mut self.synth.voices;
+            if beat % 4 == 0 {
+                for (i, note) in chord.into_iter().enumerate() {
+                    voices.push(Voice::pad(note, 0.0, 12.0, 0.035)
+                        .att(2.5).rel(0.55).cut(450.0, 850.0)
+                        .pan(i as f32 * 0.4 - 0.6));
+                }
+                voices.push(Voice::new(Wave::Sine, 0.0, 11.0, hz(chord[0] - 12.0), hz(chord[0] - 12.0), 0.025)
+                    .att(2.0).rel(0.6));
+            }
+            // Sparse, gently alternating stereo glints above the pads.
+            let note = chord[[2, 3, 1, 3][beat % 4]] + 12.0;
+            voices.push(Voice::bell(note, 0.0, 5.5, 0.018)
+                .att(0.08).decay(0.65).pan(if beat % 2 == 0 { -0.55 } else { 0.55 }));
+        }
+        self.frame = (self.frame + 1) % (self.beat_frames * 32);
+        self.synth.tick()
+    }
+
+    fn output(&mut self, muted: bool) -> (f32, f32) {
+        // A short ramp prevents clicks and silences the reverb too. Keep time
+        // moving while muted, so unmuting resumes the current part of the score.
+        let step = 1.0 / (self.synth.sr * 0.03);
+        self.gain = (self.gain + if muted { -step } else { step }).clamp(0.0, 1.0);
+        let (l, r) = self.tick();
+        (l * self.gain, r * self.gain)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn music_mute_silences_reverb_and_resumes_without_restarting() {
+        for sr in [44100, 48000] {
+            let mut music = Music::new(sr as f32);
+            for _ in 0..sr * 3 {
+                music.output(false);
+            }
+            let mut previous = music.output(false);
+            for _ in 0..sr / 20 {
+                let sample = music.output(true);
+                assert!((sample.0 - previous.0).abs().max((sample.1 - previous.1).abs()) < 0.03);
+                previous = sample;
+            }
+            for _ in 0..sr {
+                assert_eq!(music.output(true), (0.0, 0.0), "muting must silence the hall too");
+            }
+            let frame = music.frame;
+            let mut energy = 0.0;
+            for _ in 0..sr / 10 {
+                let sample = music.output(false);
+                assert!((sample.0 - previous.0).abs().max((sample.1 - previous.1).abs()) < 0.03);
+                energy += sample.0 * sample.0 + sample.1 * sample.1;
+                previous = sample;
+            }
+            assert_eq!(music.frame, frame + sr / 10);
+            assert!(energy > 0.001, "unmuting must restore audible music");
+        }
+    }
+
+    #[test]
+    fn music_continues_across_two_loops_without_gaps_or_clipping() {
+        let sr = 12000;
+        let mut music = Music::new(sr as f32);
+        let mut previous = (0.0_f32, 0.0_f32);
+        for second in 0..130 {
+            let mut energy = 0.0;
+            for _ in 0..sr {
+                let (l, r) = music.tick();
+                assert!(l.is_finite() && r.is_finite());
+                assert!(l.abs().max(r.abs()) < 0.25, "background should stay quiet");
+                assert!((l - previous.0).abs().max((r - previous.1).abs()) < 0.08, "audible discontinuity at second {second}");
+                energy += l * l + r * r;
+                previous = (l, r);
+            }
+            assert!(energy / sr as f32 > 0.000001, "music fell silent at second {second}");
+        }
+    }
 
     #[test]
     fn every_cue_is_audible_unclipped_and_rings_out() {
