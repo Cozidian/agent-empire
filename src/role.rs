@@ -67,8 +67,8 @@ impl Role {
         }
     }
 
-    /// Launch flags for a species: Claude takes the standing order as a system prompt, and a
-    /// scout runs read-only where the species can enforce it.
+    /// Launch flags for a species: Claude and Grok take the standing order beside the mission
+    /// (a system prompt, or `--rules`), and a scout runs read-only where the species can enforce it.
     pub fn args(self, kind: &str) -> Vec<String> {
         let mut v: Vec<String> = Vec::new();
         match (kind, self) {
@@ -79,15 +79,22 @@ impl Role {
                 }
                 v.extend(["--append-system-prompt".into(), r.orders().into()]);
             }
+            ("grok", r) => {
+                if r == Role::Scout {
+                    // plan mode refuses edits outside the plan file; the sandbox refuses the rest
+                    v.extend(["--permission-mode".into(), "plan".into(), "--sandbox".into(), "read-only".into()]);
+                }
+                v.extend(["--rules".into(), r.orders().into()]);
+            }
             ("codex", Role::Scout) => v.extend(["--sandbox".into(), "read-only".into()]),
             _ => {}
         }
         v
     }
 
-    /// The opening prompt: species without a system prompt flag get the standing order first.
+    /// The opening prompt: species without a system-prompt flag get the standing order first.
     pub fn prompt(self, kind: &str, text: &str) -> String {
-        if self == Role::None || kind == "claude" {
+        if self == Role::None || matches!(kind, "claude" | "grok") {
             text.to_string()
         } else {
             format!("{}\n\nYour mission: {text}", self.orders())
@@ -96,7 +103,7 @@ impl Role {
 
     /// Whether launching this species read-only is enforced, not just asked for.
     pub fn enforced(self, kind: &str) -> bool {
-        self == Role::Scout && matches!(kind, "claude" | "codex")
+        self == Role::Scout && matches!(kind, "claude" | "codex" | "grok")
     }
 }
 
@@ -112,10 +119,16 @@ mod tests {
         assert_eq!(Role::parse("admiral"), Role::None);
         assert!(Role::Scout.args("claude").windows(2).any(|w| w == ["--permission-mode", "plan"]));
         assert!(Role::Scout.args("codex").windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        assert!(Role::Scout.args("grok").windows(2).any(|w| w == ["--permission-mode", "plan"]));
+        assert!(Role::Scout.args("grok").windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        assert!(Role::Scout.enforced("grok"));
         assert!(!Role::Builder.args("claude").iter().any(|a| a == "plan"));
+        assert!(!Role::Builder.args("grok").iter().any(|a| a == "plan" || a == "read-only"));
+        assert!(Role::Builder.args("grok").windows(2).any(|w| w[0] == "--rules"));
         assert!(Role::None.args("claude").is_empty());
-        // Claude carries the order as a system prompt; the rest get it up front
+        // Claude and Grok carry the order beside the mission; the rest get it up front
         assert_eq!(Role::Builder.prompt("claude", "Fix it"), "Fix it");
+        assert_eq!(Role::Builder.prompt("grok", "Fix it"), "Fix it");
         assert!(Role::Builder.prompt("codex", "Fix it").ends_with("Your mission: Fix it"));
     }
 }

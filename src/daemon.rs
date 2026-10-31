@@ -142,6 +142,8 @@ struct Agent {
     last_in: Instant,
     /// Status reported by the agent's own hooks, when it has them.
     hook: Option<Status>,
+    /// A hook has reported in, so those reports outrank the screen.
+    hooks: bool,
     /// The last question the player answered, and how often it was on screen then.
     answered: Option<(String, usize)>,
     status: Status,
@@ -218,9 +220,10 @@ impl Agent {
     /// The question line near the bottom of the screen, if the agent seems to be
     /// asking the player something, plus how many times that line is on screen.
     fn question(&self) -> Option<(String, usize)> {
-        const ASK: [&str; 10] = [
-            "do you want", "would you like", "(y/n)", "[y/n]", "proceed?", "allow execution",
-            "apply this change", "yes, and don't ask", "enter to confirm", "trust this folder",
+        const ASK: [&str; 14] = [
+            "do you want", "would you like", "(y/n)", "[y/n]", "proceed?", "yes, proceed", "allow execution",
+            "allow once", "yes, allow", "apply this change", "yes, and don't ask", "enter to confirm",
+            "trust this folder", "do you trust",
         ];
         let text = self.parser.screen().contents().to_lowercase();
         let hits: Vec<&str> = text.lines().map(unbox).rev().filter(|l| !l.is_empty()).take(8).filter(|l| ASK.iter().any(|k| l.contains(k))).collect();
@@ -276,16 +279,13 @@ impl Agent {
     }
 
     /// Agents without edit hooks: pick edits off the screen ("• Edited src/a.rs (+3 -1)",
-    /// "⏺ Update(src/a.rs)", "Added …", "Wrote …").
+    /// "⏺ Update(src/a.rs)", "Added …", "Wrote …", Grok's "Edit `src/a.rs`").
     fn scan_edits(&mut self) {
         let text = self.parser.screen().contents();
         let now = Instant::now();
         for line in text.lines() {
-            let l = line.trim().trim_start_matches(['•', '●', '⏺', '·', '-', '*', ' ']);
-            let rest = ["Edited ", "Added ", "Updated ", "Created ", "Wrote ", "Deleted ", "Update(", "Write(", "Edit("].iter().find_map(|p| l.strip_prefix(p));
-            let Some(rest) = rest else { continue };
-            let path: String = rest.chars().take_while(|c| !c.is_whitespace() && !"()".contains(*c)).collect();
-            if path.is_empty() || !(path.contains('/') || path.contains('.')) || !self.edits_seen.insert(line.trim().to_string()) {
+            let Some(path) = edit_path(line) else { continue };
+            if !self.edits_seen.insert(line.trim().to_string()) {
                 continue;
             }
             let f = self.resolve(&path);
@@ -297,7 +297,7 @@ impl Agent {
     fn busy_marker(&self) -> bool {
         let text = self.parser.screen().contents().to_lowercase();
         let tail: Vec<&str> = text.lines().rev().filter(|l| !l.trim().is_empty()).take(10).collect();
-        tail.iter().any(|l| l.contains("esc to interrupt") || l.contains("ctrl+c to interrupt"))
+        tail.iter().any(|l| l.contains("esc to interrupt") || l.contains("ctrl+c to interrupt") || l.contains("send a message to interrupt"))
     }
 
     /// Agents whose idle screen animates, so output activity says nothing.
@@ -306,9 +306,10 @@ impl Agent {
     }
 
     /// Reports working/done through hooks, so its screen output (statusline
-    /// repaints and all) says nothing about whether it's busy.
+    /// repaints and all) says nothing about whether it's busy. Grok counts once
+    /// a hook has actually reported: until the folder is trusted, its screen does.
     fn hooked(&self) -> bool {
-        self.kind == "claude"
+        self.kind == "claude" || self.hooks
     }
 
     /// Asking, and not a question the player already answered.
@@ -514,7 +515,9 @@ fn command(kind: &str, exe: &str, resume: Option<&str>) -> (String, Vec<String>)
             }
             "codex".into()
         }
+        // inline mode keeps its output in the scrollback, so comms can scroll it
         "grok" => {
+            args.push("--no-alt-screen".into());
             if let Some(id) = resume {
                 args.extend(["--resume".into(), id.into()]);
             }
@@ -547,6 +550,7 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         last_out: now,
         last_in: now,
         hook: None,
+        hooks: false,
         answered: None,
         turns: 0,
         report: Report::default(),
@@ -567,6 +571,9 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
 fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>, role: Role) -> anyhow::Result<u32> {
     let id = next_id(hub);
     let exe = exe_path().to_string_lossy().into_owned();
+    if kind == "grok" {
+        install_grok_hooks(&exe);
+    }
     let pty = native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })?;
     let (prog, args) = command(kind, &exe, resume);
     let mut args = [role.args(kind), args].concat();
@@ -978,6 +985,46 @@ fn discover_sessions(hub: &Shared) {
             a.lock().unwrap().session = Some(s);
         }
     }
+    // Grok's context and spend live in the session directory, not a statusline.
+    let groks: Vec<(Arc<Mutex<Agent>>, String, String)> = hub
+        .lock()
+        .unwrap()
+        .agents
+        .values()
+        .cloned()
+        .filter_map(|a| {
+            let g = a.lock().unwrap();
+            let session = (g.kind == "grok").then(|| g.session.clone()).flatten()?;
+            Some((a.clone(), g.cwd.clone(), session))
+        })
+        .collect();
+    for (a, cwd, session) in groks {
+        let Some(mut report) = grok_vitals(&grok_sessions_dir(&cwd).join(&session)) else { continue };
+        report.session = Some(session);
+        a.lock().unwrap().report = report;
+    }
+}
+
+/// Context, spend and lines changed, from a Grok session directory.
+/// `costUsdTicks` is 10^10 ticks per USD.
+fn grok_vitals(dir: &std::path::Path) -> Option<Report> {
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let signals = read("signals.json");
+    let usage = read("usage.json");
+    if signals.is_none() && usage.is_none() {
+        return None;
+    }
+    let num = |v: &serde_json::Value, k: &str| v.get(k).and_then(|n| n.as_f64());
+    let signals = signals.unwrap_or_default();
+    let usage = usage.unwrap_or_default();
+    Some(Report {
+        model: signals.get("primaryModelId").and_then(|m| m.as_str()).map(str::to_string),
+        ctx: num(&signals, "contextWindowUsage").map(|n| n as f32),
+        cost: usage.get("session").and_then(|s| num(s, "costUsdTicks")).map(|n| (n / 1e10) as f32),
+        added: num(&signals, "agentLinesAdded").map(|n| n as u32),
+        removed: num(&signals, "agentLinesRemoved").map(|n| n as u32),
+        session: None,
+    })
 }
 
 fn recent_entries(dir: &std::path::Path, since: SystemTime) -> Vec<(SystemTime, PathBuf)> {
@@ -1025,17 +1072,98 @@ fn codex_session(cwd: &str, born: SystemTime, claimed: &HashSet<String>) -> Opti
     None
 }
 
-fn grok_session(cwd: &str, born: SystemTime, claimed: &HashSet<String>) -> Option<String> {
+fn grok_home() -> PathBuf {
+    std::env::var_os("GROK_HOME").map(PathBuf::from).unwrap_or_else(|| crate::game::home().join(".grok"))
+}
+
+/// Grok groups sessions by a URL-encoded working directory.
+fn grok_sessions_dir(cwd: &str) -> PathBuf {
     let enc: String = cwd
         .bytes()
         .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
         .collect();
-    let dir = crate::game::home().join(".grok/sessions").join(enc);
+    grok_home().join("sessions").join(enc)
+}
+
+fn grok_session(cwd: &str, born: SystemTime, claimed: &HashSet<String>) -> Option<String> {
+    let dir = grok_sessions_dir(cwd);
     recent_entries(&dir, born)
         .into_iter()
         .filter(|(_, p)| p.is_dir())
         .filter_map(|(_, p)| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .find(|n| !claimed.contains(n))
+}
+
+/// A file path named on an agent's screen, from Claude/Codex edit lines and Grok's
+/// ``Edit `path` `` / ``Write `path` `` titles.
+fn edit_path(line: &str) -> Option<String> {
+    let l = line.trim().trim_start_matches(['•', '●', '⏺', '·', '-', '*', ' ']);
+    // longer prefixes first: "Edited `" must not be read as "Edit `"
+    let path = if let Some(rest) = ["Edited `", "Wrote `", "Edit `", "Write `"].iter().find_map(|p| l.strip_prefix(p)) {
+        rest.split('`').next().unwrap_or("").trim().to_string()
+    } else {
+        let rest = ["Edited ", "Added ", "Updated ", "Created ", "Wrote ", "Deleted ", "Update(", "Write(", "Edit("].iter().find_map(|p| l.strip_prefix(p))?;
+        rest.chars().take_while(|c| !c.is_whitespace() && !"()".contains(*c)).collect()
+    };
+    (!path.is_empty() && (path.contains('/') || path.contains('.'))).then_some(path)
+}
+
+/// What a hook said. A permission prompt is named by its type: the display text changes.
+fn hook_message(v: &serde_json::Value) -> Option<String> {
+    let text = |k: &str| v.get(k).and_then(|m| m.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+    let kind = text("notification_type").or_else(|| text("notificationType"));
+    if kind.as_deref() == Some("permission_prompt") {
+        return kind;
+    }
+    text("message").or(kind)
+}
+
+/// The file an edit tool is about to change. Claude names tools in PascalCase;
+/// Grok's are `write` and `search_replace`, with either `tool_input` or `toolInput`.
+fn edited_file(v: &serde_json::Value) -> Option<String> {
+    let name = v.get("tool_name").or_else(|| v.get("toolName")).and_then(|n| n.as_str())?;
+    if !matches!(name.to_ascii_lowercase().as_str(), "edit" | "write" | "multiedit" | "notebookedit" | "search_replace") {
+        return None;
+    }
+    let input = v.get("tool_input").or_else(|| v.get("toolInput"))?;
+    ["file_path", "path", "notebook_path"].iter().find_map(|k| input.get(*k).and_then(|p| p.as_str()).filter(|s| !s.is_empty()).map(str::to_string))
+}
+
+/// Hooks Grok loads from `~/.grok/hooks/`. `args` runs `command` with no shell.
+/// `empire hook` returns at once when `EMPIRE_AGENT_ID` is unset, so this file
+/// is a no-op for a Grok the empire did not launch.
+fn grok_hooks_json(exe: &str) -> serde_json::Value {
+    let group = |event: &str| {
+        serde_json::json!([{ "hooks": [{ "type": "command", "command": exe, "args": ["hook", event], "timeout": 5 }] }])
+    };
+    serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": group("working"),
+            "PreToolUse": group("working"),
+            "PostToolUse": group("working"),
+            "Notification": [{
+                "matcher": "permission_prompt",
+                "hooks": [{ "type": "command", "command": exe, "args": ["hook", "notify"], "timeout": 5 }],
+            }],
+            "Stop": group("done"),
+            "StopCancelled": group("done"),
+            "SessionStart": group("session"),
+        }
+    })
+}
+
+/// Write `empire.json` beside any other Grok hooks, and only when it changed.
+/// Never touches the player's other hook files. A failure still lets the ship launch.
+fn install_grok_hooks(exe: &str) {
+    let path = grok_home().join("hooks").join("empire.json");
+    let Ok(body) = serde_json::to_string_pretty(&grok_hooks_json(exe)) else { return };
+    let body = format!("{body}\n");
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
+        return;
+    }
+    if std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("."))).is_ok() {
+        let _ = std::fs::write(path, body);
+    }
 }
 
 fn handle(hub: &Shared, req: Req) -> Resp {
@@ -1261,9 +1389,13 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             }
             None => missing(id),
         },
-        Req::Hook { id, event, message, file } => match get(id) {
+        Req::Hook { id, event, message, file, session } => match get(id) {
             Some(a) => {
                 let mut g = a.lock().unwrap();
+                g.hooks = true;
+                if let Some(s) = session.filter(|s| !s.is_empty()) {
+                    g.session = Some(s);
+                }
                 if let Some(f) = file {
                     let f = g.resolve(&f);
                     g.touched.insert(f, Instant::now());
@@ -1414,10 +1546,10 @@ pub fn hook(event: &str) {
     let _ = io::stdin().read_to_string(&mut input);
     let Some(id) = std::env::var("EMPIRE_AGENT_ID").ok().and_then(|s| s.parse().ok()) else { return };
     let v = serde_json::from_str::<serde_json::Value>(&input).unwrap_or_default();
-    let message = v.get("message").and_then(|m| m.as_str()).map(String::from);
-    let edit = matches!(v["tool_name"].as_str(), Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit"));
-    let file = edit.then(|| v["tool_input"]["file_path"].as_str().or(v["tool_input"]["notebook_path"].as_str()).map(String::from)).flatten();
-    let _ = call(&Req::Hook { id, event: event.into(), message, file });
+    let message = hook_message(&v);
+    let file = edited_file(&v);
+    let session = v.get("session_id").or_else(|| v.get("sessionId")).and_then(|s| s.as_str()).map(String::from);
+    let _ = call(&Req::Hook { id, event: event.into(), message, file, session });
 }
 
 /// `empire statusline`: Claude Code's statusline command inside the empire. Reports
@@ -1641,5 +1773,88 @@ mod screenshot_tests {
         // slash commands and menu picks aren't tasks
         a.keys("/clear\r1\r");
         assert_eq!(a.task, "Fix the logs sorting~");
+    }
+
+    #[test]
+    fn grok_launches_inline_and_resumes() {
+        let (prog, args) = command("grok", "/usr/bin/empire", Some("abc"));
+        assert_eq!(prog, "grok");
+        assert_eq!(args, ["--no-alt-screen", "--resume", "abc"]);
+        let (prog, args) = command("grok", "/usr/bin/empire", None);
+        assert_eq!(prog, "grok");
+        assert_eq!(args, ["--no-alt-screen"]);
+    }
+
+    #[test]
+    fn grok_hooks_call_empire_without_a_shell() {
+        let v = grok_hooks_json("/usr/bin/empire");
+        let hooks = &v["hooks"];
+        for (event, arg) in [
+            ("UserPromptSubmit", "working"),
+            ("PreToolUse", "working"),
+            ("PostToolUse", "working"),
+            ("Stop", "done"),
+            ("StopCancelled", "done"),
+            ("SessionStart", "session"),
+        ] {
+            let h = &hooks[event][0]["hooks"][0];
+            assert_eq!(h["type"], "command");
+            assert_eq!(h["command"], "/usr/bin/empire");
+            assert_eq!(h["args"], serde_json::json!(["hook", arg]));
+            assert_eq!(h["timeout"], 5);
+            assert!(hooks[event][0].get("matcher").is_none());
+        }
+        let n = &hooks["Notification"][0];
+        assert_eq!(n["matcher"], "permission_prompt");
+        assert_eq!(n["hooks"][0]["args"], serde_json::json!(["hook", "notify"]));
+    }
+
+    #[test]
+    fn hook_payloads_name_edits_and_permission_prompts() {
+        let write = serde_json::json!({ "toolName": "write", "toolInput": { "file_path": "src/a.rs" } });
+        assert_eq!(edited_file(&write).as_deref(), Some("src/a.rs"));
+        let replace = serde_json::json!({ "tool_name": "search_replace", "tool_input": { "path": "src/b.rs" } });
+        assert_eq!(edited_file(&replace).as_deref(), Some("src/b.rs"));
+        let claude = serde_json::json!({ "tool_name": "Edit", "tool_input": { "file_path": "src/c.rs" } });
+        assert_eq!(edited_file(&claude).as_deref(), Some("src/c.rs"));
+        let notebook = serde_json::json!({ "tool_name": "NotebookEdit", "tool_input": { "notebook_path": "n.ipynb" } });
+        assert_eq!(edited_file(&notebook).as_deref(), Some("n.ipynb"));
+        let shell = serde_json::json!({ "tool_name": "run_terminal_command", "tool_input": { "command": "ls" } });
+        assert_eq!(edited_file(&shell), None);
+        let prompt = serde_json::json!({ "notificationType": "permission_prompt", "message": "Allow this command?" });
+        assert_eq!(hook_message(&prompt).as_deref(), Some("permission_prompt"));
+        let claude_note = serde_json::json!({ "message": "Claude needs your permission" });
+        assert_eq!(hook_message(&claude_note).as_deref(), Some("Claude needs your permission"));
+    }
+
+    #[test]
+    fn screen_edit_lines_include_grok_titles() {
+        assert_eq!(edit_path("Edit `src/a.rs`").as_deref(), Some("src/a.rs"));
+        assert_eq!(edit_path("  • Edited src/a.rs (+3 -1)").as_deref(), Some("src/a.rs"));
+        assert_eq!(edit_path("⏺ Update(src/a.rs)").as_deref(), Some("src/a.rs"));
+        assert_eq!(edit_path("Wrote README").as_deref(), None);
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let writer = Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 };
+        let mut a = new_agent(1, "grok", "/world", writer, 40, 120);
+        a.parser.process(b"Edit `src/a.rs`\r\n");
+        a.scan_edits();
+        assert!(a.touched.keys().any(|k| k.ends_with("src/a.rs")));
+    }
+
+    #[test]
+    fn grok_vitals_read_session_files() {
+        let dir = std::env::temp_dir().join(format!("empire-grok-vitals-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("signals.json"), r#"{"primaryModelId":"grok-4","contextWindowUsage":13,"agentLinesAdded":4,"agentLinesRemoved":1}"#).unwrap();
+        std::fs::write(dir.join("usage.json"), r#"{"session":{"costUsdTicks":1423104000}}"#).unwrap();
+        let report = grok_vitals(&dir).unwrap();
+        assert_eq!(report.model.as_deref(), Some("grok-4"));
+        assert_eq!(report.ctx, Some(13.0));
+        assert_eq!(report.added, Some(4));
+        assert_eq!(report.removed, Some(1));
+        assert!((report.cost.unwrap() - 0.1423104).abs() < 1e-5);
+        assert!(report.session.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(grok_vitals(std::path::Path::new("/no/such/empire-grok-session")).is_none());
     }
 }

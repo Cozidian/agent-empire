@@ -351,7 +351,119 @@ fn star(fb: &mut Fb, (x, y): (f32, f32), r: f32, seed: u32, col: V3, t: f32) {
     circle(fb, x, y, core * (1.5 + rnd(seed ^ 139) * 0.5), col * 0.1);
 }
 
+/// A calm system map at distances where full-size ship effects would overlap.
+fn galaxy_overview(fb: &mut Fb, app: &App, w: &World, l: &Lay) {
+    let scr = |p| l.to_screen(&app.cam, p);
+    for &(i, j) in &w.lanes {
+        let (a, b) = (scr(w.systems[i].wpos), scr(w.systems[j].wpos));
+        fb.line(a.0, a.1, b.0, b.1, v3(0.025, 0.055, 0.08), v3(0.025, 0.055, 0.08));
+    }
+    let selected = app.selected_system(w);
+    for s in &w.systems {
+        let (x, y) = scr(s.wpos);
+        let fleet = app.fleet(w, &Sel::Sys(s.key.clone()));
+        let waiting = fleet.iter().any(|a| a.status == Status::Blocked || !a.war.is_empty());
+        let done = fleet.iter().any(|a| a.status == Status::Done);
+        let col = if waiting { Status::Blocked.color() } else if done { Status::Done.color() } else { s.star };
+        // One small star and a steady status ring, independent of fleet size.
+        orb(fb, x, y, 1.8, s.star * 0.8);
+        if waiting || done { circle(fb, x, y, 4.5, col * 0.28); }
+        if selected.is_some_and(|picked| picked.key == s.key) { overview_reticle(fb, x, y); }
+    }
+    if let Some(p) = w.station {
+        let (x, y) = scr(p);
+        let col = if all_prs(app, w).iter().any(|(_, p)| p.ci == "fail") { ci_color("fail") } else { v3(0.55, 0.7, 0.9) };
+        // A simple diamond: no overlapping PR ships at galaxy scale.
+        for (a, b) in [((0.0, -4.0), (4.0, 0.0)), ((4.0, 0.0), (0.0, 4.0)), ((0.0, 4.0), (-4.0, 0.0)), ((-4.0, 0.0), (0.0, -4.0))] {
+            fb.line(x + a.0, y + a.1, x + b.0, y + b.1, col * 0.55, col * 0.55);
+        }
+        if app.sel == Some(Sel::GitHub) { overview_reticle(fb, x, y); }
+    }
+}
+
+fn overview_reticle(fb: &mut Fb, x: f32, y: f32) {
+    for dx in [-1.0, 1.0] {
+        for dy in [-1.0, 1.0] {
+            fb.line(x + dx * 5.0, y + dy * 7.0, x + dx * 7.0, y + dy * 7.0, TEXT * 0.6, TEXT * 0.6);
+            fb.line(x + dx * 7.0, y + dy * 5.0, x + dx * 7.0, y + dy * 7.0, TEXT * 0.6, TEXT * 0.6);
+        }
+    }
+}
+
+pub struct OverviewLabel {
+    pub target: Sel,
+    pub col: i32,
+    pub row: i32,
+    pub lines: Vec<(String, V3)>,
+}
+
+/// Shared by drawing and picking, so moved labels remain clickable. Prefer full
+/// summaries; in a crowded map, retain names and let zooming reveal the rest.
+pub fn overview_labels(app: &App, w: &World, l: &Lay) -> Vec<OverviewLabel> {
+    let selected = app.selected_system(w);
+    let mut entries = Vec::new();
+    for s in &w.systems {
+        let fleet = app.fleet(w, &Sel::Sys(s.key.clone()));
+        let waiting = fleet.iter().filter(|a| a.status == Status::Blocked).count();
+        let finished = fleet.iter().filter(|a| a.status == Status::Done).count();
+        let working = fleet.iter().filter(|a| a.status == Status::Working).count();
+        let conflicts = fleet.iter().any(|a| !a.war.is_empty());
+        let picked = selected.is_some_and(|picked| picked.key == s.key);
+        let mut lines = vec![
+            (s.name.to_uppercase(), if picked { TEXT } else { s.star * 0.9 }),
+            (format!("{} world{} · {} ship{}", s.planets.len(), if s.planets.len() == 1 { "" } else { "s" }, fleet.len(), if fleet.len() == 1 { "" } else { "s" }), DIM),
+        ];
+        let mut status = Vec::new();
+        if waiting > 0 { status.push(format!("{waiting} waiting")); }
+        if conflicts { status.push("conflict".into()); }
+        if finished > 0 { status.push(format!("{finished} finished")); }
+        if working > 0 && status.is_empty() { status.push(format!("{working} working")); }
+        if !status.is_empty() { lines.push((status.join(" · "), if waiting > 0 || conflicts { v3(1.0, 0.55, 0.4) } else if finished > 0 { Status::Done.color() * 0.8 } else { DIM })); }
+        entries.push((!picked, waiting == 0 && !conflicts, Sel::Sys(s.key.clone()), s.wpos, lines));
+    }
+    if let Some(pos) = w.station {
+        let prs = all_prs(app, w);
+        let fails = prs.iter().filter(|(_, p)| p.ci == "fail").count();
+        let mut lines = vec![("GITHUB".into(), v3(0.6, 0.75, 0.9)), (format!("{} PR{}", prs.len(), if prs.len() == 1 { "" } else { "s" }), DIM)];
+        if fails > 0 { lines.push((format!("{fails} failing"), ci_color("fail"))); }
+        entries.push((app.sel != Some(Sel::GitHub), fails == 0, Sel::GitHub, pos, lines));
+    }
+    entries.sort_by_key(|e| (e.0, e.1));
+    let cw = l.cols - l.pw;
+    let overlaps = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3;
+    // Reserve every node, including the station, before placing any label.
+    let mut occupied: Vec<_> = entries.iter().map(|e| {
+        let (x, y) = l.to_screen(&app.cam, e.3);
+        ((x / 2.0).floor() as i32 - 4, (y / 4.0).floor() as i32 - 2, 9, 5)
+    }).collect();
+    let mut labels = Vec::new();
+    for (_, _, target, pos, mut lines) in entries {
+        let (x, y) = l.to_screen(&app.cam, pos);
+        if x < 0.0 || x >= l.vw || y < l.vy0 || y >= l.vy0 + l.vh { continue; }
+        let (c, r) = ((x / 2.0).floor() as i32, (y / 4.0).floor() as i32);
+        for (text, _) in &mut lines { *text = trunc(text, (cw - 2).clamp(1, 36) as usize); }
+        for full in [true, false] {
+            if !full { lines.truncate(1); }
+            let width = lines.iter().map(|(s, _)| s.chars().count() as i32).max().unwrap_or(1);
+            let height = lines.len() as i32;
+            let candidates = [(c - width / 2, r + 3), (c - width / 2, r - height - 2), (c + 5, r - height / 2), (c - width - 5, r - height / 2)];
+            if let Some((col, row)) = candidates.into_iter().map(|(c, r)| (c.clamp(1, (cw - width - 1).max(1)), r)).find(|&(c, r)| {
+                r >= 1 && r + height < l.rows - 1 && !occupied.iter().any(|&rect| overlaps((c - 1, r, width + 2, height), rect))
+            }) {
+                occupied.push((col - 1, row, width + 2, height));
+                labels.push(OverviewLabel { target: target.clone(), col, row, lines });
+                break;
+            }
+        }
+    }
+    labels
+}
+
 fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
+    if app.cam.z < OVERVIEW_ZOOM {
+        galaxy_overview(fb, app, w, l);
+        return;
+    }
     let cam = &app.cam;
     let z = cam.z;
     let scr = |p: (f32, f32)| l.to_screen(cam, p);
@@ -712,6 +824,14 @@ fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usiz
 }
 
 fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
+    if app.cam.z < OVERVIEW_ZOOM {
+        for label in overview_labels(app, w, l) {
+            for (i, (text, col)) in label.lines.iter().enumerate() {
+                fb.text(label.col, label.row + i as i32, text, *col);
+            }
+        }
+        return;
+    }
     let cam = &app.cam;
     let z = cam.z;
     let cw = l.cols - l.pw;
@@ -1207,8 +1327,13 @@ fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
     fb.panel(0, l.rows - 1, l.cols, 1, BAR);
     let mute = match sound {
         None => "",
-        Some(s) if s.muted.load(Relaxed) => " · m unmute",
-        Some(_) => " · m mute",
+        Some(s) if s.muted.load(Relaxed) => " · m alerts off",
+        Some(_) => " · m alerts on",
+    };
+    let music = match sound {
+        None => "",
+        Some(s) if s.music_muted.load(Relaxed) => "· M music off ",
+        Some(_) => "· M music on ",
     };
     let ctx = match &app.sel {
         Some(Sel::Agent(id)) if app.agent(*id).is_some_and(|a| !a.war.is_empty()) => "⏎ ship card · P give priority · L missions · x decommission · ",
@@ -1219,7 +1344,7 @@ fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
         Some(Sel::GitHub) => "⏎ projects and pull requests · ",
         None => "",
     };
-    let s = format!("{}· {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
+    let s = format!("{}{music}· {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1936,7 +2061,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("1-9", "answer the incoming transmission"),
         ("wasd / drag", "pan        ± / wheel  zoom"),
         ("z / f", "fit galaxy / focus selection"),
-        ("o", "toggle outliner        m  mute"),
+        ("o", "outliner    m  mute alerts    M  mute music"),
         ("q", "leave (agents keep running in the daemon)"),
         ("", ""),
         ("CHAT", ""),

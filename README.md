@@ -37,6 +37,13 @@ surface patterns and axial tilts, tilted colony rings, stellar coronas and occas
 belts, and four ship hull styles. Each folder or ship keeps its look across redraws and reopening
 the galaxy. Ship status colours and development indicators still show the same information.
 
+Zooming far out switches to a **system overview**: one small star per system, quiet connections,
+and world/ship counts with waiting or finished work (including agents on moons). The GitHub
+station becomes a simple diamond with its PR count and failing checks. Labels move or shorten
+to avoid overlapping; ships, rings and effects return when you zoom in. Click a system or its
+label to select it, then press Enter or click it again to zoom in. The outliner still lets you
+select individual worlds and agents at any distance.
+
 | key              | action                                                              |
 | ---------------- | ------------------------------------------------------------------- |
 | `n`              | **colonize**: launch an agent in a folder (pick one, or type a new path and it's created) |
@@ -58,7 +65,14 @@ the galaxy. Ship status colours and development indicators still show the same i
 | `x`              | **decommission** the selected agent (asks first)                    |
 | `↑↓` / `j k`     | move through the outliner                                           |
 | `wasd` / drag    | pan · `±` / wheel zoom · `z` fit galaxy · `f` focus selection        |
-| `o` `m` `?` `q`  | outliner · mute · fleet manual · leave                              |
+| `m` / `M`        | mute alerts / mute background music (Shift+m)                       |
+| `o` `?` `q`      | outliner · fleet manual · leave                                     |
+
+The galaxy plays a quiet, original space-themed score: slow synth pads, low swells and
+sparse bells in a continuous 64-second loop. Press **`M` (Shift+m)** on the galaxy
+to mute or resume the music; **`m`** controls alert sounds independently. The footer
+shows the music state. Music starts on each time you open the galaxy and stops when
+you leave. It is synthesized locally, with no downloads or audio files needed.
 
 Comms opens as a **chat popup** over the galaxy: the agent's terminal, fitted to the popup, and a
 line to write in underneath. `⏎` sends what you wrote (or, with nothing written, presses Enter for
@@ -103,12 +117,12 @@ one):
 | role        | what it does                                                                 |
 | ----------- | ---------------------------------------------------------------------------- |
 | none        | a generalist: does whatever the mission asks                                 |
-| `scout`     | investigates and reports a plan, read-only: Claude runs in plan mode and Codex in its read-only sandbox (other species are only asked) |
+| `scout`     | investigates and reports a plan, read-only: Claude runs in plan mode, Codex in its read-only sandbox, and Grok in plan mode inside the read-only sandbox (other species are only asked) |
 | `builder`   | implements, runs the tests and commits on its world; never pushes            |
 | `inspector` | runs the tests and reviews recent changes; fixes only what's broken          |
 
-Claude gets the standing order as a system prompt, so your mission stays as you wrote it; other
-species get it in front of the mission. A ship keeps its role across upgrades and restarts, and it
+Claude gets the standing order as a system prompt, and Grok as `--rules`, so your mission stays as
+you wrote it; other species get it in front of the mission. A ship keeps its role across upgrades and restarts, and it
 shows in the outliner, on its cards and in its hull: scouts, frigates (builders) and inspectors
 each have their own silhouette.
 
@@ -249,7 +263,8 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
   Claude's only appear after it has talked to the API at least once.
 - **Select a world** for its card: branch, ahead/behind, uncommitted files ("stability"),
   commits, files and main language, population, turns finished, lines changed, spend, and how
-  full each Claude's context is.
+  full each Claude or Grok's context is. Grok's context and spend come from its session files;
+  it has no rate-limit window in the resource bar.
 - **Select a system** for the totals across its worlds: capital, unrest (uncommitted work) and
   trade (commits not pushed yet).
 
@@ -257,6 +272,10 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
 
 - **Claude Code** is launched with injected hooks (`--settings`) that call `empire hook …`, so
   it reports working, done and needs-permission itself.
+- **Grok** gets the same reports from `~/.grok/hooks/empire.json`, written when a Grok ship
+  launches. The file does nothing unless empire started that Grok. Until the folder is trusted,
+  the screen is used instead: a live `send a message to interrupt` hint means working. Context
+  and spend are read from the session directory. Empire does not pass `--trust`.
 - **Everything else** is read from the screen: a live `esc to interrupt` hint means working,
   approval phrasing near the bottom ("Do you want to proceed?", "Would you like to run…",
   "trust this folder") means blocked, and quiet after work means done. Agents whose idle
@@ -266,7 +285,7 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
 
 - `daemon.rs`: PTYs (`portable-pty`), terminal emulation (`vt100`) including answers to the
   terminal queries TUIs block on (cursor position, device attributes, colours), status
-  detection, socket server, Claude hooks.
+  detection, socket server, Claude and Grok hooks.
 - `proto.rs` / `client.rs`: JSON-lines protocol, plus background threads for the agent list,
   live screen streaming and an ordered command queue.
 - `game.rs`: galaxy model, camera, input, colonize/deploy/decommission flows.

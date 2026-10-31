@@ -25,7 +25,7 @@ pub enum Req {
     },
     /// The player looked at this agent: a finished turn is no longer news.
     Seen { id: u32 },
-    /// Reported by agent hooks (e.g. Claude Code's) from inside the agent.
+    /// Reported by agent hooks (Claude Code, Grok) from inside the agent.
     Hook {
         id: u32,
         event: String,
@@ -33,12 +33,15 @@ pub enum Req {
         /// The file an edit tool is about to change.
         #[serde(default)]
         file: Option<String>,
+        /// The agent's session id, when the hook payload carries one.
+        #[serde(default)]
+        session: Option<String>,
     },
     /// Settle a border conflict: `id` keeps the contested files, its rivals are told to leave them.
     Priority { id: u32 },
     /// Pick an option of the question an agent is asking (`key` as listed in its `Ask`).
     Answer { id: u32, key: String },
-    /// What an agent tells us about itself (Claude Code, through its statusline).
+    /// What an agent tells us about itself (Claude through its statusline, Grok from its session files).
     Report { id: u32, report: Report },
     Shutdown,
     /// A new mission for the world at `cwd`: launch a ship with it right away, or queue it

@@ -1367,6 +1367,15 @@ impl App {
         }
     }
 
+    /// Keep a selected ship or moon associated with its star in the distant overview.
+    pub fn selected_system<'a>(&self, w: &'a World) -> Option<&'a System> {
+        if let Some(Sel::Sys(k)) = &self.sel {
+            return w.systems.iter().find(|s| &s.key == k);
+        }
+        let key = self.sel_planet()?;
+        w.planets.iter().position(|p| p.key == key).and_then(|i| w.system_of(i))
+    }
+
     /// The planet (folder) the selection belongs to.
     pub fn sel_planet(&self) -> Option<String> {
         match self.sel.as_ref()? {
@@ -1627,7 +1636,7 @@ impl App {
                 if let Some(s) = w.systems.iter().find(|s| s.key == k) {
                     let r = s.orbits.last().copied().unwrap_or(40.0) + 40.0;
                     (self.cam.tx, self.cam.ty) = s.wpos;
-                    self.cam.tz = (l.vw / (2.0 * r)).min(l.vh / (1.2 * r)).clamp(0.3, 4.0);
+                    self.cam.tz = (l.vw / (2.0 * r)).min(l.vh / (1.2 * r)).clamp(OVERVIEW_ZOOM + 0.1, 4.0);
                 }
             }
             None => {}
@@ -1869,6 +1878,9 @@ fn history_file() -> PathBuf {
 /// The most worlds kept on the map from history.
 const HISTORY_WORLDS: usize = 40;
 
+/// Below this scale, individual ships and worlds no longer have room on screen.
+pub const OVERVIEW_ZOOM: f32 = 0.45;
+
 /// `s`, cut to `n` chars with an ellipsis.
 pub fn clip(s: &str, n: usize) -> String {
     let s = s.lines().next().unwrap_or("");
@@ -1920,7 +1932,7 @@ pub fn run() -> io::Result<()> {
     crate::daemon::ensure_running()?;
     let stale = crate::daemon::ensure_current();
     let client = Client::start();
-    let sound = Sound::start();
+    let sound = Sound::start(true);
 
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
@@ -2718,6 +2730,7 @@ fn handle(
         KeyCode::Enter
             if let Some(id) = app.transmission().map(|a| a.id)
                 && app.sel != Some(Sel::GitHub)
+                && !(app.cam.z < OVERVIEW_ZOOM && matches!(app.sel, Some(Sel::Sys(_))))
                 && !matches!(app.sel, Some(Sel::Agent(s)) if s != id) =>
         {
             app.sel = Some(Sel::Agent(id));
@@ -2852,6 +2865,12 @@ fn handle(
         KeyCode::Char('o') => {
             app.panel = !app.panel;
             app.bg_key = (0, 0, 0);
+        }
+        KeyCode::Char('M') => {
+            if let Some(s) = sound {
+                let muted = !s.music_muted.fetch_xor(true, Relaxed);
+                app.toast(if muted { "music muted" } else { "music on" }, t);
+            }
         }
         KeyCode::Char('m') => {
             if let Some(s) = sound {
@@ -3046,6 +3065,16 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
         ((sx - px).powi(2) + (sy - py).powi(2)).sqrt()
     };
     let nearest = |c: Vec<(f32, f32, Sel)>| c.into_iter().filter(|(d, r, _)| d < r).min_by(|a, b| a.0.total_cmp(&b.0)).map(|c| c.2);
+    if z < OVERVIEW_ZOOM {
+        // Only the visible system and station markers are targets at this scale.
+        let mut nodes: Vec<_> = w.systems.iter().map(|s| (dist(s.wpos), 8.0, Sel::Sys(s.key.clone()))).collect();
+        if let Some(p) = w.station { nodes.push((dist(p), 8.0, Sel::GitHub)); }
+        return nearest(nodes).or_else(|| draw::overview_labels(app, w, l).into_iter().find_map(|label| {
+            let width = label.lines.iter().map(|(s, _)| s.chars().count()).max().unwrap_or(0) as f32;
+            (px >= label.col as f32 * 2.0 && px < (label.col as f32 + width) * 2.0
+                && py >= label.row as f32 * 4.0 && py < (label.row as f32 + label.lines.len() as f32) * 4.0).then_some(label.target)
+        }));
+    }
     let ships = app.agents.iter().filter(|a| a.dying.is_none()).map(|a| (dist(a.wpos), 6.0 * z.clamp(0.7, 2.2), Sel::Agent(a.id))).collect();
     let planets = w.planets.iter().map(|p| (dist(p.wpos), (p.r * z).max(4.0) + 3.0, Sel::Planet(p.key.clone()))).collect();
     let stars = w.systems.iter().map(|s| (dist(s.wpos), (9.0 * z).max(4.0) + 4.0, Sel::Sys(s.key.clone()))).collect();
@@ -3104,6 +3133,109 @@ mod screenshot_tests {
         assert!(rows.iter().any(|r| r.contains("queue it")));
         assert!(rows.iter().any(|r| r.contains("Ctrl+V") && r.contains("Ctrl+X")));
         assert!(rows.iter().any(|r| r.contains("give orders")));
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+
+    fn fixture() -> (App, World, Lay) {
+        let mut app = App::new();
+        app.history.clear();
+        app.online = true;
+        for (id, cwd, status) in [(1, "/empire/api", Status::Working), (2, "/empire/web", Status::Done), (3, "/moons/patch", Status::Blocked)] {
+            let mut a = ship_card_tests::ship(id, false);
+            a.cwd = cwd.into();
+            a.status = status;
+            app.agents.push(a);
+        }
+        app.survey.worlds.insert("/moons/patch".into(), survey::World { host: Some("/empire/api".into()), ..Default::default() });
+        let w = app.world(4.0, 0.0);
+        app.cam.z = 0.2;
+        let l = Lay::new(&Fb::new(100, 36), false);
+        (app, w, l)
+    }
+
+    #[test]
+    fn distant_system_can_be_picked_without_hitting_its_hidden_ships() {
+        let (mut app, w, l) = fixture();
+        app.agents[0].wpos = w.systems[0].wpos;
+        let point = l.to_screen(&app.cam, w.systems[0].wpos);
+        assert_eq!(pick_at(&app, &w, &l, point), Some(Sel::Sys("/empire".into())));
+        app.cam.z = 1.0;
+        let point = l.to_screen(&app.cam, app.agents[0].wpos);
+        assert_eq!(pick_at(&app, &w, &l, point), Some(Sel::Agent(1)));
+    }
+
+    #[test]
+    fn enter_on_a_distant_system_zooms_even_when_an_agent_is_asking() {
+        let (mut app, w, l) = fixture();
+        app.agents[2].ask = Some(Ask { question: "Allow this?".into(), options: vec![crate::proto::Choice { key: "y".into(), label: "Yes".into() }], ..Default::default() });
+        app.sel = Some(Sel::Sys("/empire".into()));
+        handle(&mut app, &w, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), 4.0, &mut None);
+        assert!(matches!(app.mode, Mode::Galaxy));
+        assert!(app.cam.tz >= 0.5);
+    }
+
+    #[test]
+    fn overview_shows_world_and_ship_totals_including_attention_on_moons() {
+        let (mut app, w, l) = fixture();
+        let mut fb = Fb::new(100, 36);
+        draw::frame(&mut fb, &mut app, &w, &l, 4.0, None);
+        let text = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("2 worlds · 3 ships"));
+        assert!(text.contains("1 waiting"));
+        assert!(text.contains("1 finished"));
+    }
+
+    #[test]
+    fn entering_a_large_system_always_reveals_its_worlds() {
+        let (mut app, mut w, l) = fixture();
+        w.systems[0].orbits.push(600.0);
+        app.sel = Some(Sel::Sys(w.systems[0].key.clone()));
+        app.activate(&w, &l, &Client::isolated());
+        assert!(app.cam.tz >= 0.5, "enter must leave the distant overview");
+    }
+
+    #[test]
+    fn distant_labels_are_clickable_and_do_not_cover_each_other() {
+        let (mut app, mut w, l) = fixture();
+        for i in 1..8 {
+            w.systems.push(System { key: format!("/system{i}"), name: format!("system {i}"), wpos: (i as f32 * 60.0 - 240.0, (i % 3) as f32 * 80.0 - 80.0), planets: vec![], orbits: vec![], star: s3(0.8) });
+        }
+        w.station = Some((260.0, 80.0));
+        app.sel = Some(Sel::Agent(3)); // the blocked agent is on a moon
+        let labels = draw::overview_labels(&app, &w, &l);
+        assert!(!labels.is_empty());
+        assert_eq!(labels[0].target, Sel::Sys("/empire".into()));
+        for (i, label) in labels.iter().enumerate() {
+            let width = label.lines.iter().map(|(s, _)| s.chars().count() as i32).max().unwrap();
+            let point = (label.col as f32 * 2.0 + 1.0, label.row as f32 * 4.0 + 2.0);
+            assert_eq!(pick_at(&app, &w, &l, point), Some(label.target.clone()));
+            assert!(label.col >= 0 && label.col + width <= l.cols - l.pw);
+            for other in labels.iter().skip(i + 1) {
+                let ow = other.lines.iter().map(|(s, _)| s.chars().count() as i32).max().unwrap();
+                assert!(label.col + width <= other.col || other.col + ow <= label.col
+                    || label.row + label.lines.len() as i32 <= other.row || other.row + other.lines.len() as i32 <= label.row);
+            }
+        }
+    }
+
+    #[test]
+    fn distant_graphics_do_not_accumulate_ship_effects_but_close_graphics_keep_them() {
+        let (mut app, w, l) = fixture();
+        for zoom in [0.12, 0.3, 1.0] {
+            app.cam.z = zoom;
+            app.fx.clear();
+            let mut before = Fb::new(100, 36);
+            draw::frame(&mut before, &mut app, &w, &l, 4.0, None);
+            app.fx.push(Fx::Ring { x: 0.0, y: 0.0, t0: 3.5, col: s3(1.0), speed: 40.0, dur: 2.0 });
+            let mut after = Fb::new(100, 36);
+            draw::frame(&mut after, &mut app, &w, &l, 4.0, None);
+            if zoom < 0.45 { assert_eq!(before.px, after.px); }
+            else { assert_ne!(before.px, after.px); }
+        }
     }
 }
 

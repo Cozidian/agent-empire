@@ -50,7 +50,7 @@ fn main() -> io::Result<()> {
         }
         Some("stop") => call(&Req::Shutdown).map(|_| println!("daemon stopped; all agents recalled")),
         Some("sounds") => {
-            let Some(s) = sound::Sound::start() else {
+            let Some(s) = sound::Sound::start(false) else {
                 println!("no audio device");
                 return Ok(());
             };
