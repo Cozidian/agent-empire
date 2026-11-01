@@ -928,11 +928,11 @@ const REFIT_GRACE: Duration = Duration::from_millis(if cfg!(test) { 600 } else {
 /// The session a ship would be refitted on: only a species that resumes a session by id can be
 /// relaunched without losing its work, and only once it has one.
 fn refit_session(kind: &str, session: Option<&str>) -> Result<String, String> {
-    let s = session.filter(|s| !s.is_empty()).ok_or("no session to resume yet: let it finish a turn first")?;
-    if !command(kind, "", Some(s)).1.iter().any(|a| a == s) {
+    // the species first: one that can't resume will never get a session worth waiting for
+    if !command(kind, "", Some("\0probe")).1.iter().any(|a| a == "\0probe") {
         return Err(format!("{kind} can't resume a session, so it can't be refitted in place"));
     }
-    Ok(s.into())
+    Ok(session.filter(|s| !s.is_empty()).ok_or("no session to resume yet: let it finish a turn first")?.into())
 }
 
 /// Carry out a ship's refit and record how it went.
@@ -2141,6 +2141,8 @@ mod refit_tests {
         assert!(matches!(handle(&hub, refit_req(2, true)), Resp::Err { msg } if msg.contains("can't resume")));
         assert_eq!(state(&cursor), Some("unsupported".into()));
         assert!(refit_session("shell", Some("s")).is_err());
+        // a species that can't resume says so, rather than asking to wait for a session it'll never get
+        assert!(refit_session("shell", None).is_err_and(|e| e.contains("can't resume")));
         for kind in ["claude", "codex", "grok"] {
             assert_eq!(refit_session(kind, Some("s")).as_deref(), Ok("s"));
         }
