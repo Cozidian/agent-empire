@@ -64,7 +64,7 @@ select individual worlds and agents at any distance.
 | `T`              | strike finished missions on the selected world from its log         |
 | `S`              | the **situation log** in full: filter it, read an entry's details   |
 | `x`              | **decommission** the selected agent (asks first)                    |
-| `↑↓` / `j k`     | move through the outliner                                           |
+| `↑↓` / `j k`     | move through the outliner (the wheel scrolls it and the log beneath) |
 | `wasd` / drag    | pan · `±` / wheel zoom · `z` fit galaxy · `f` focus selection        |
 | `m` / `M`        | mute alerts / mute background music (Shift+m)                       |
 | `o` `?` `q`      | outliner · fleet manual · leave                                     |

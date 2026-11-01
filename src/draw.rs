@@ -1380,8 +1380,13 @@ fn outliner_view(app: &App, w: &World, l: &Lay) -> (Vec<Sel>, i32, i32, usize) {
     let log_h = ((l.rows - 6) / 3).clamp(3, 10);
     let first = 3;
     let vis = (l.rows - 2 - log_h - 2 - first).max(1);
-    let si = app.sel.as_ref().and_then(|s| rows.iter().position(|r| r == s)).unwrap_or(0);
-    let off = si.saturating_sub(vis as usize - 1);
+    let max = rows.len().saturating_sub(vis as usize);
+    let off = app.out_off.min(max);
+    // once the selection moves away from where the wheel left it, keep it in view
+    let off = match app.sel.as_ref().and_then(|s| rows.iter().position(|r| r == s)) {
+        Some(si) if app.out_pin != app.sel => off.clamp(si.saturating_sub(vis as usize - 1), si),
+        _ => off,
+    };
     (rows, first, vis, off)
 }
 
@@ -1389,6 +1394,26 @@ pub fn panel_hit(app: &App, w: &World, l: &Lay, row: i32) -> Option<Sel> {
     let (rows, first, vis, off) = outliner_view(app, w, l);
     let k = row - first;
     (k >= 0 && k < vis).then(|| rows.get(off + k as usize).cloned()).flatten()
+}
+
+/// Situation log rows in the side panel: (first entry's screen row, visible count, scroll offset).
+fn panel_log_view(app: &App, w: &World, l: &Lay) -> (i32, usize, usize) {
+    let (_, first, vis, _) = outliner_view(app, w, l);
+    let r0 = first + vis + 3;
+    let n = (l.rows - 2 - r0).max(0) as usize;
+    (r0, n, app.log_off.min(app.log.len().saturating_sub(n)))
+}
+
+/// Wheel over the side panel: scroll whichever list is under the row by `d` lines.
+pub fn panel_scroll(app: &mut App, w: &World, l: &Lay, row: i32, d: isize) {
+    let (_, first, vis, off) = outliner_view(app, w, l);
+    if row < first + vis {
+        app.out_off = off.saturating_add_signed(d);
+        app.out_pin = app.sel.clone();
+    } else {
+        let (_, _, off) = panel_log_view(app, w, l);
+        app.log_off = off.saturating_add_signed(d);
+    }
 }
 
 fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
@@ -1466,8 +1491,9 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     let x = seg(fb, x0 + 2, ly, "SITUATION LOG", pw, v3(0.6, 0.85, 1.0), Some(PANEL));
     seg(fb, x + 1, ly, "S", 1, DIM * 0.7, Some(PANEL));
     seg(fb, x0 + 2, ly + 1, &"─".repeat(pw as usize - 3), pw, v3(0.1, 0.2, 0.26), Some(PANEL));
-    for (k, e) in app.log.iter().enumerate().take((l.rows - 2 - ly - 2).max(0) as usize) {
-        let r = ly + 2 + k as i32;
+    let (r0, n, loff) = panel_log_view(app, w, l);
+    for (k, e) in app.log.iter().skip(loff).enumerate().take(n) {
+        let r = r0 + k as i32;
         let x = seg(fb, x0 + 2, r, &e.clock, 5, DIM * 0.8, Some(PANEL)) + 1;
         seg(fb, x, r, &trunc(&e.msg, (x0 + pw - 1 - x) as usize), x0 + pw - 1 - x, e.col, Some(PANEL));
     }
@@ -1475,12 +1501,12 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
 /// The situation log entry under a row of the side panel, if any (its heading means the newest).
 pub fn panel_log_hit(app: &App, w: &World, l: &Lay, row: i32) -> Option<u64> {
-    let (_, first, vis, _) = outliner_view(app, w, l);
-    let k = row - (first + vis + 3);
+    let (r0, _, off) = panel_log_view(app, w, l);
+    let k = row - r0;
     if k < -2 || row >= l.rows - 2 {
         return None;
     }
-    app.log.get(k.max(0) as usize).map(|e| e.id)
+    app.log.get(if k < 0 { 0 } else { off + k as usize }).map(|e| e.id)
 }
 
 fn planet_color(p: &Planet) -> V3 {
@@ -2114,7 +2140,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("1-9", "answer the incoming transmission"),
         ("wasd / drag", "pan        ± / wheel  zoom"),
         ("z / f", "fit galaxy / focus selection"),
-        ("o", "outliner    m  mute alerts    M  mute music"),
+        ("o", "outliner (wheel scrolls)    m  mute alerts    M  mute music"),
         ("q", "leave (agents keep running in the daemon)"),
         ("", ""),
         ("CHAT", ""),
