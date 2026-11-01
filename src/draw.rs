@@ -23,6 +23,10 @@ const TERM_BG: V3 = v3(0.043, 0.059, 0.102);
 
 pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Option<&Sound>) {
     fb.clear_text();
+    if let Mode::Planet(v) = &app.mode {
+        planet_view(fb, app, w, v, l, t);
+        return;
+    }
     if let Mode::Comms(id) = app.mode {
         top_bar(fb, app, w, l, t);
         comms(fb, app, l, t, id);
@@ -72,7 +76,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Build { planet, sel } => build_menu(fb, app, planet, *sel, l),
         Mode::Log { world, sel, open } => mission_log(fb, app, world, *sel, open, l, t),
         Mode::Dock { moon } => dock(fb, app, moon, l),
-        Mode::Chat { id, text } => chat(fb, app, *id, text, l, t),
+        Mode::Chat { id, text, attachments, sending } => chat(fb, app, *id, text, attachments, *sending, l, t),
         _ => {}
     }
     if !app.online {
@@ -643,6 +647,12 @@ fn trunc(s: &str, w: usize) -> String {
         t.push('…');
         t
     }
+}
+
+/// Keep the file or final folder visible when its parents do not fit.
+fn path_tail(s: &str, w: usize) -> String {
+    if s.chars().count() <= w { s.into() }
+    else { format!("…{}", s.chars().skip(s.chars().count().saturating_sub(w.saturating_sub(1))).collect::<String>()) }
 }
 
 fn pad(s: &str, w: usize) -> String {
@@ -1364,8 +1374,8 @@ fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
     let ctx = match &app.sel {
         Some(Sel::Agent(id)) if app.agent(*id).is_some_and(|a| !a.war.is_empty()) => "⏎ ship card · P give priority · L missions · x decommission · ",
         Some(Sel::Agent(_)) => "⏎ ship card · t mission · L missions · e deploy here · x decommission · ",
-        Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ comms · t mission · L missions · D dock · e deploy here · ",
-        Some(Sel::Planet(_)) => "⏎ comms · r needs · t mission · B build · L missions · b fleet · u moon · e deploy · ",
+        Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ land · t mission · L missions · D dock · e deploy here · ",
+        Some(Sel::Planet(_)) => "⏎ land · r needs · t mission · B build · L missions · b fleet · u moon · e deploy · ",
         Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
         Some(Sel::GitHub) => "⏎ projects and pull requests · ",
         None => "",
@@ -1550,7 +1560,7 @@ fn colonize(fb: &mut Fb, app: &App, c: &Colonize, l: &Lay, t: f32) {
     let (x, y, w, h) = centered(l, 72, 17);
     let accent = v3(0.45, 0.85, 1.0);
     frame_box(fb, x, y, w, h, "◆ COLONIZE A NEW WORLD", accent);
-    seg(fb, x + 3, y + 2, "Pick a folder for the new colony, or type a new path to found one.", w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + 2, "Type a path: fuzzy matches ignore case. Or name a new folder.", w - 6, DIM, Some(BOX));
     let row = y + 4;
     let x1 = seg(fb, x + 3, row, "› ", 2, accent, Some(BOX));
     let room = w - 8;
@@ -1569,16 +1579,19 @@ fn colonize(fb: &mut Fb, app: &App, c: &Colonize, l: &Lay, t: f32) {
         let (m, col) = if exists { ("an established world — agents will join its orbit", v3(0.4, 0.9, 0.6)) } else { ("✦ uncharted space — this folder will be created", v3(1.0, 0.8, 0.4)) };
         seg(fb, x + 5, row + 2, m, w - 8, col, Some(BOX));
     }
-    for (k, comp) in c.comps.iter().enumerate().take(7) {
+    let selected = c.comp_i.saturating_sub(1) % c.comps.len().max(1);
+    let first = selected.saturating_sub(5);
+    for (k, comp) in c.comps.iter().enumerate().skip(first).take(6) {
         let hot = c.comp_i > 0 && (c.comp_i - 1) % c.comps.len() == k;
-        seg(fb, x + 5, row + 2 + k as i32, &trunc(comp, (w - 8) as usize), w - 8, if hot { TEXT } else { DIM }, Some(if hot { SELBG } else { BOX }));
+        seg(fb, x + 5, row + 2 + (k - first) as i32, &trunc(comp, (w - 8) as usize), w - 8, if hot { TEXT } else { DIM }, Some(if hot { SELBG } else { BOX }));
     }
     species(fb, app, x + 3, y + h - 5, c.kind);
+    seg(fb, x + 3, y + h - 4, "Ctrl/Alt+Backspace or Ctrl+W: erase path segment", w - 6, DIM, Some(BOX));
     if c.mkdir {
         let m = format!("found new world at {}?  press ⏎ again", c.path.s.trim());
         seg(fb, x + 3, y + h - 3, &trunc(&m, (w - 6) as usize), w - 6, v3(1.0, 0.8, 0.4), Some(BOX));
     }
-    seg(fb, x + 3, y + h - 2, "⏎ launch · ⇥ complete · ↑↓ species · esc cancel", w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + h - 2, "⏎ launch · Tab/⇧Tab match · ↑↓ species · esc cancel", w - 6, DIM, Some(BOX));
 }
 
 fn expand_path(p: &str) -> String {
@@ -1663,6 +1676,103 @@ fn actions(fb: &mut Fb, app: &App, planet: &str, sel: usize, l: &Lay) {
         seg(fb, x + 6, y + 4 + (acts.len() + i) as i32, &clip(&n.label, (w - 10) as usize), w - 10, n.col * 0.8, Some(BOX));
     }
     seg(fb, x + 3, y + h - 2, "1-9 / ⏎ act · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
+}
+
+/// Shared cell geometry for the landed view and its mouse targets.
+pub struct PlanetLayout {
+    pub split: i32,
+    pub y: i32,
+    pub step: i32,
+    pub buildings: usize,
+    pub files: usize,
+    pub preview_y: i32,
+    pub preview_rows: i32,
+    pub width: i32,
+}
+
+impl PlanetLayout {
+    pub fn new(l: &Lay) -> Self {
+        let split = (l.cols / 3).clamp(22, 38).min(l.cols / 2);
+        let y = 6;
+        let step = if l.rows >= 27 { 2 } else { 1 };
+        let buildings = ((l.rows - y - 3) / step).clamp(1, 8) as usize;
+        let files = ((l.rows - 14) / 3).clamp(1, 7) as usize;
+        let preview_y = y + files as i32 + 2;
+        Self { split, y, step, buildings, files, preview_y, preview_rows: (l.rows - preview_y - 3).max(1), width: (l.cols - split - 4).max(1) }
+    }
+}
+
+fn planet_view(fb: &mut Fb, app: &App, w: &World, v: &PlanetView, l: &Lay, t: f32) {
+    fb.px.fill(PANEL);
+    fb.panel(0, 0, l.cols, 4, BAR);
+    let accent = KINDS[v.sel].color();
+    seg(fb, 2, 0, "‹ Esc galaxy", l.cols - 4, DIM, Some(BAR));
+    seg(fb, 2, 1, &format!("PLANET  {}", base_name(&v.key)), l.cols - 17, TEXT, Some(BAR));
+    seg(fb, 2, 2, &tilde(&v.key), l.cols - 17, DIM, Some(BAR));
+    if let Some(p) = w.planet(&v.key) {
+        for row in 0..4 {
+            for col in (l.cols - 13).max(0)..l.cols { fb.txt[(row * l.cols + col) as usize] = None; }
+        }
+        sphere(fb, l.cols as f32 * 2.0 - 15.0, 8.0, 6.0, p, (-1.0, -0.5), t);
+    }
+    if l.cols < 48 || l.rows < 18 {
+        seg(fb, 2, 6, "Enlarge the terminal to browse buildings.", l.cols - 4, TEXT, None);
+        return;
+    }
+    let g = PlanetLayout::new(l);
+    fb.panel(g.split, 4, 1, l.rows - 6, BAR);
+    seg(fb, 2, 4, if v.focus == 0 { "▸ BUILDINGS" } else { "  BUILDINGS" }, g.split - 4, accent, None);
+    let start = v.sel.saturating_sub(g.buildings - 1);
+    for (i, k) in KINDS.iter().enumerate().skip(start).take(g.buildings) {
+        let y = g.y + (i - start) as i32 * g.step;
+        let built = v.built.iter().find(|b| b.kind == *k);
+        let bg = if i == v.sel { SELBG } else { PANEL };
+        fb.panel(1, y, g.split - 2, g.step, bg);
+        let mark = if built.is_some() { k.glyph() } else { '·' };
+        seg(fb, 2, y, &format!("{} {mark} {}", i + 1, k.name()), g.split - 4, if i == v.sel { k.color() } else { TEXT }, Some(bg));
+        if g.step == 2 {
+            seg(fb, 4, y + 1, k.what(), g.split - 6, DIM, Some(bg));
+        }
+    }
+    if l.rows >= 30 {
+        if let Some(p) = w.planet(&v.key) {
+            let cy = (l.rows as f32 - 6.0) * 4.0;
+            sphere(fb, g.split as f32, cy, 12.0, p, (-1.0, -0.5), t);
+            spires(fb, app, p, (g.split as f32, cy), 12.0, t);
+        }
+    }
+    let x = g.split + 2;
+    let kind = KINDS[v.sel];
+    let count = v.building().map_or("empty plot".into(), |b| format!("{} built", b.count));
+    seg(fb, x, 4, &format!("{}{} · {count}", if v.focus == 1 { "▸ " } else { "" }, kind.what()), g.width, accent, None);
+    let start = v.file.saturating_sub(g.files - 1);
+    if v.files().is_empty() {
+        seg(fb, x, g.y, "No files yet", g.width, DIM, None);
+        seg(fb, x, g.y + 1, kind.about(), g.width, DIM, None);
+    }
+    for (i, path) in v.files().iter().enumerate().skip(start).take(g.files) {
+        let y = g.y + (i - start) as i32;
+        let bg = if i == v.file { SELBG } else { PANEL };
+        fb.panel(x, y, g.width, 1, bg);
+        // retain the filename when a skill's parent path is wider than the pane
+        let label = path_tail(path, (g.width - 2) as usize);
+        seg(fb, x, y, &format!("{} {label}", if i == v.file { '›' } else { ' ' }), g.width, TEXT, Some(bg));
+    }
+    let title = v.path().unwrap_or_else(|| "Construction plot".into());
+    seg(fb, x, g.preview_y - 1, &format!("{}{}", if v.focus == 2 { "▸ " } else { "  " }, path_tail(&title, (g.width - 2) as usize)), g.width, accent, None);
+    let lines = v.lines(g.width as usize);
+    let scroll = v.scroll.min(lines.len().saturating_sub(g.preview_rows as usize));
+    for (i, line) in lines.iter().skip(scroll).take(g.preview_rows as usize).enumerate() {
+        seg(fb, x, g.preview_y + i as i32, line, g.width, TEXT, None);
+    }
+    seg(fb, x, l.rows - 3, &format!("{} · {} files · lines {}–{} / {}", if v.building().is_some() { "B renovate" } else { "B construct" }, v.files().len(), scroll + 1, (scroll + g.preview_rows as usize).min(lines.len()), lines.len()), g.width, DIM, None);
+    fb.panel(0, l.rows - 2, l.cols, 2, BAR);
+    let keys = if l.cols >= 60 { "↑↓ choose · Tab pane · 1–8 building · B build/renovate" } else { "↑↓ choose · Tab pane · B build · Esc back" };
+    seg(fb, 2, l.rows - 2, keys, l.cols - 4, TEXT, Some(BAR));
+    seg(fb, 2, l.rows - 1, "PgUp/Dn read · R refresh · c comms", l.cols - 4, DIM, Some(BAR));
+    if let Some((msg, at)) = &app.toast && t - at < 3.2 {
+        seg(fb, 2, 3, msg, l.cols - 4, v3(0.6, 0.95, 0.7), Some(BAR));
+    }
 }
 
 /// A world's structures: what stands there, and what can still be built.
@@ -2123,7 +2233,8 @@ fn help(fb: &mut Fb, l: &Lay) {
     let lines = [
         ("GALAXY", ""),
         ("↑↓ / j k", "select in the outliner"),
-        ("⏎ / click twice", "a ship's card: comms, missions, priority, decommission"),
+        ("⏎ / click twice", "planet: land and browse buildings; ship: open its card"),
+        ("ON A PLANET", "↑↓ select · Tab pane · B build · PgUp/Dn read · Esc leave"),
         ("⇥", "next agent that needs you"),
         ("C", "commander: your attention queue across all systems"),
         ("n", "colonize: launch an agent in a folder (new or existing)"),
@@ -2226,12 +2337,18 @@ pub fn chat_box(l: &Lay) -> (i32, i32, i32, i32) {
 
 /// The agent's terminal size inside the chat popup: frame, then a rule, the line you
 /// write in and the hints below it.
-pub fn chat_term(l: &Lay) -> (i32, i32) {
+fn chat_input_rows(l: &Lay, text: &Line) -> i32 {
     let (_, _, w, h) = chat_box(l);
-    (w - 2, h - 5)
+    let rows = layout(&text.s, (w - 4).max(1)).last().map_or(1, |&(_, r)| r + 1);
+    rows.clamp(1, 4.min((h - 7).max(1)))
 }
 
-fn chat(fb: &mut Fb, app: &App, id: u32, text: &Line, l: &Lay, t: f32) {
+pub fn chat_terminal(l: &Lay, text: &Line, images: usize) -> (i32, i32, i32, i32) {
+    let (x, y, w, h) = chat_box(l);
+    (x + 1, y + 1, w - 2, (h - 4 - chat_input_rows(l, text) - i32::from(images > 0)).max(1))
+}
+
+fn chat(fb: &mut Fb, app: &App, id: u32, text: &Line, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
     let a = app.agents.iter().find(|a| a.id == id);
     let accent = a.map_or(DIM, |a| a.status.color());
     let (x, y, w, h) = chat_box(l);
@@ -2240,16 +2357,27 @@ fn chat(fb: &mut Fb, app: &App, id: u32, text: &Line, l: &Lay, t: f32) {
         None => "◆ COMMS".into(),
     };
     frame_box(fb, x, y, w, h, &title, accent);
-    let (iw, ih) = chat_term(l);
+    let (_, _, iw, ih) = chat_terminal(l, text, attachments.len());
     let back = term(fb, app, (x + 1, y + 1, iw, ih), accent, t, false);
-    seg(fb, x + 1, y + h - 4, &"─".repeat(iw as usize), iw, accent * 0.4, Some(BOX));
-    field(fb, x + 2, y + h - 3, w - 4, text, accent, t);
+    let rule = y + 1 + ih;
+    seg(fb, x + 1, rule, &"─".repeat(iw as usize), iw, accent * 0.4, Some(BOX));
+    if let Some((_, s)) = &app.screen && s.history > 0 {
+        let thumb = y + 1 + ((ih - 1) as usize * (s.history - s.scroll.min(s.history)) / s.history) as i32;
+        for row in y + 1..y + 1 + ih { fb.put_bg(x + w - 1, row, if row == thumb { '█' } else { '│' }, if row == thumb { TEXT } else { DIM * 0.5 }, Some(BOX)); }
+    }
+    if !attachments.is_empty() {
+        let names = attachments.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ");
+        seg(fb, x + 2, rule + 1, &format!("{} image{} · Ctrl+X remove last · {names}", attachments.len(), if attachments.len() == 1 { "" } else { "s" }), w - 4, accent, Some(BOX));
+    }
+    area(fb, (x + 2, rule + 1 + i32::from(!attachments.is_empty()), w - 4, chat_input_rows(l, text)), text, accent, t);
     let asking = a.is_some_and(|a| a.status == Status::Blocked);
-    let hint = match back {
+    let hint = if let Some((message, _)) = app.toast.as_ref().filter(|(_, at)| t - at < 3.2) {
+        message.clone()
+    } else if sending { "Sending reply…".into() } else { match back {
         Some(n) => format!("↑ {n} lines back · PgDn / wheel to return · ⇥ full screen · esc close"),
-        None if asking && text.s.is_empty() => "1-9 / ↑↓ ⏎ answer · or write a reply · ⇥ full screen · esc close".into(),
-        None => "⏎ send · PgUp / wheel scroll · ⇥ full screen · esc close".into(),
-    };
+        None if asking && text.s.is_empty() && attachments.is_empty() => "1-9 / ↑↓ ⏎ answer · Ctrl+V paste · drag copy · esc close".into(),
+        None => "⏎ send · Ctrl+V paste · drag copy · PgUp/Dn scroll · ⇥ expand · esc close".into(),
+    }};
     seg(fb, x + 2, y + h - 2, &hint, w - 4, DIM, Some(BOX));
 }
 

@@ -26,7 +26,7 @@ pub const KINDS: [Kind; 8] = [Kind::Charter, Kind::Archive, Kind::Academy, Kind:
 pub struct Built {
     pub kind: Kind,
     pub count: u32,
-    /// Relative to the world, at most a handful.
+    /// Relative to the world, in browsing order.
     pub files: Vec<String>,
 }
 
@@ -121,7 +121,7 @@ pub fn survey(path: &str) -> Vec<Built> {
     let mut out = Vec::new();
     let mut add = |kind: Kind, files: Vec<String>, count: u32| {
         if count > 0 {
-            out.push(Built { kind, count, files: files.into_iter().take(6).collect() });
+            out.push(Built { kind, count, files });
         }
     };
     let charter = existing(root, &["AGENTS.md", "AGENTS.override.md"]);
@@ -196,6 +196,20 @@ fn markdown(root: &Path, dir: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_skill_is_available_to_browse() {
+        let dir = std::env::temp_dir().join(format!("empire-many-skills-{}", std::process::id()));
+        for i in 0..12 {
+            let p = dir.join(format!(".agents/skills/skill-{i:02}"));
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("SKILL.md"), format!("# Skill {i}")).unwrap();
+        }
+        let got = survey(dir.to_str().unwrap());
+        let skills = got.iter().find(|b| b.kind == Kind::Academy).unwrap();
+        assert_eq!(skills.files.len(), 12);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn finds_every_kind_of_structure_and_counts_them() {

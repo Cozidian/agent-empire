@@ -9,6 +9,19 @@ cargo build --release
 ./target/release/empire
 ```
 
+To run `empire` from any folder, link the release build into a directory on your `PATH`
+(run these commands from the repository):
+
+```sh
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/target/release/empire" "$HOME/.local/bin/empire"
+empire
+```
+
+This assumes `~/.local/bin` is on your `PATH`. Rebuild with `cargo build --release` after
+source changes; the link uses the updated build automatically. If you move the repository,
+update the link to its new location.
+
 ## How it works
 
 ```
@@ -48,7 +61,7 @@ select individual worlds and agents at any distance.
 | ---------------- | ------------------------------------------------------------------- |
 | `n`              | **colonize**: launch an agent in a folder (pick one, or type a new path and it's created) |
 | `e`              | **deploy** another agent to the selected world                      |
-| `⏎` / click twice | **comms**: a chat popup with the agent's live terminal; `⇥` goes full screen |
+| `⏎` / click twice | **land** on a planet to browse buildings; on a ship, open its card |
 | `Ctrl-]` / `F12` | leave comms, back to the galaxy                                     |
 | `⇥`              | jump to the next agent that needs you                               |
 | `C`              | **commander**: your attention queue across all star systems         |
@@ -69,6 +82,17 @@ select individual worlds and agents at any distance.
 | `m` / `M`        | mute alerts / mute background music (Shift+m)                       |
 | `o` `?` `q`      | outliner · fleet manual · leave                                     |
 
+In **colonize** (`n`), folder suggestions use case-insensitive fuzzy matching: `doc` can find
+`Documents`, and `dwn` can find `Downloads`. Exact names and prefixes rank ahead of substrings
+and scattered letters. The parent path stays literal; only its last segment is searched.
+Hidden folders appear when that segment begins with `.`. **Tab / Shift+Tab** cycle matches,
+scrolling the list as needed and preserving the folder's real spelling. Enter still uses the
+path in the field, so new folders can be created as before.
+
+**Ctrl+Backspace**, **Alt+Backspace**, or **Ctrl+W** erase the path segment before the cursor
+(`code/somethi` → `code/`). Use Alt+Backspace or Ctrl+W if the terminal does not distinguish
+Ctrl+Backspace. Ordinary Backspace removes one character; **Ctrl+U** clears the field.
+
 The galaxy plays a quiet, original space-themed score: slow synth pads, low swells and
 sparse bells in a continuous 64-second loop. Press **`M` (Shift+m)** on the galaxy
 to mute or resume the music; **`m`** controls alert sounds independently. The footer
@@ -79,6 +103,18 @@ Comms opens as a **chat popup** over the galaxy: the agent's terminal, fitted to
 line to write in underneath. `⏎` sends what you wrote (or, with nothing written, presses Enter for
 the agent); when it's waiting on a question, `1`–`9` and `↑↓` answer it. `PgUp/PgDn` or the wheel
 scroll back, `Esc` or a click outside closes it, and `⇥` takes you to the full-screen terminal.
+
+In the popup, drag across the agent's output to **copy** it (double-click selects a word;
+`Ctrl+C` copies the selection again). **Ctrl+V** pastes clipboard text or attaches a screenshot;
+terminal paste and dropped image paths work too. Pasted line breaks are preserved, and
+`Shift/Alt+Enter` or `Ctrl+J` adds a line without sending. Images appear above the reply:
+`Ctrl+X` removes the last, and `Ctrl+O` attaches an image path typed into the reply. Press Enter
+to send the text and images together. Failed delivery keeps the draft; Esc discards unsent
+image copies. Send or clear a draft before switching to full screen.
+
+The popup's right-hand scroll track can be clicked to jump through terminal history.
+`Ctrl+Home` goes to the oldest available output, `Ctrl+End` returns to live. For agents that
+manage their own scrolling, wheel and page events are forwarded using popup-relative coordinates.
 
 In the full-screen terminal every key, including Esc and Ctrl-C, goes straight to the agent. The mouse wheel
 (or `Shift-PgUp/PgDn`) scrolls back through the agent's history; agents that handle the mouse
@@ -187,6 +223,21 @@ A **fleet order** (`b` on a system or world) goes to every ship there at once (e
 on an answer). The cards show its progress, and the situation log reports when the whole fleet is done.
 
 ## Structures
+
+Select a planet and press **Enter** or **f**, click it again, or zoom closely into it to land.
+The planet has its own screen: buildings on the left, their files on the right, and a read-only
+file preview below. Empty plots explain what can be built. Skills open their `SKILL.md`, and
+all discovered files are available, including worlds with many skills.
+
+Use **↑↓ / j k** or the wheel to choose, **1–8** to jump to a building, and **Tab / Shift+Tab**
+or **←→** to move between buildings, files and the preview. Click a building or file to select it;
+**PgUp/PgDn** scroll the preview. **Home/End** jump within the focused pane. **R** refreshes
+the files and preview. **B** drafts a construction or renovation order for the selected building;
+cancelling or submitting it returns here. **c** opens the world's lead ship's comms, returning
+here when closed. **Esc** or the top-left galaxy link returns to the map.
+
+Previews show up to 64 KiB, with a notice for larger files. An unreadable or removed file shows
+an explanation in the preview; it does not close the planet screen.
 
 A world's buildings are the AI resources in its folder: what it has built for the agents that work
 there. The survey finds them every few seconds, and each one stands as a spire on the planet's upper
