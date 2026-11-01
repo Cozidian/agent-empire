@@ -555,6 +555,11 @@ pub struct App {
     pub comms_at: Instant,
     /// Lines scrolled back in the comms window (0 = live).
     pub scroll: usize,
+    /// Outliner rows wheeled past, and the selection it was wheeled at (it follows the selection once that moves).
+    pub out_off: usize,
+    pub out_pin: Option<Sel>,
+    /// Situation log entries wheeled past in the side panel (0 = newest at the top).
+    pub log_off: usize,
     pub missions: Vec<Mission>,
     pub log_sort: LogSort,
     /// Jev's suggestion for the mission being written.
@@ -777,6 +782,9 @@ impl App {
             bg_key: (0, 0, 0),
             comms_at: Instant::now(),
             scroll: 0,
+            out_off: 0,
+            out_pin: None,
+            log_off: 0,
             log_sort: LogSort::Status,
             jev: JevState::default(),
             trade_view: TradeView::All,
@@ -3052,6 +3060,7 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
     match me.kind {
         MouseEventKind::ScrollUp if !in_panel => app.zoom_at(l, 1.15, px),
         MouseEventKind::ScrollDown if !in_panel => app.zoom_at(l, 1.0 / 1.15, px),
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => draw::panel_scroll(app, w, l, mr as i32, if me.kind == MouseEventKind::ScrollUp { -3 } else { 3 }),
         MouseEventKind::Down(MouseButton::Left) => *drag = Some(((mc, mr), (app.cam.x, app.cam.y), false)),
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(((c0, r0), (x0, y0), moved)) = drag.as_mut() {
@@ -3874,5 +3883,61 @@ mod structure_tests {
         handle(&mut app, &world, &l, &client, None, key_ev(KeyCode::Down), 1.0, &mut None);
         handle(&mut app, &world, &l, &client, None, key_ev(KeyCode::Enter), 1.0, &mut None);
         assert!(matches!(&app.mode, Mode::Brief { text, .. } if text.s.starts_with("Write a CLAUDE.md")));
+    }
+}
+
+#[cfg(test)]
+mod panel_scroll_tests {
+    use super::*;
+
+    fn wheel(app: &mut App, w: &World, l: &Lay, row: u16, down: bool) {
+        let kind = if down { MouseEventKind::ScrollDown } else { MouseEventKind::ScrollUp };
+        let me = event::MouseEvent { kind, column: (l.cols - 5) as u16, row, modifiers: KeyModifiers::NONE };
+        mouse(app, w, l, &Client::isolated(), me, &mut None, 0.0);
+    }
+
+    fn sys(i: usize) -> System {
+        System { key: format!("/s{i}"), name: format!("s{i}"), wpos: (0.0, 0.0), planets: vec![], orbits: vec![], star: s3(0.8) }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_outliner_until_the_selection_moves() {
+        let mut app = App::new();
+        let w = World { systems: (0..60).map(sys).collect(), planets: vec![], lanes: vec![], station: None };
+        let l = Lay::new(&Fb::new(120, 40), true);
+        app.sel = Some(Sel::Sys("/s0".into()));
+        assert_eq!(draw::panel_hit(&app, &w, &l, 3), Some(Sel::Sys("/s0".into())));
+        wheel(&mut app, &w, &l, 5, true);
+        wheel(&mut app, &w, &l, 5, true);
+        assert_eq!(draw::panel_hit(&app, &w, &l, 3), Some(Sel::Sys("/s6".into())));
+        wheel(&mut app, &w, &l, 5, false);
+        assert_eq!(draw::panel_hit(&app, &w, &l, 3), Some(Sel::Sys("/s3".into())));
+        // scrolling never runs past either end
+        for _ in 0..40 { wheel(&mut app, &w, &l, 5, true); }
+        assert_eq!(draw::panel_hit(&app, &w, &l, 3).is_some(), true);
+        assert_eq!(draw::panel_hit(&app, &w, &l, 2), None);
+        // a new selection is brought back into view
+        app.sel = Some(Sel::Sys("/s1".into()));
+        assert_eq!(draw::panel_hit(&app, &w, &l, 3), Some(Sel::Sys("/s1".into())));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_side_panel_situation_log() {
+        let mut app = App::new();
+        let w = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        for i in 0..30 { app.say(Ev::Mission, format!("entry {i}"), DIM_LOG); }
+        let mut fb = Fb::new(120, 40);
+        let l = Lay::new(&fb, true);
+        let last = (l.rows - 3) as u16;
+        let msg = |app: &App, row| draw::panel_log_hit(app, &w, &l, row).and_then(|id| app.log.iter().find(|e| e.id == id)).map(|e| e.msg.clone());
+        let top = last as i32 - (msg(&app, last as i32).map(|m| 29 - m[6..].parse::<i32>().unwrap()).unwrap());
+        assert_eq!(msg(&app, top).as_deref(), Some("entry 29"));
+        wheel(&mut app, &w, &l, last, true);
+        assert_eq!(msg(&app, top).as_deref(), Some("entry 26"));
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let rendered: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(rendered.contains("entry 26") && !rendered.contains("entry 27"));
+        for _ in 0..20 { wheel(&mut app, &w, &l, last, false); }
+        assert_eq!(msg(&app, top).as_deref(), Some("entry 29"));
     }
 }
