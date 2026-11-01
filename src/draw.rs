@@ -74,6 +74,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Deploy { planet, kind } => deploy(fb, app, planet, *kind, l),
         Mode::Confirm { id } => confirm(fb, app, *id, l),
         Mode::Ship { id, sel } => ship_card(fb, app, *id, *sel, l, t),
+        Mode::ShipRefit { id, sel, confirm } => ship_refit(fb, app, *id, *sel, *confirm, l),
         Mode::Help => help(fb, l),
         Mode::Brief { planet, text, kind, launch, role, to, attachments, sending, ship } => brief(fb, app, planet, text, *kind, (*launch, *role, *to), attachments, *sending, ship, l, t),
         Mode::Refit(v) => refit(fb, app, v, l, t),
@@ -2397,8 +2398,11 @@ fn area(fb: &mut Fb, (x, y, width, rows): (i32, i32, i32, i32), text: &Line, acc
 }
 
 /// The ship card's frame: five lines about the ship, then its menu.
+/// The ship card's info rows: a refit ordered for it gets a row of its own.
+fn card_rows(app: &App, id: u32) -> i32 { 5 + app.agent(id).is_some_and(|a| a.refit.is_some()) as i32 }
+
 fn ship_box(app: &App, id: u32, l: &Lay) -> (i32, i32, i32, i32) {
-    centered(l, 64, app.ship_acts(id).len() as i32 + 11)
+    centered(l, 84, app.ship_acts(id).len() as i32 + card_rows(app, id) + 7)
 }
 
 /// Where a click lands on the ship card: outside it (None), on menu item i, or elsewhere on it.
@@ -2407,7 +2411,7 @@ pub fn ship_hit(app: &App, id: u32, l: &Lay, c: i32, r: i32) -> Option<Option<us
     if c < x || c >= x + w || r < y || r >= y + h {
         return None;
     }
-    let i = r - (y + 8);
+    let i = r - (y + 4 + card_rows(app, id));
     Some((i >= 0 && (i as usize) < app.ship_acts(id).len()).then_some(i as usize))
 }
 
@@ -2430,19 +2434,25 @@ fn ship_card(fb: &mut Fb, app: &App, id: u32, sel: usize, l: &Lay, t: f32) {
     if rep.added.is_some() || rep.removed.is_some() {
         stats.push(format!("+{} −{}", rep.added.unwrap_or(0), rep.removed.unwrap_or(0)));
     }
-    let lines = [
-        ("task", if a.title.is_empty() { "—".to_string() } else { a.title.clone() }),
-        ("mission", mission.map_or("none".into(), |m| m.replace('\n', " "))),
-        ("world", tilde(&a.cwd)),
-        ("report", if stats.is_empty() { "—".into() } else { stats.join(" · ") }),
+    let mut lines = vec![
+        ("task", if a.title.is_empty() { "—".to_string() } else { a.title.clone() }, TEXT),
+        ("mission", mission.map_or("none".into(), |m| m.replace('\n', " ")), TEXT),
+        ("world", tilde(&a.cwd), TEXT),
+        ("report", if stats.is_empty() { "—".into() } else { stats.join(" · ") }, TEXT),
+        ("outfit", outfit_line(a.role, &a.spec), TEXT),
     ];
-    for (i, (k, v)) in lines.iter().enumerate() {
+    // a refit is shown apart from what's aboard: only "active" means it's running with it
+    if let Some(r) = &a.refit {
+        let (label, col) = refit_label(r);
+        lines.push(("refit", label, col));
+    }
+    for (i, (k, v, col)) in lines.iter().enumerate() {
         let r = y + 3 + i as i32;
         seg(fb, x + 3, r, k, 9, DIM * 0.9, Some(BOX));
-        seg(fb, x + 13, r, &clip(v, (iw - 10) as usize), iw - 10, TEXT, Some(BOX));
+        seg(fb, x + 13, r, &clip(v, (iw - 10) as usize), iw - 10, *col, Some(BOX));
     }
     for (i, act) in app.ship_acts(id).iter().enumerate() {
-        let r = y + 8 + i as i32;
+        let r = y + 4 + card_rows(app, id) + i as i32;
         let bg = if i == sel { SELBG } else { BOX };
         fb.panel(x + 2, r, w - 4, 1, bg);
         let col = if *act == ShipAct::Decommission { v3(1.0, 0.4, 0.3) } else { accent };
@@ -2450,6 +2460,128 @@ fn ship_card(fb: &mut Fb, app: &App, id: u32, sel: usize, l: &Lay, t: f32) {
         seg(fb, c + 1, r, act.label(), iw - 4, TEXT, Some(bg));
     }
     seg(fb, x + 3, y + h - 2, "1-9 / ⏎ act · ↑↓ choose · esc / click outside closes", iw, DIM, Some(BOX));
+}
+
+/// What a ship is running with: its role, design, and orders and skills of its own.
+fn outfit_line(role: Role, spec: &crate::proto::ShipSpec) -> String {
+    let mut v = vec![if role == Role::None { "no role".to_string() } else { role.name().to_string() }];
+    if !spec.design.is_empty() { v.push(format!("{} design", spec.design)); }
+    if !spec.orders.trim().is_empty() { v.push("own orders".into()); }
+    if !spec.skills.is_empty() { v.push(format!("skills {}", spec.skills.join(", "))); }
+    v.join(" · ")
+}
+
+/// A refit's place, in words and colour: only "active" is aboard.
+pub fn refit_label(r: &crate::proto::RefitState) -> (String, V3) {
+    let what = refit_name(r);
+    let note = |s: &str| if r.note.is_empty() { s.to_string() } else { r.note.clone() };
+    match r.state.as_str() {
+        "pending" => (format!("◌ PENDING {what}: restarts on its own session when idle"), v3(1.0, 0.75, 0.3)),
+        "applying" => (format!("⟳ APPLYING {what}: relaunching on its own session"), v3(0.55, 0.85, 1.0)),
+        "active" => (format!("✓ ACTIVE {what} aboard"), v3(0.5, 0.9, 0.6)),
+        "failed" => (format!("✖ FAILED {what}: {}", note("old outfit kept")), v3(1.0, 0.4, 0.3)),
+        "unsupported" => (format!("⊘ UNSUPPORTED {what}: {}", note("can't resume its session")), v3(0.65, 0.65, 0.7)),
+        s => (format!("{s} {what}"), DIM),
+    }
+}
+
+/// Refitting a deployed ship: pick a design, see what changes, confirm.
+fn ship_refit(fb: &mut Fb, app: &App, id: u32, sel: usize, confirm: bool, l: &Lay) {
+    let Some(a) = app.agent(id) else { return };
+    let list = &app.designs.designs;
+    let shown = list.len().clamp(1, 6) as i32;
+    let (x, y, w, h) = centered(l, 84, shown + 17);
+    let iw = w - 6;
+    frame_box(fb, x, y, w, h, &format!("⚒ REFIT · {} · {}", a.kind.to_uppercase(), base_name(&a.cwd).to_uppercase()), DESIGN);
+    seg(fb, x + 3, y + 2, &format!("aboard   {}", outfit_line(a.role, &a.spec)), iw, TEXT, Some(BOX));
+    let mut r = y + 3;
+    if let Some(rf) = &a.refit {
+        let (label, col) = refit_label(rf);
+        seg(fb, x + 3, r, &clip(&format!("refit    {label}"), iw as usize), iw, col, Some(BOX));
+    }
+    r += 2;
+    if list.is_empty() {
+        seg(fb, x + 3, r, "No designs in the shipyard yet: save one from a mission composer with ^S.", iw, DIM, Some(BOX));
+        seg(fb, x + 3, y + h - 2, "esc back", iw, DIM, Some(BOX));
+        return;
+    }
+    let top = sel.saturating_sub(shown as usize - 1);
+    for (i, d) in list.iter().enumerate().skip(top).take(shown as usize) {
+        let bg = if i == sel { SELBG } else { BOX };
+        fb.panel(x + 2, r, w - 4, 1, bg);
+        let role = Role::parse(&d.role);
+        seg(fb, x + 3, r, &clip(&format!(" {} · {} · prefers {}", d.name, role.label(), d.kind), (iw - 2) as usize), iw - 2, if i == sel { TEXT } else { DIM * 1.2 }, Some(bg));
+        r += 1;
+    }
+    r = y + 6 + shown;
+    let Some((role, spec)) = app.refit_outfit(sel) else { return };
+    let row = |fb: &mut Fb, r: i32, k: &str, v: &str, col: V3| {
+        seg(fb, x + 3, r, k, 9, DIM * 0.9, Some(BOX));
+        seg(fb, x + 13, r, &clip(v, (iw - 10) as usize), iw - 10, col, Some(BOX));
+    };
+    let (gain, lose, same) = (v3(0.5, 0.9, 0.6), v3(1.0, 0.55, 0.45), DIM);
+    if role == a.role {
+        row(fb, r, "role", &format!("{} (unchanged)", a.role.label()), same);
+    } else {
+        row(fb, r, "role", &format!("{} → {}", a.role.label(), role.label()), TEXT);
+    }
+    let first = |s: &str| { let f = s.trim().lines().next().unwrap_or("").to_string(); if s.trim().lines().count() > 1 { format!("“{f} …”") } else { format!("“{f}”") } };
+    match (a.spec.orders.trim().is_empty(), spec.orders.trim().is_empty()) {
+        (true, true) => row(fb, r + 1, "orders", "none (unchanged)", same),
+        _ if a.spec.orders.trim() == spec.orders.trim() => row(fb, r + 1, "orders", &format!("{} (unchanged)", first(&spec.orders)), same),
+        (false, true) => row(fb, r + 1, "orders", &format!("− {} (dropped)", first(&a.spec.orders)), lose),
+        (true, false) => row(fb, r + 1, "orders", &format!("+ {}", first(&spec.orders)), gain),
+        (false, false) => {
+            row(fb, r + 1, "orders", &format!("− {}", first(&a.spec.orders)), lose);
+            row(fb, r + 2, "", &format!("+ {}", first(&spec.orders)), gain);
+        }
+    }
+    // skills: + gained, − dropped, = kept; ✓/✗ whether this species can find it from here
+    let r2 = r + 3;
+    seg(fb, x + 3, r2, "skills", 9, DIM * 0.9, Some(BOX));
+    let mut c = x + 13;
+    let home = &app.skill_home;
+    let mut cells: Vec<(String, V3)> = Vec::new();
+    for s in &spec.skills {
+        let ok = crate::design::reachable(&a.kind, s, std::path::Path::new(&a.cwd), home);
+        let mark = if a.spec.skills.contains(s) { "=" } else { "+" };
+        cells.push((format!("{mark}{}{s}", if ok { "✓" } else { "✗" }), if ok { gain } else { RED_SKILL }));
+    }
+    for s in a.spec.skills.iter().filter(|s| !spec.skills.contains(s)) {
+        cells.push((format!("−{s}"), lose));
+    }
+    if cells.is_empty() {
+        seg(fb, c, r2, "none (unchanged)", iw - 10, same, Some(BOX));
+    }
+    for (cell, col) in cells {
+        let n = cell.chars().count() as i32;
+        if c + n > x + w - 3 { seg(fb, c, r2, "…", 1, DIM, Some(BOX)); break; }
+        c = seg(fb, c, r2, &cell, n, col, Some(BOX)) + 1;
+    }
+    // a scout's read-only launch, where the species enforces one
+    let enforced = matches!(a.kind.as_str(), "claude" | "codex" | "grok");
+    let ro = match (a.role == Role::Scout, role == Role::Scout) {
+        (false, true) if enforced => Some(("gains a read-only launch (scout)", gain)),
+        (true, false) if enforced => Some(("loses its read-only launch: it may edit files again", lose)),
+        _ => None,
+    };
+    if let Some((s, col)) = ro { row(fb, r2 + 1, "access", s, col); }
+    let notice = if !resumes(&a.kind) {
+        (format!("⊘ {} can't resume a session, so this ship can't be refitted in place.", a.kind), v3(0.65, 0.65, 0.7))
+    } else {
+        (format!("Restarts on its own session when idle: {} relaunches with the new flags and resumes its conversation; until then the old outfit stays active.", a.kind), v3(1.0, 0.75, 0.3))
+    };
+    let nr = r2 + 3;
+    for (i, part) in wrap(&notice.0, iw as usize).iter().take(2).enumerate() {
+        seg(fb, x + 3, nr + i as i32, part, iw, notice.1, Some(BOX));
+    }
+    if confirm {
+        fb.panel(x + 2, y + h - 2, w - 4, 1, SELBG);
+        seg(fb, x + 3, y + h - 2, &format!("Refit as {}? y refit when idle · any other key back", spec.design), iw, v3(1.0, 0.75, 0.3), Some(SELBG));
+    } else {
+        let cancel = if a.refit.is_some() { " · c cancel refit" } else { "" };
+        seg(fb, x + 3, y + h - 2, &format!("↑↓ design · ⏎ refit…{cancel} · esc back"), iw, DIM, Some(BOX));
+    }
 }
 
 fn confirm(fb: &mut Fb, app: &App, id: u32, l: &Lay) {
@@ -2477,7 +2609,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("Y", "shipyard: saved ship designs (^D picks one in a mission, ^R refits)"),
         ("n", "colonize: launch an agent in a folder (new or existing)"),
         ("e", "deploy another agent to the selected world"),
-        ("x", "decommission the selected agent"),
+        ("x", "decommission the agent · card: r refits it"),
         ("r", "what the selected world needs, with quick actions"),
         ("B", "structures: AGENTS.md, skills, MCP… build or renovate"),
         ("t / L", "give a world a mission / its mission log"),

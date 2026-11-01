@@ -118,7 +118,10 @@ pub struct AgentView {
     /// The design it was launched from, by name ("" for none).
     #[serde(default)]
     pub design: String,
-    /// A refit ordered for it, and how it went; `role`/`design` stay what's actually aboard.
+    /// Its own orders and skills as it's running now (beyond its role).
+    #[serde(default)]
+    pub spec: ShipSpec,
+    /// A refit ordered for it, and how it went; `role`/`design`/`spec` stay what's actually aboard.
     #[serde(default)]
     pub refit: Option<RefitState>,
 }

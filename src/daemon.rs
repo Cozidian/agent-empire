@@ -394,6 +394,7 @@ impl Agent {
             report: self.report.clone(),
             ask: if self.status == Status::Blocked { self.ask() } else { None },
             war: Vec::new(),
+            spec: self.spec.clone(),
             refit: self.refit.clone(),
         }
     }
