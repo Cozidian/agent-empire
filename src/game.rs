@@ -8,7 +8,7 @@ use crate::draw;
 use crate::gfx::*;
 use crate::role::{ROLES, Role};
 use crate::structure::{Built, KINDS, Kind};
-use crate::proto::{AgentView, Ask, Mission, Report, ScreenView, ShipSpec, War};
+use crate::proto::{AgentView, Ask, Mission, RefitState, Report, ScreenView, ShipSpec, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crate::screenshots::{self, Attachment};
@@ -190,6 +190,10 @@ pub struct Agent {
     pub role: Role,
     /// The design it was launched from, by name ("" for none).
     pub design: String,
+    /// Its own orders and skills as it's running now.
+    pub spec: ShipSpec,
+    /// A refit ordered for it (pending until the daemon relaunches it), and how it went.
+    pub refit: Option<RefitState>,
     pub wpos: (f32, f32),
     /// In front of its planet (drawn after it).
     pub front: bool,
@@ -517,6 +521,8 @@ pub enum Mode {
     Confirm { id: u32 },
     /// A ship's card: what it's doing, and what you can do with it.
     Ship { id: u32, sel: usize },
+    /// Refitting a deployed ship from a shipyard design: what would change, then `confirm`.
+    ShipRefit { id: u32, sel: usize, confirm: bool },
     /// What a world needs, as a menu of quick actions.
     Actions { planet: String, sel: usize },
     /// A world's structures (its AI resources): what stands, and what can be built.
@@ -1185,8 +1191,15 @@ impl App {
         if !a.war.is_empty() {
             v.push(ShipAct::Priority);
         }
+        v.push(ShipAct::Refit);
         v.push(ShipAct::Decommission);
         v
+    }
+
+    /// The role and outfit the shipyard's `i`th design would give a deployed ship.
+    pub fn refit_outfit(&self, i: usize) -> Option<(Role, ShipSpec)> {
+        let d = self.designs.designs.get(i)?;
+        Some((Role::parse(&d.role), ShipSpec { orders: d.orders.clone(), skills: d.skills.clone(), design: d.name.clone() }))
     }
 
     fn ship_act(&mut self, id: u32, act: ShipAct, client: &Client, l: &Lay, t: f32) {
@@ -1199,6 +1212,7 @@ impl App {
             ShipAct::Comms => self.open_comms(id, client, l),
             ShipAct::Mission => self.mode = Mode::Brief { planet: cwd, text: Line::default(), kind: 0, launch: false, role: 0, to: None, attachments: Vec::new(), sending: false, ship: Outfit::default() },
             ShipAct::Priority => self.act(&cwd, Act::Priority(id), client, l, t),
+            ShipAct::Refit => self.mode = Mode::ShipRefit { id, sel: 0, confirm: false },
             ShipAct::Decommission => self.mode = Mode::Confirm { id },
         }
     }
@@ -1344,6 +1358,22 @@ impl App {
                 a.turns = v.turns;
                 a.report = v.report.clone();
                 a.ask = v.ask.clone();
+                // what's aboard can change under a refit; say how one ended
+                let was = a.refit.as_ref().map(|r| r.state.clone());
+                (a.role, a.design, a.spec, a.refit) = (Role::parse(&v.role), v.design.clone(), v.spec.clone(), v.refit.clone());
+                if let Some(r) = v.refit.as_ref().filter(|r| was.as_deref() != Some(r.state.as_str()) && was.is_some()) {
+                    let (kind, planet) = (a.kind.clone(), base_name(&a.cwd));
+                    let line = match r.state.as_str() {
+                        "active" => Some((format!("⚒ {kind} on {planet} refitted: {} aboard", refit_name(r)), v3(0.5, 0.9, 0.6))),
+                        "failed" => Some((format!("✖ refit of {kind} on {planet} failed: {}", r.note), v3(1.0, 0.4, 0.3))),
+                        "unsupported" => Some((format!("⊘ {kind} on {planet} can't be refitted: {}", r.note), v3(0.7, 0.7, 0.75))),
+                        _ => None,
+                    };
+                    if let Some((msg, col)) = line {
+                        self.say(Ev::Agent, msg, col).on(&v.cwd).by(v.id);
+                    }
+                }
+                let a = &mut self.agents[i];
                 // a new border conflict (reported once, by the lower id of the pair)
                 let (old_war, kind, planet, pos) = (a.war.clone(), a.kind.clone(), base_name(&a.cwd), a.wpos);
                 for w in &v.war {
@@ -1386,6 +1416,8 @@ impl App {
                     war: v.war.clone(),
                     role: Role::parse(&v.role),
                     design: v.design.clone(),
+                    spec: v.spec.clone(),
+                    refit: v.refit.clone(),
                     wpos: (0.0, 0.0),
                     front: true,
                 });
@@ -3160,6 +3192,7 @@ pub enum ShipAct {
     Comms,
     Mission,
     Priority,
+    Refit,
     Decommission,
 }
 
@@ -3169,12 +3202,21 @@ impl ShipAct {
             Self::Comms => "open comms",
             Self::Mission => "give its world a mission",
             Self::Priority => "give priority in its border conflict",
+            Self::Refit => "refit from a saved design",
             Self::Decommission => "decommission",
         }
     }
 }
 
 const AMBER: V3 = v3(1.0, 0.75, 0.3);
+
+/// What a refit is to put aboard, by design name or role.
+pub fn refit_name(r: &RefitState) -> String {
+    if !r.spec.design.is_empty() { r.spec.design.clone() } else { Role::parse(&r.role).label().to_string() }
+}
+
+/// Can this species be relaunched on its own session? (The daemon has the last word.)
+pub fn resumes(kind: &str) -> bool { matches!(kind, "claude" | "codex" | "grok") }
 const RED: V3 = v3(1.0, 0.4, 0.3);
 
 /// Points each world has earned, and which events were already counted.
@@ -4044,6 +4086,7 @@ fn handle(
                 KeyCode::Enter | KeyCode::Char('c') => acts.get(s).copied(),
                 KeyCode::Char('t') => Some(ShipAct::Mission),
                 KeyCode::Char('x') => Some(ShipAct::Decommission),
+                KeyCode::Char('r') => Some(ShipAct::Refit),
                 KeyCode::Char('P') if acts.contains(&ShipAct::Priority) => Some(ShipAct::Priority),
                 _ => None,
             };
@@ -4052,6 +4095,53 @@ fn handle(
             }
             if let Some(a) = pick {
                 app.ship_act(id, a, client, l, t);
+            }
+            return false;
+        }
+        Mode::ShipRefit { id, sel, confirm } => {
+            let (id, mut s, asking) = (*id, *sel, *confirm);
+            let Some(a) = app.agent(id) else {
+                app.mode = Mode::Galaxy;
+                return false;
+            };
+            let (kind, planet, cwd, aboard, pending) = (a.kind.clone(), base_name(&a.cwd), a.cwd.clone(), (a.role, a.spec.clone()), a.refit.is_some());
+            let plan = app.refit_outfit(s);
+            if asking {
+                // nothing is sent until the player says yes
+                match (k.code, plan) {
+                    (KeyCode::Char('y') | KeyCode::Char('Y'), Some((role, spec))) => {
+                        let name = spec.design.clone();
+                        client.send(Cmd::Refit { id, role: role.name().into(), spec });
+                        app.say(Ev::Agent, format!("⚒ refit ordered: {kind} on {planet} → {name}; restarts on its own session when idle"), v3(1.0, 0.75, 0.3)).on(&cwd).by(id);
+                        app.mode = Mode::Ship { id, sel: 0 };
+                    }
+                    _ => app.mode = Mode::ShipRefit { id, sel: s, confirm: false },
+                }
+                return false;
+            }
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.mode = Mode::Ship { id, sel: 0 };
+                    return false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => s = s.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => s = (s + 1).min(app.designs.designs.len().saturating_sub(1)),
+                KeyCode::Enter | KeyCode::Char('y') => match plan {
+                    Some(p) if p == aboard => app.toast("It already carries that outfit", t),
+                    Some(_) => {
+                        app.mode = Mode::ShipRefit { id, sel: s, confirm: true };
+                        return false;
+                    }
+                    None => app.toast("No designs yet: save one from a mission composer with ^S", t),
+                },
+                KeyCode::Char('c') if pending => {
+                    client.send(Cmd::CancelRefit(id));
+                    app.say(Ev::Agent, format!("⚒ refit of {kind} on {planet} called off"), DIM_LOG).on(&cwd).by(id);
+                }
+                _ => {}
+            }
+            if let Mode::ShipRefit { sel, .. } = &mut app.mode {
+                *sel = s;
             }
             return false;
         }
@@ -5342,6 +5432,8 @@ mod ship_card_tests {
             war: if war { vec![crate::proto::War { rival: 9, files: vec!["src/a.rs".into()] }] } else { vec![] },
             role: Role::None,
             design: String::new(),
+            spec: ShipSpec::default(),
+            refit: None,
             wpos: (0.0, 0.0),
             front: true,
         }
@@ -5359,8 +5451,8 @@ mod ship_card_tests {
     fn priority_is_offered_only_in_a_border_conflict() {
         let mut app = App::new();
         app.agents = vec![ship(1, false), ship(2, true)];
-        assert_eq!(app.ship_acts(1), vec![ShipAct::Comms, ShipAct::Mission, ShipAct::Decommission]);
-        assert_eq!(app.ship_acts(2), vec![ShipAct::Comms, ShipAct::Mission, ShipAct::Priority, ShipAct::Decommission]);
+        assert_eq!(app.ship_acts(1), vec![ShipAct::Comms, ShipAct::Mission, ShipAct::Refit, ShipAct::Decommission]);
+        assert_eq!(app.ship_acts(2), vec![ShipAct::Comms, ShipAct::Mission, ShipAct::Priority, ShipAct::Refit, ShipAct::Decommission]);
         assert!(app.ship_acts(7).is_empty());
     }
 
@@ -6756,6 +6848,159 @@ mod design_tests {
                 draw::frame(&mut Fb::new(cols, rows), &mut later, &w, &small, 1.0, None);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod ship_refit_tests {
+    use super::*;
+    use crate::design::Design;
+    use crate::proto::RefitState;
+
+    fn press(app: &mut App, w: &World, l: &Lay, client: &Client, code: KeyCode) {
+        handle(app, w, l, client, None, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 1.0, &mut None);
+    }
+    fn screen(app: &mut App, w: &World, l: &Lay) -> String {
+        let mut fb = Fb::new(120, 40);
+        draw::frame(&mut fb, app, w, l, 1.0, None);
+        fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()
+    }
+    /// A deployed builder on a world with one Claude skill, and two designs in the shipyard.
+    fn setup(name: &str, kind: &str) -> (App, World, Lay, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("empire-shiprefit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".claude/skills/empire-test-release")).unwrap();
+        std::fs::write(dir.join(".claude/skills/empire-test-release/SKILL.md"), "---\nname: empire-test-release\n---").unwrap();
+        let mut app = App::new();
+        let mut a = crate::game::ship_card_tests::ship(1, false);
+        a.kind = kind.into();
+        a.cwd = dir.to_string_lossy().into();
+        a.status = Status::Idle;
+        a.role = Role::Builder;
+        a.spec = ShipSpec { orders: "Old orders.".into(), skills: vec!["old-skill".into()], design: "Frigate".into() };
+        a.design = "Frigate".into();
+        app.agents = vec![a];
+        app.designs.save(Design { name: "Warden".into(), kind: "codex".into(), role: "inspector".into(), orders: "Review first.".into(), skills: vec!["empire-test-release".into(), "missing-skill".into()], ..Default::default() }).unwrap();
+        app.designs.save(Design { name: "Probe".into(), kind: "claude".into(), role: "scout".into(), ..Default::default() }).unwrap();
+        app.mode = Mode::Ship { id: 1, sel: 0 };
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        (app, world, Lay::new(&Fb::new(120, 40), false), dir)
+    }
+
+    #[test]
+    fn the_preview_shows_what_changes_and_nothing_is_sent_before_y() {
+        let (mut app, w, l, dir) = setup("preview", "claude");
+        let (client, commands) = Client::recording();
+        press(&mut app, &w, &l, &client, KeyCode::Char('r'));
+        assert!(matches!(app.mode, Mode::ShipRefit { id: 1, sel: 0, confirm: false }));
+        let s = screen(&mut app, &w, &l);
+        assert!(s.contains("REFIT · CLAUDE") && s.contains("aboard   builder · Frigate design"), "{s}");
+        assert!(s.contains("builder → inspector"), "{s}");
+        assert!(s.contains("− “Old orders.”") && s.contains("+ “Review first.”"), "{s}");
+        assert!(s.contains("+✓empire-test-release") && s.contains("+✗missing-skill") && s.contains("−old-skill"), "{s}");
+        assert!(s.contains("Restarts on its own session when idle") && s.contains("old outfit stays active"), "{s}");
+        // a scout design: read-only gained, orders and skills dropped
+        press(&mut app, &w, &l, &client, KeyCode::Down);
+        let s = screen(&mut app, &w, &l);
+        assert!(s.contains("builder → scout") && s.contains("gains a read-only launch") && s.contains("(dropped)"), "{s}");
+        assert!(commands.try_recv().is_err(), "previewing sends nothing");
+        // ⏎ asks first; anything but y backs out
+        press(&mut app, &w, &l, &client, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::ShipRefit { confirm: true, sel: 1, .. }));
+        assert!(screen(&mut app, &w, &l).contains("Refit as Probe? y refit when idle"));
+        press(&mut app, &w, &l, &client, KeyCode::Char('n'));
+        assert!(matches!(app.mode, Mode::ShipRefit { confirm: false, sel: 1, .. }));
+        assert!(commands.try_recv().is_err());
+        press(&mut app, &w, &l, &client, KeyCode::Enter);
+        press(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        match commands.try_recv().unwrap() {
+            Cmd::Refit { id, role, spec } => {
+                assert_eq!((id, role.as_str()), (1, "scout"));
+                assert_eq!(spec, ShipSpec { orders: String::new(), skills: vec![], design: "Probe".into() });
+            }
+            _ => panic!("expected a refit"),
+        }
+        assert!(commands.try_recv().is_err());
+        assert!(matches!(app.mode, Mode::Ship { id: 1, .. }));
+        // the ship still shows what's actually aboard until the daemon says otherwise
+        assert_eq!(app.agents[0].role, Role::Builder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scout_refitted_to_a_builder_loses_read_only_and_the_same_outfit_is_no_refit() {
+        let (mut app, w, l, dir) = setup("scout", "claude");
+        let (client, commands) = Client::recording();
+        app.agents[0].role = Role::Scout;
+        app.agents[0].spec = ShipSpec { design: "Probe".into(), ..Default::default() };
+        app.mode = Mode::ShipRefit { id: 1, sel: 0, confirm: false };
+        assert!(screen(&mut app, &w, &l).contains("loses its read-only launch"));
+        press(&mut app, &w, &l, &client, KeyCode::Down);
+        press(&mut app, &w, &l, &client, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::ShipRefit { confirm: false, .. }), "already aboard: nothing to confirm");
+        assert!(commands.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn c_calls_off_a_refit_and_unresumable_species_are_flagged() {
+        let (mut app, w, l, dir) = setup("cancel", "cursor");
+        let (client, commands) = Client::recording();
+        app.mode = Mode::ShipRefit { id: 1, sel: 0, confirm: false };
+        assert!(screen(&mut app, &w, &l).contains("cursor can't resume a session"));
+        press(&mut app, &w, &l, &client, KeyCode::Char('c'));
+        assert!(commands.try_recv().is_err(), "no refit to cancel");
+        app.agents[0].refit = Some(RefitState { role: "inspector".into(), spec: ShipSpec { design: "Warden".into(), ..Default::default() }, state: "pending".into(), note: String::new() });
+        assert!(screen(&mut app, &w, &l).contains("c cancel refit"));
+        press(&mut app, &w, &l, &client, KeyCode::Char('c'));
+        assert!(matches!(commands.try_recv().unwrap(), Cmd::CancelRefit(1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_ship_card_shows_each_refit_state_apart_from_whats_aboard() {
+        let (mut app, w, l, dir) = setup("card", "claude");
+        assert!(!screen(&mut app, &w, &l).contains("refit   "));
+        for (state, note, label) in [
+            ("pending", "", "◌ PENDING Warden: restarts on its own session when idle"),
+            ("applying", "", "⟳ APPLYING Warden"),
+            ("active", "resumed session s", "✓ ACTIVE Warden aboard"),
+            ("failed", "it shut down right after relaunch; relaunched with its old outfit", "✖ FAILED Warden: it shut down right after relaunch"),
+            ("unsupported", "no session to resume yet", "⊘ UNSUPPORTED Warden: no session to resume yet"),
+        ] {
+            app.agents[0].refit = Some(RefitState { role: "inspector".into(), spec: ShipSpec { design: "Warden".into(), ..Default::default() }, state: state.into(), note: note.into() });
+            let s = screen(&mut app, &w, &l);
+            assert!(s.contains(label), "{state}: {s}");
+            // the outfit row is what's actually running
+            assert!(s.contains("outfit    builder · Frigate design · own orders · skills old-skill"), "{s}");
+        }
+        // the menu moved down a row and clicks still land on it
+        let mut fb = Fb::new(120, 40);
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let rows: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+        let r = rows.iter().position(|r| r.contains("refit from a saved design")).unwrap();
+        let c = rows[r].find("refit from").map(|b| rows[r][..b].chars().count()).unwrap() as i32;
+        assert_eq!(draw::ship_hit(&app, 1, &l, c, r as i32), Some(Some(2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_agent_list_carries_the_refit_and_reports_how_it_ended() {
+        let (mut app, _w, _l, dir) = setup("apply", "claude");
+        app.loaded = true;
+        let cwd = app.agents[0].cwd.clone();
+        let view = |state: &str, role: &str, design: &str| AgentView {
+            id: 1, kind: "claude".into(), cwd: cwd.clone(), title: String::new(), task: String::new(), role: role.into(), status: "idle".into(), age: 0.0, turns: 0,
+            report: Report::default(), ask: None, war: vec![], design: design.into(), spec: ShipSpec { design: design.into(), ..Default::default() },
+            refit: Some(RefitState { role: "inspector".into(), spec: ShipSpec { design: "Warden".into(), ..Default::default() }, state: state.into(), note: String::new() }),
+        };
+        let mut cues = Vec::new();
+        app.apply(vec![view("pending", "builder", "Frigate")], 1.0, &mut cues);
+        assert_eq!((app.agents[0].role, app.agents[0].refit.as_ref().unwrap().state.as_str()), (Role::Builder, "pending"));
+        app.apply(vec![view("active", "inspector", "Warden")], 2.0, &mut cues);
+        assert_eq!((app.agents[0].role, app.agents[0].design.as_str()), (Role::Inspector, "Warden"));
+        assert!(app.log.iter().any(|e| e.msg.contains("refitted: Warden aboard")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

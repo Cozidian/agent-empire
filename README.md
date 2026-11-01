@@ -89,6 +89,7 @@ zoom and still lets you select individual worlds and agents at any distance.
 | `T`              | strike finished missions on the selected world from its log         |
 | `S`              | the **situation log** in full: filter it, read an entry's details   |
 | `x`              | **decommission** the selected agent (asks first)                    |
+| `r` on a ship card | **refit** the ship from a saved design: preview the changes, `y` confirms |
 | `↑↓` / `j k`     | move through the outliner (the wheel scrolls it and the log beneath) |
 | `wasd` / drag    | pan · `±` / wheel zoom · `z` fit galaxy · `f` focus selection        |
 | `m` / `M`        | mute alerts / mute background music (Shift+m)                       |
@@ -206,6 +207,19 @@ and `x` scraps it. Designs are kept in `$XDG_STATE_HOME/empire/designs.json` (no
 `~/.local/state/empire/designs.json`) and survive restarts. A ship keeps its own copy of its
 orders and skills, through upgrades and restarts, so renaming or scrapping a design never touches
 ships already launched from it; the ship card shows which design a ship came from.
+
+A ship already flying can be **refitted** from a design: on its card (`⏎` on a ship), `r` lists
+the shipyard and previews what the selected design changes: role (`builder → inspector`), standing
+orders (`−` old, `+` new), skills (`+` gained, `−` dropped, `=` kept, each `✓`/`✗` for whether
+its species finds it from that world) and whether a scout's read-only launch is gained or lost.
+`⏎` asks first and only `y` orders the refit. It stays **pending** while the ship works: when it's
+next idle, with no mission under way, the daemon restarts it on its own session (`claude --resume`,
+`codex resume`, `grok --resume`) with the new launch flags, so its conversation and work carry over.
+The card keeps the outfit that's actually aboard apart from the refit, which reads **pending**,
+**applying**, **active**, **failed** (the old outfit was relaunched) or **unsupported** (the species
+can't resume a session, or the ship has none yet). `c` in the refit view calls off a pending refit.
+Refit state is saved with the ship and survives restarts of the galaxy and the daemon, and it only
+changes that ship's launch: no world files are written.
 
 The composer also lists the ships already on the world: **give it to** one of them and it takes
 the mission when it's next free (`⇥` steps through launch, each ship, and queue-for-anyone). If
