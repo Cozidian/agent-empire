@@ -89,7 +89,7 @@ zoom and still lets you select individual worlds and agents at any distance.
 | `T`              | strike finished missions on the selected world from its log         |
 | `S`              | the **situation log** in full: filter it, read an entry's details   |
 | `x`              | **decommission** the selected agent (asks first)                    |
-| `r` on a ship card | **refit** the ship from a saved design: preview the changes, `y` confirms |
+| `r` on a ship card | **refit** a deployed ship from a saved design: preview, `⏎` then `y` confirms, `c` cancels |
 | `↑↓` / `j k`     | move through the outliner (the wheel scrolls it and the log beneath) |
 | `wasd` / drag    | pan · `±` / wheel zoom · `z` fit galaxy · `f` focus selection        |
 | `m` / `M`        | mute alerts / mute background music (Shift+m)                       |
@@ -208,18 +208,54 @@ and `x` scraps it. Designs are kept in `$XDG_STATE_HOME/empire/designs.json` (no
 orders and skills, through upgrades and restarts, so renaming or scrapping a design never touches
 ships already launched from it; the ship card shows which design a ship came from.
 
-A ship already flying can be **refitted** from a design: on its card (`⏎` on a ship), `r` lists
-the shipyard and previews what the selected design changes: role (`builder → inspector`), standing
-orders (`−` old, `+` new), skills (`+` gained, `−` dropped, `=` kept, each `✓`/`✗` for whether
-its species finds it from that world) and whether a scout's read-only launch is gained or lost.
-`⏎` asks first and only `y` orders the refit. It stays **pending** while the ship works: when it's
-next idle, with no mission under way, the daemon restarts it on its own session (`claude --resume`,
-`codex resume`, `grok --resume`) with the new launch flags, so its conversation and work carry over.
-The card keeps the outfit that's actually aboard apart from the refit, which reads **pending**,
-**applying**, **active**, **failed** (the old outfit was relaunched) or **unsupported** (the species
-can't resume a session, or the ship has none yet). `c` in the refit view calls off a pending refit.
-Refit state is saved with the ship and survives restarts of the galaxy and the daemon, and it only
-changes that ship's launch: no world files are written.
+### Refitting a deployed ship
+
+A ship already flying can take a saved design without losing its work. (`Ctrl+R` in the
+mission composer is different: it outfits a ship that hasn't launched yet.) Open the ship's card
+(`⏎` or a second click on the ship). It lists **open comms**, **give its world a mission**,
+**refit from a saved design** and **decommission**, plus **priority** during a border conflict.
+`r`, or the refit entry, opens the refit view. The top line shows what's **aboard** now. Below it,
+`↑↓` steps through the shipyard's designs, and a preview shows what the selected design would
+change for this ship:
+
+- **role**: `builder → inspector`, or `(unchanged)`
+- **orders**: the old standing orders as `−` and the new ones as `+` (first line each), or `(dropped)` / `(unchanged)`
+- **skills**: `+` gained, `−` dropped, `=` kept. Each new skill is marked `✓` or `✗` for whether
+  *this ship's* species finds it from its world (see the table above). `✗` skills are still named
+  in its orders.
+- **access**: whether it gains or loses a scout's read-only launch (Claude, Codex, Grok)
+
+Nothing changes yet. `⏎` asks **"Refit as …? y refit when idle"**, and only `y` orders the refit:
+any other key goes back to the preview. Picking the outfit the ship already carries only says so.
+The preview warns when the species can't resume a session (anything but claude, codex and grok).
+
+A refit means a **session handoff**: the agent is stood down and launched again as the same
+ship (same id) with the new launch flags. It resumes its own session through its harness: `claude
+--resume <session>`, `codex resume <session>`, `grok --resume <session>`. Its conversation and
+work carry over, and the harness keeps its own permissions; no bypass flags are added. This waits
+until the ship is **idle**, between turns and with no mission sent or under way. A ship waiting for
+or under refit takes no queued missions; missions given to it wait for it.
+
+The card keeps the outfit that's actually running (the **outfit** row: role, design, own orders,
+skills) apart from the refit (the **refit** row):
+
+| refit row | meaning |
+| --------- | ------- |
+| **◌ PENDING** | ordered; waits until the ship is idle. The old outfit is still the one running |
+| **⟳ APPLYING** | standing down and relaunching on its session (a few seconds) |
+| **✓ ACTIVE** | relaunched with the new outfit; the outfit row now shows it |
+| **✖ FAILED** | the new launch failed, or exited within a few seconds, so the ship was relaunched with its old outfit; the note says why |
+| **⊘ UNSUPPORTED** | it can't be resumed: the species has no resume by session id, or the ship has no session yet (a Claude that hasn't finished a turn). Nothing was restarted |
+
+The situation log reports when a refit becomes active, fails or is unsupported. `c` in the refit
+view calls off a pending refit or clears a finished one's notice (not while it's applying).
+
+A refit belongs to that one ship. It copies the design's role, orders and skills into the ship's
+own outfit, as a launch does. Changing or scrapping the design later doesn't touch the ship, and
+nothing is written to the world: its skills, AGENTS.md and other structures stay as they are.
+Refit state is saved with the ship (`agents.json` in the state directory, and the in-place upgrade
+handoff), so it survives restarts of both the galaxy and the daemon. A refit cut short by a daemon
+restart goes back to **pending**, and the ship comes back as it was until it's next idle.
 
 The composer also lists the ships already on the world: **give it to** one of them and it takes
 the mission when it's next free (`⇥` steps through launch, each ship, and queue-for-anyone). If
