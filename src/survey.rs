@@ -14,6 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Default, Debug)]
 pub struct World {
     pub git: bool,
+    pub checked: Option<i64>,
+    pub conflicts: Vec<String>,
     pub branch: String,
     pub ahead: u32,
     pub behind: u32,
@@ -174,6 +176,8 @@ fn status(path: &str, w: &mut World) {
         return;
     };
     w.git = true;
+    w.checked = Some(now());
+    w.conflicts.clear();
     w.dirty = 0;
     for line in s.lines() {
         if let Some(b) = line.strip_prefix("# branch.head ") {
@@ -183,14 +187,21 @@ fn status(path: &str, w: &mut World) {
             (w.ahead, w.behind) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
         } else if !line.starts_with('#') {
             w.dirty += 1;
+            if line.starts_with("u ") {
+                if let Some(file) = line.splitn(11, ' ').nth(10) { w.conflicts.push(file.to_string()); }
+            }
         }
     }
     w.last_commit = git(path, &["log", "-1", "--format=%ct"]).and_then(|s| s.trim().parse().ok());
-    w.host = git(path, &["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"]).and_then(|s| {
+    w.host = world_host(path);
+}
+
+pub fn world_host(path: &str) -> Option<String> {
+    git(path, &["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"]).and_then(|s| {
         let mut l = s.lines();
         let (own, common) = (l.next()?.to_string(), l.next()?.to_string());
         (own != common).then(|| common.strip_suffix("/.git").map(String::from)).flatten()
-    });
+    })
 }
 
 fn size(path: &str, w: &mut World) {
@@ -414,5 +425,41 @@ fn find<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value
         serde_json::Value::Object(m) => m.get(key).filter(|x| !x.is_null()).or_else(|| m.values().find_map(|x| find(x, key))),
         serde_json::Value::Array(a) => a.iter().find_map(|x| find(x, key)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod anomaly_tests {
+    use super::*;
+    #[test]
+    fn a_real_merge_conflict_is_surveyed_and_recovery_clears_it() {
+        let dir = std::env::temp_dir().join(format!("empire-conflict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(["-c", "user.name=Empire Test", "-c", "user.email=empire@example.invalid", "-c", "commit.gpgsign=false"])
+                .args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-b", "main"]);
+        std::fs::write(dir.join("file with spaces.txt"), "base\n").unwrap();
+        run(&["add", "."]); run(&["commit", "-m", "base"]);
+        run(&["checkout", "-b", "moon"]);
+        std::fs::write(dir.join("file with spaces.txt"), "moon\n").unwrap();
+        run(&["commit", "-am", "moon"]);
+        run(&["checkout", "main"]);
+        std::fs::write(dir.join("file with spaces.txt"), "world\n").unwrap();
+        run(&["commit", "-am", "world"]);
+        let merge = Command::new("git").arg("-C").arg(&dir).args(["merge", "moon"]).output().unwrap();
+        assert!(!merge.status.success());
+        let path = dir.to_str().unwrap();
+        let mut world = World::default();
+        status(path, &mut world);
+        assert_eq!(world.conflicts, vec!["file with spaces.txt"]);
+        assert!(world.checked.is_some());
+        run(&["merge", "--abort"]);
+        status(path, &mut world);
+        assert!(world.conflicts.is_empty());
+        assert!(world.checked.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

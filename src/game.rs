@@ -197,6 +197,7 @@ pub struct Agent {
 pub enum Sel {
     GitHub,
     Sys(String),
+    Sector(u64, String),
     Planet(String),
     Agent(u32),
 }
@@ -445,11 +446,37 @@ impl PlanetView {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum SectorEdit { New, Rename, Path, Remove }
+
+#[derive(Default)]
+pub struct SectorView {
+    pub id: u64,
+    pub world: String,
+    pub worlds: bool,
+    pub edit: Option<SectorEdit>,
+    pub text: Line,
+    pub error: String,
+}
+
+#[derive(Default, Debug, PartialEq)]
+pub struct SectorStats {
+    pub worlds: usize, pub ships: usize, pub working: usize, pub blocked: usize, pub finished: usize,
+    pub missions: usize, pub queued: usize, pub anomalies: usize,
+}
+
+impl SectorStats {
+    pub fn activity(&self) -> String { format!("{} ships · {} working · {} waiting · {} finished", self.ships, self.working, self.blocked, self.finished) }
+    pub fn work(&self) -> String { format!("{} missions under way · {} queued · {} anomalies", self.missions, self.queued, self.anomalies) }
+}
+
 pub enum Mode {
     Galaxy,
     /// On a world's surface, browsing its buildings and their files.
     Planet(PlanetView),
     Commander,
+    Sectors,
+    Anomalies { id: u64, typing: bool },
     Trade { sel: usize },
     /// Talking to an agent in a popup over the galaxy: its terminal, and a line to write in.
     Chat { id: u32, text: Line, attachments: Vec<Attachment>, sending: bool },
@@ -596,6 +623,17 @@ pub struct App {
     pub log: VecDeque<LogEntry>,
     /// What the situation log view shows.
     pub sit: SitFilter,
+    pub sectors: crate::sector::Book,
+    pub sector_view: SectorView,
+    pub sector_focus: Option<u64>,
+    pub sector_error: String,
+    sector_path: Option<PathBuf>,
+    pub anomalies: crate::anomaly::Book,
+    pub anomaly_filter: crate::anomaly::Filter,
+    pub anomaly_detail: usize,
+    pub anomaly_error: String,
+    anomaly_path: Option<PathBuf>,
+    anomaly_return: Option<u64>,
     pub toast: Option<(String, f32)>,
     pub mode: Mode,
     planet_return: Option<PlanetView>,
@@ -848,6 +886,17 @@ impl App {
             fx: Vec::new(),
             log: VecDeque::new(),
             sit: SitFilter::default(),
+            sectors: Default::default(),
+            sector_view: Default::default(),
+            sector_focus: None,
+            sector_error: String::new(),
+            sector_path: if cfg!(test) { None } else { Some(crate::sector::path()) },
+            anomalies: Default::default(),
+            anomaly_filter: Default::default(),
+            anomaly_detail: 0,
+            anomaly_error: String::new(),
+            anomaly_path: if cfg!(test) { None } else { Some(crate::anomaly::path()) },
+            anomaly_return: None,
             toast: None,
             mode: Mode::Galaxy,
             commander: String::new(),
@@ -870,9 +919,9 @@ impl App {
             pick: None,
             survey: survey::Snapshot::default(),
             missions: Vec::new(),
-            prestige: std::fs::read_to_string(prestige_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+            prestige: if cfg!(test) { Default::default() } else { std::fs::read_to_string(prestige_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default() },
             fanfares: Vec::new(),
-            history: std::fs::read_to_string(history_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+            history: if cfg!(test) { Default::default() } else { std::fs::read_to_string(history_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default() },
             history_saved: Instant::now(),
             click: ((-1, -1), Instant::now(), 0),
         }
@@ -1073,7 +1122,7 @@ impl App {
                 .map(|i| &w.planets[i])
                 .collect(),
             Sel::Planet(k) => w.planet(k).into_iter().collect(),
-            Sel::Agent(_) | Sel::GitHub => Vec::new(),
+            Sel::Agent(_) | Sel::GitHub | Sel::Sector(_, _) => Vec::new(),
         };
         planets.iter().flat_map(|p| p.agents.iter().map(|&i| &self.agents[i])).filter(|a| a.dying.is_none() && a.status != Status::Exited).collect()
     }
@@ -1331,6 +1380,10 @@ impl App {
                 pmap.entry(k).or_default();
             }
         }
+        // sector members remain charted even without ships or a recent history entry
+        for key in self.sectors.sectors.iter().flat_map(|s| s.worlds.iter()) {
+            if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
+        }
         // worktrees are moons of the world they were split from (which shows up even if empty)
         let host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
         for h in host_of.values() {
@@ -1450,6 +1503,9 @@ impl App {
         if w.station.is_some() { v.push(Sel::GitHub); }
         for s in &w.systems {
             v.push(Sel::Sys(s.key.clone()));
+            if self.sector_map() {
+                v.extend(self.sectors.sectors.iter().filter(|g| s.planets.iter().any(|&i| self.sector_has(g, &w.planets[i].key))).map(|g| Sel::Sector(g.id, s.key.clone())));
+            }
             for &pi in &s.planets {
                 let p = &w.planets[pi];
                 for p in std::iter::once(p).chain(p.moons.iter().map(|&m| &w.planets[m])) {
@@ -1466,6 +1522,7 @@ impl App {
     pub fn sel_pos(&self, w: &World) -> Option<(f32, f32)> {
         match self.sel.as_ref()? {
             Sel::GitHub => w.station,
+            Sel::Sector(id, k) => self.sector_regions(w).into_iter().find(|r| r.id == *id && r.system == *k).map(|r| r.center()),
             Sel::Sys(k) => w.systems.iter().find(|s| &s.key == k).map(|s| s.wpos),
             Sel::Planet(k) => w.planet(k).map(|p| p.wpos),
             Sel::Agent(id) => self.agent(*id).map(|a| a.wpos),
@@ -1474,7 +1531,7 @@ impl App {
 
     /// Keep a selected ship or moon associated with its star in the distant overview.
     pub fn selected_system<'a>(&self, w: &'a World) -> Option<&'a System> {
-        if let Some(Sel::Sys(k)) = &self.sel {
+        if let Some(Sel::Sys(k) | Sel::Sector(_, k)) = &self.sel {
             return w.systems.iter().find(|s| &s.key == k);
         }
         let key = self.sel_planet()?;
@@ -1486,7 +1543,7 @@ impl App {
         match self.sel.as_ref()? {
             Sel::Planet(k) => Some(k.clone()),
             Sel::Agent(id) => self.agent(*id).map(|a| a.cwd.clone()),
-            Sel::Sys(_) | Sel::GitHub => None,
+            Sel::Sys(_) | Sel::GitHub | Sel::Sector(_, _) => None,
         }
     }
 
@@ -1781,11 +1838,24 @@ impl App {
             Some(Sel::GitHub) => self.mode = Mode::Trade { sel: 0 },
             Some(Sel::Agent(id)) => self.mode = Mode::Ship { id, sel: 0 },
             Some(Sel::Planet(k)) => self.mode = Mode::Planet(PlanetView::new(k)),
+            Some(Sel::Sector(id, k)) => {
+                if let Some(r) = self.sector_regions(w).into_iter().find(|r| r.id == id && r.system == k) {
+                    (self.cam.tx, self.cam.ty) = r.center();
+                    let (x0, y0, x1, y1) = r.bounds;
+                    self.cam.tz = (l.vw / (x1 - x0 + 60.0)).min(l.vh / (y1 - y0 + 60.0)).clamp(SECTOR_ZOOM + 0.15, 2.5);
+                    self.sector_focus = Some(id);
+                }
+            }
             Some(Sel::Sys(k)) => {
                 if let Some(s) = w.systems.iter().find(|s| s.key == k) {
                     let r = s.orbits.last().copied().unwrap_or(40.0) + 40.0;
                     (self.cam.tx, self.cam.ty) = s.wpos;
-                    self.cam.tz = (l.vw / (2.0 * r)).min(l.vh / (1.2 * r)).clamp(OVERVIEW_ZOOM + 0.1, 4.0);
+                    self.cam.tz = if self.cam.z < OVERVIEW_ZOOM && !self.sectors.sectors.is_empty() {
+                        (OVERVIEW_ZOOM + SECTOR_ZOOM) * 0.5
+                    } else {
+                        let min = if self.sectors.sectors.is_empty() { OVERVIEW_ZOOM + 0.1 } else { SECTOR_ZOOM + 0.15 };
+                        (l.vw / (2.0 * r)).min(l.vh / (1.2 * r)).clamp(min, 4.0)
+                    };
                 }
             }
             None => {}
@@ -1844,6 +1914,7 @@ pub struct Need {
 }
 
 pub enum AttentionTarget {
+    Anomaly(u64),
     Agent(u32),
     Needs,
     Pr(survey::Pr),
@@ -1898,6 +1969,9 @@ impl App {
                 rows.push(Attention { id: format!("pr:{}:{}", p.key, pr.number), world: p.key.clone(), kind: if mine { "CI failed" } else { "Review" }, title: format!("#{} {}", pr.number, pr.title), detail: format!("{}\n{}\n{freshness}", if mine { "Your pull request has failing checks." } else { "Your review has been requested." }, pr.title), target: AttentionTarget::Pr(pr.clone()), rank: if mine { 2 } else { 3 } });
             }
         }
+        for f in self.anomalies.findings.iter().filter(|f| f.state == crate::anomaly::State::Open && f.kind != "CI") {
+            rows.push(Attention { id: format!("anomaly:{}", f.id), world: f.world.clone(), kind: "Anomaly", title: f.title.clone(), detail: f.evidence.clone(), target: AttentionTarget::Anomaly(f.id), rank: 4 });
+        }
         rows.sort_by(|a, b| (a.rank, &a.world, &a.id).cmp(&(b.rank, &b.world, &b.id)));
         rows
     }
@@ -1914,6 +1988,382 @@ impl App {
         self.mode = Mode::Commander;
     }
 }
+
+impl App {
+    fn edit_anomalies(&mut self, change: impl FnOnce(&mut crate::anomaly::Book)) {
+        let result = match &self.anomaly_path {
+            Some(path) => crate::anomaly::edit(path, change),
+            None => { change(&mut self.anomalies); Ok(self.anomalies.clone()) }
+        };
+        match result {
+            Ok(book) => { self.anomalies = book; self.anomaly_error.clear(); }
+            Err(e) => {
+                let msg = format!("Anomalies could not be saved or loaded: {e}");
+                if self.anomaly_error != msg { self.say(Ev::Error, msg.clone(), RED); }
+                self.anomaly_error = msg;
+            }
+        }
+    }
+
+    fn refresh_anomalies(&mut self) {
+        use crate::anomaly::{Observation, State, Event};
+        let mut seen = Vec::new();
+        for (path, w) in &self.survey.worlds {
+            let host = w.host.as_ref().unwrap_or(path);
+            let obs = |key: String, kind: &str, title: String, evidence: String, at: i64, present: bool| Observation {
+                key, kind: kind.into(), world: path.clone(), host: host.clone(), title, evidence, at, present,
+            };
+            if let Some(at) = w.checked {
+                seen.push(obs("conflicts".into(), "Git", "Unresolved merge conflicts".into(), format!("git status reports unmerged files:\n{}", w.conflicts.join("\n")), at, !w.conflicts.is_empty()));
+                if w.host.is_some() && self.loaded && self.online {
+                    let crewed = self.agents.iter().any(|a| a.cwd == *path && a.dying.is_none() && a.status != Status::Exited);
+                    seen.push(obs("uncrewed".into(), "Moon", "Worktree moon has no ship".into(), format!("Branch: {}\nHost: {host}\nNo running agent is assigned here. This does not establish that the worktree is abandoned.", w.branch), at, !crewed));
+                }
+            }
+            if let Some(at) = w.prs_checked.filter(|_| w.prs_error.is_none() && w.host.is_none()) {
+                for pr in w.prs.iter().filter(|p| p.ci == "fail" || p.ci == "pass") {
+                    seen.push(obs(format!("ci:{}", pr.number), "CI", format!("PR #{} has failing checks", pr.number), format!("{}\nAuthor: {}\nGitHub check rollup: {}", pr.title, pr.author, pr.ci), at, pr.ci == "fail"));
+                }
+            }
+        }
+        let missions = self.missions.clone();
+        self.edit_anomalies(|book| {
+            for o in seen { book.observe(o); }
+            for f in &mut book.findings {
+                let tag = format!("{} ", f.tag());
+                for m in &missions {
+                    if m.cwd != f.world || !m.text.starts_with(&tag) || (m.at as i64) < f.first { continue; }
+                    if !f.missions.contains(&m.id) {
+                        f.missions.push(m.id);
+                        f.history.push(Event { at: m.at as i64, note: format!("Investigation mission #{} linked", m.id) });
+                        if f.state == State::Open { f.state = State::Investigating; }
+                    }
+                    if m.state == "done" {
+                        let note = format!("Mission #{} finished its turn; finding still needs verification", m.id);
+                        if !f.history.iter().any(|h| h.note == note) { f.history.push(Event { at: m.done_at.unwrap_or(m.at) as i64, note }); }
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn anomaly_count(&self, key: &str, system: bool) -> usize {
+        self.anomalies.findings.iter().filter(|f| f.state.active() && if system { f.system == key } else { f.world == key || f.host == key }).count()
+    }
+
+    pub fn anomaly_rows(&self) -> Vec<&crate::anomaly::Finding> { self.anomaly_filter.rows(&self.anomalies) }
+
+    fn open_anomalies(&mut self) {
+        self.anomaly_filter = crate::anomaly::Filter::default();
+        self.anomaly_detail = 0;
+        self.mode = Mode::Anomalies { id: self.anomaly_rows().first().map_or(0, |f| f.id), typing: false };
+    }
+
+    fn investigate_anomaly(&mut self, id: u64, t: f32) {
+        let Some(f) = self.anomalies.findings.iter().find(|f| f.id == id) else { return };
+        if !Path::new(&f.world).is_dir() { self.toast("this world's folder is unavailable", t); return; }
+        let mut text = Line::default();
+        text.set(format!("{} Investigate: {}\n\nWorld: {}\nSource: {}\nObserved evidence:\n{}\n\nInvestigate read-only. Verify whether this still holds and report supporting evidence, possible causes and a concrete next step. Do not fix, commit, merge, push or delete anything. Report uncertainty explicitly.\n\nInclude any additional findings in your reply with their world, evidence and uncertainty. This finding already exists; report its outcome in your reply.", f.tag(), f.title, f.world, f.kind, f.evidence));
+        let planet = f.world.clone();
+        let role = ROLES.iter().position(|r| *r == Role::Scout).unwrap_or(0);
+        self.anomaly_return = Some(id);
+        self.jev.touched = true;
+        self.mode = Mode::Brief { planet, text, kind: 0, launch: true, role, to: None, attachments: vec![], sending: false };
+    }
+}
+
+fn anomaly_input(app: &mut App, w: &World, l: &Lay, ev: &Event, id: u64, mut typing: bool, t: f32) {
+    use crate::anomaly::{State, Filter, KINDS, STATES};
+    let ids: Vec<_> = app.anomaly_rows().iter().map(|f| f.id).collect();
+    let mut sel = ids.iter().position(|&n| n == id).unwrap_or(0);
+    let mut action = None;
+    match ev {
+        Event::Key(k) if k.kind == KeyEventKind::Release => return,
+        Event::Paste(s) if typing => app.anomaly_filter.query.extend(s.chars().filter(|c| !c.is_control())),
+        Event::Key(k) if typing => match k.code {
+            KeyCode::Esc | KeyCode::Enter => typing = false,
+            KeyCode::Backspace => { app.anomaly_filter.query.pop(); }
+            KeyCode::Char(c) => app.anomaly_filter.query.push(c),
+            _ => {}
+        },
+        Event::Key(k) => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => { app.mode = Mode::Galaxy; return; }
+            KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(ids.len().saturating_sub(1)),
+            KeyCode::Home => sel = 0,
+            KeyCode::End => sel = ids.len().saturating_sub(1),
+            KeyCode::PageUp => app.anomaly_detail = app.anomaly_detail.saturating_sub(4),
+            KeyCode::PageDown => app.anomaly_detail = app.anomaly_detail.saturating_add(4),
+            KeyCode::Char('/') => typing = true,
+            KeyCode::Char('f') => app.anomaly_filter.kind = (app.anomaly_filter.kind + 1) % KINDS.len(),
+            KeyCode::Char('v') => app.anomaly_filter.state = (app.anomaly_filter.state + 1) % STATES.len(),
+            KeyCode::Char('w') => {
+                if app.anomaly_filter.world.take().is_none() {
+                    app.anomaly_filter.world = ids.get(sel).and_then(|id| app.anomalies.findings.iter().find(|f| f.id == *id)).map(|f| f.host.clone());
+                }
+            }
+            KeyCode::Char('s') => {
+                if app.anomaly_filter.system.take().is_none() {
+                    app.anomaly_filter.system = ids.get(sel).and_then(|id| app.anomalies.findings.iter().find(|f| f.id == *id)).map(|f| f.system.clone());
+                }
+            }
+            KeyCode::Char('x') => app.anomaly_filter = Filter::default(),
+            KeyCode::Enter => action = Some('l'),
+            KeyCode::Char(c @ ('t' | 'd' | 'i' | 'r' | 'o')) => action = Some(c),
+            _ => {}
+        },
+        Event::Mouse(m) => match m.kind {
+            MouseEventKind::ScrollUp => sel = sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => sel = (sel + 1).min(ids.len().saturating_sub(1)),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(i) = draw::anomaly_hit(l, ids.len(), sel, m.column as i32, m.row as i32) {
+                    if i == sel { action = Some('l'); }
+                    sel = i;
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    let rows: Vec<_> = app.anomaly_rows().iter().map(|f| f.id).collect();
+    let selected = if rows == ids { rows.get(sel).copied() } else { rows.iter().copied().find(|n| *n == id).or(rows.first().copied()) }.unwrap_or(0);
+    if selected != id { app.anomaly_detail = 0; }
+    app.mode = Mode::Anomalies { id: selected, typing };
+    let Some(f) = app.anomalies.findings.iter().find(|f| f.id == selected) else { return };
+    let world = f.world.clone();
+    match action {
+        Some('t') => app.investigate_anomaly(selected, t),
+        Some('l') => {
+            if w.planet(&world).is_none() && !Path::new(&world).is_dir() { app.toast("this world's folder is unavailable", t); return; }
+            app.history.insert(world.clone(), survey::now().max(0) as u64);
+            app.sel = Some(Sel::Planet(world));
+            let map = app.world(t, 0.0);
+            app.glide_to_sel(&map);
+            app.cam.tz = 1.6;
+            app.mode = Mode::Galaxy;
+        }
+        Some(c) => {
+            let state = match c { 'd' => State::Deferred, 'i' => State::Dismissed, 'r' => State::Resolved, _ => State::Open };
+            app.edit_anomalies(|b| b.set_state(selected, state, survey::now()));
+            app.anomaly_detail = 0;
+        }
+        None => {}
+    }
+}
+
+
+impl App {
+    pub fn sector_has(&self, sector: &crate::sector::Sector, path: &str) -> bool {
+        sector.contains(path, self.survey.worlds.get(path).and_then(|w| w.host.as_deref()))
+    }
+
+    pub fn focused_sector(&self) -> Option<&crate::sector::Sector> {
+        self.sector_focus.and_then(|id| self.sectors.sectors.iter().find(|s| s.id == id))
+    }
+
+    pub fn selected_sector(&self) -> Option<&crate::sector::Sector> {
+        self.sectors.sectors.iter().find(|s| s.id == self.sector_view.id).or(self.sectors.sectors.first())
+    }
+
+    pub fn sector_worlds(&self, w: &World) -> Vec<String> {
+        let mut worlds: std::collections::BTreeSet<String> = w.planets.iter().map(|p| p.host.map_or_else(|| p.key.clone(), |i| w.planets[i].key.clone())).collect();
+        if let Some(s) = self.selected_sector() { worlds.extend(s.worlds.iter().cloned()); }
+        worlds.into_iter().collect()
+    }
+
+    pub fn sector_stats(&self, sector: &crate::sector::Sector) -> SectorStats {
+        let mut stats = SectorStats { worlds: sector.worlds.len(), ..Default::default() };
+        for a in self.agents.iter().filter(|a| a.dying.is_none() && a.status != Status::Exited && self.sector_has(sector, &a.cwd)) {
+            stats.ships += 1;
+            match a.status { Status::Working => stats.working += 1, Status::Blocked => stats.blocked += 1, Status::Done => stats.finished += 1, _ => {} }
+        }
+        for m in self.missions.iter().filter(|m| self.sector_has(sector, &m.cwd)) {
+            match m.state.as_str() { "active" | "sent" => stats.missions += 1, "queued" => stats.queued += 1, _ => {} }
+        }
+        stats.anomalies = self.anomalies.findings.iter().filter(|f| f.state.active() && sector.contains(&f.world, Some(&f.host))).count();
+        stats
+    }
+
+    fn sync_sectors(&mut self, change: impl FnOnce(&mut crate::sector::Book) -> Result<u64, String>) -> Result<u64, String> {
+        let mut result = Ok(0);
+        let apply = |b: &mut crate::sector::Book| { result = change(b); };
+        let loaded = match &self.sector_path {
+            Some(path) => crate::sector::edit(path, apply),
+            None => { apply(&mut self.sectors); Ok(self.sectors.clone()) }
+        };
+        match loaded {
+            Ok(book) => {
+                self.sectors = book;
+                self.sector_error.clear();
+                if self.sector_focus.is_some() && self.focused_sector().is_none() { self.sector_focus = None; }
+                result
+            }
+            Err(e) => {
+                let msg = format!("Sectors could not be saved or loaded: {e}");
+                if self.sector_error != msg { self.say(Ev::Error, msg.clone(), RED); }
+                self.sector_error = msg.clone();
+                Err(msg)
+            }
+        }
+    }
+
+    fn open_sectors(&mut self) {
+        let _ = self.sync_sectors(|_| Ok(0));
+        let picked = self.sel_planet();
+        let selected = match &self.sel { Some(Sel::Sector(id, _)) => self.sectors.sectors.iter().find(|s| s.id == *id), _ => None };
+        self.sector_view.id = selected.or_else(|| self.focused_sector()).or_else(|| picked.as_ref().and_then(|p| self.sectors.sectors.iter().find(|s| self.sector_has(s, p))))
+            .or_else(|| self.selected_sector()).map_or(0, |s| s.id);
+        if let Some(p) = picked { self.sector_view.world = self.moon_host(&p).unwrap_or(p); }
+        self.sector_view.edit = None;
+        self.sector_view.error.clear();
+        self.mode = Mode::Sectors;
+    }
+
+    fn focus_sector(&mut self, l: &Lay, t: f32) {
+        let Some(s) = self.selected_sector().cloned() else { return };
+        let w = self.world(t, 0.0);
+        let mut points = Vec::new();
+        for (i, p) in w.planets.iter().enumerate().filter(|(_, p)| self.sector_has(&s, &p.key)) {
+            points.push(p.wpos);
+            if let Some(sys) = w.system_of(i) { points.push(sys.wpos); }
+        }
+        if points.is_empty() { self.sector_view.error = "Add an available world before focusing this sector".into(); return; }
+        let bounds = points.iter().fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)));
+        self.cam.tx = (bounds.0 + bounds.2) * 0.5;
+        self.cam.ty = (bounds.1 + bounds.3) * 0.5;
+        self.cam.tz = (l.vw / (bounds.2 - bounds.0 + 100.0)).min(l.vh / (bounds.3 - bounds.1 + 100.0)).clamp(0.12, (OVERVIEW_ZOOM + SECTOR_ZOOM) * 0.5);
+        self.sector_focus = Some(s.id);
+        self.sel = None;
+        self.mode = Mode::Galaxy;
+    }
+
+    fn sector_anomalies(&mut self) {
+        let Some(s) = self.selected_sector().cloned() else { return };
+        self.open_anomalies();
+        self.anomaly_filter.sector = Some((s.name, s.worlds));
+        self.mode = Mode::Anomalies { id: self.anomaly_rows().first().map_or(0, |f| f.id), typing: false };
+    }
+}
+
+fn sector_input(app: &mut App, w: &World, l: &Lay, ev: &Event, t: f32) {
+    if let Event::Key(k) = ev && k.kind == KeyEventKind::Release { return; }
+    if let Some(edit) = app.sector_view.edit {
+        match ev {
+            Event::Key(k) if k.code == KeyCode::Esc => { app.sector_view.edit = None; app.sector_view.error.clear(); }
+            Event::Key(k) if matches!(edit, SectorEdit::Remove) => {
+                if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    let id = app.sector_view.id;
+                    match app.sync_sectors(|b| b.remove(id).map(|_| 0)) {
+                        Ok(_) => { app.sector_view = SectorView::default(); }
+                        Err(e) => app.sector_view.error = e,
+                    }
+                } else { app.sector_view.edit = None; }
+            }
+            Event::Key(k) if k.code == KeyCode::Enter => {
+                let id = app.sector_view.id;
+                let text = app.sector_view.text.s.clone();
+                let result = match edit {
+                    SectorEdit::New => app.sync_sectors(|b| b.create(&text)),
+                    SectorEdit::Rename => app.sync_sectors(|b| b.rename(id, &text).map(|_| id)),
+                    SectorEdit::Path => {
+                        let path = expand(text.trim()).canonicalize();
+                        match path {
+                            Ok(path) if path.is_dir() => {
+                                let path = path.to_string_lossy().into_owned();
+                                let host = survey::world_host(&path).unwrap_or(path);
+                                let result = app.sync_sectors(|b| {
+                                    if !b.sectors.iter().any(|s| s.id == id && s.contains(&host, None)) { b.toggle(id, &host)?; }
+                                    Ok(id)
+                                });
+                                if result.is_ok() { app.sector_view.world = host; }
+                                result
+                            }
+                            _ => Err("Choose an existing folder; sectors do not create or move folders".into()),
+                        }
+                    }
+                    SectorEdit::Remove => unreachable!(),
+                };
+                match result {
+                    Ok(id) => { app.sector_view.id = id; app.sector_view.edit = None; app.sector_view.worlds = true; app.sector_view.error.clear(); }
+                    Err(e) => app.sector_view.error = e,
+                }
+            }
+            Event::Key(k) => { app.sector_view.text.key(k); }
+            Event::Paste(s) if !matches!(edit, SectorEdit::Remove) => {
+                app.sector_view.text.paste_lines(&s.chars().filter(|c| !c.is_control()).collect::<String>());
+            }
+            _ => {}
+        }
+        return;
+    }
+    let sectors: Vec<_> = app.sectors.sectors.iter().map(|s| s.id).collect();
+    let worlds = app.sector_worlds(w);
+    let mut si = sectors.iter().position(|id| *id == app.sector_view.id).unwrap_or(0);
+    let mut wi = worlds.iter().position(|p| *p == app.sector_view.world).unwrap_or(0);
+    let mut pane = app.sector_view.worlds;
+    let mut action = None;
+    let page = (l.rows - 14).max(1) as usize;
+    match ev {
+        Event::Key(k) => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('V') => { app.mode = Mode::Galaxy; return; }
+            KeyCode::Tab | KeyCode::BackTab => pane = !pane,
+            KeyCode::Left => pane = false,
+            KeyCode::Right => pane = true,
+            KeyCode::Up | KeyCode::Char('k') => if pane { wi = wi.saturating_sub(1); } else { si = si.saturating_sub(1); },
+            KeyCode::Down | KeyCode::Char('j') => if pane { wi = (wi + 1).min(worlds.len().saturating_sub(1)); } else { si = (si + 1).min(sectors.len().saturating_sub(1)); },
+            KeyCode::Home => if pane { wi = 0; } else { si = 0; },
+            KeyCode::End => if pane { wi = worlds.len().saturating_sub(1); } else { si = sectors.len().saturating_sub(1); },
+            KeyCode::PageUp => if pane { wi = wi.saturating_sub(page); } else { si = si.saturating_sub(page); },
+            KeyCode::PageDown => if pane { wi = (wi + page).min(worlds.len().saturating_sub(1)); } else { si = (si + page).min(sectors.len().saturating_sub(1)); },
+            KeyCode::Enter => action = Some(if pane { 'l' } else { 'f' }),
+            KeyCode::Char(c @ ('n' | 'r' | 'x' | 'p' | 'f' | 'a' | ' ')) => action = Some(c),
+            _ => {}
+        },
+        Event::Mouse(m) => match m.kind {
+            MouseEventKind::ScrollUp => if pane { wi = wi.saturating_sub(1); } else { si = si.saturating_sub(1); },
+            MouseEventKind::ScrollDown => if pane { wi = (wi + 1).min(worlds.len().saturating_sub(1)); } else { si = (si + 1).min(sectors.len().saturating_sub(1)); },
+            MouseEventKind::Up(MouseButton::Left) => match draw::sector_hit(l, sectors.len(), worlds.len(), si, wi, m.column as i32, m.row as i32) {
+                Some((false, i)) => { pane = false; si = i; }
+                Some((true, i)) => { pane = true; wi = i; }
+                None => {}
+            },
+            _ => {}
+        },
+        _ => {}
+    }
+    let id = sectors.get(si).copied().unwrap_or(0);
+    app.sector_view.id = id;
+    app.sector_view.world = worlds.get(wi).cloned().unwrap_or_default();
+    app.sector_view.worlds = pane;
+    match action {
+        Some('n') => { app.sector_view.edit = Some(SectorEdit::New); app.sector_view.text.set(String::new()); app.sector_view.error.clear(); }
+        Some(c @ ('r' | 'p' | 'x')) if id != 0 => {
+            app.sector_view.edit = Some(match c { 'r' => SectorEdit::Rename, 'p' => SectorEdit::Path, _ => SectorEdit::Remove });
+            let value = if c == 'r' { app.selected_sector().unwrap().name.clone() } else { String::new() };
+            app.sector_view.text.set(value);
+            app.sector_view.error.clear();
+        }
+        Some(' ') if pane && id != 0 => {
+            if let Some(world) = worlds.get(wi) {
+                match app.sync_sectors(|b| b.toggle(id, world).map(|_| id)) {
+                    Ok(_) => app.sector_view.error.clear(),
+                    Err(e) => app.sector_view.error = e,
+                }
+            }
+        }
+        Some('f') => app.focus_sector(l, t),
+        Some('a') => app.sector_anomalies(),
+        Some('l') => {
+            if let Some(path) = worlds.get(wi) {
+                if w.planet(path).is_none() { app.sector_view.error = "This world's folder is unavailable or is still being charted".into(); return; }
+                app.sel = Some(Sel::Planet(path.clone()));
+                app.glide_to_sel(w); app.cam.tz = 1.6; app.mode = Mode::Galaxy;
+            }
+        }
+        _ => {}
+    }
+}
+
 
 fn commander_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event) {
     let rows = app.attention(w);
@@ -1962,6 +2412,10 @@ fn commander_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
                 app.sel = Some(Sel::Agent(*id));
                 app.commander_return = true;
                 app.open_comms(*id, client, l);
+            }
+            AttentionTarget::Anomaly(id) => {
+                app.open_anomalies();
+                app.mode = Mode::Anomalies { id: *id, typing: false };
             }
             AttentionTarget::Needs => app.mode = Mode::Actions { planet: row.world.clone(), sel: 0 },
             AttentionTarget::Deploy => app.mode = Mode::Deploy { planet: row.world.clone(), kind: 0 },
@@ -2029,6 +2483,67 @@ const HISTORY_WORLDS: usize = 40;
 
 /// Below this scale, individual ships and worlds no longer have room on screen.
 pub const OVERVIEW_ZOOM: f32 = 0.45;
+/// Between the galaxy overview and planetary detail, sectors trace their member worlds.
+pub const SECTOR_ZOOM: f32 = 1.05;
+
+/// One sector's territory within a star system; moons belong to their host marker.
+pub struct SectorRegion {
+    pub id: u64,
+    pub system: String,
+    pub worlds: Vec<usize>,
+    pub hull: Vec<(f32, f32)>,
+    pub bounds: (f32, f32, f32, f32),
+}
+
+impl SectorRegion {
+    pub fn center(&self) -> (f32, f32) { ((self.bounds.0 + self.bounds.2) * 0.5, (self.bounds.1 + self.bounds.3) * 0.5) }
+    pub fn contains(&self, p: (f32, f32)) -> bool {
+        (0..self.hull.len()).all(|i| {
+            let (a, b) = (self.hull[i], self.hull[(i + 1) % self.hull.len()]);
+            (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0) >= 0.0
+        })
+    }
+}
+
+impl App {
+    pub fn sector_map(&self) -> bool { self.cam.z >= OVERVIEW_ZOOM && self.cam.z < SECTOR_ZOOM && !self.sectors.sectors.is_empty() }
+
+    pub fn sector_regions(&self, w: &World) -> Vec<SectorRegion> {
+        let mut regions = Vec::new();
+        for g in &self.sectors.sectors {
+            for s in &w.systems {
+                let worlds: Vec<_> = s.planets.iter().copied().filter(|&i| self.sector_has(g, &w.planets[i].key)).collect();
+                if worlds.is_empty() { continue; }
+                let mut points: Vec<_> = worlds.iter().flat_map(|&i| {
+                    let p = &w.planets[i];
+                    (0..12).map(move |n| {
+                        let a = n as f32 * TAU / 12.0;
+                        (p.wpos.0 + (p.r + 16.0) * a.cos(), p.wpos.1 + (p.r + 16.0) * a.sin())
+                    })
+                }).collect();
+                points.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+                let bounds = points.iter().fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)));
+                // Rounded hulls hug the worlds instead of enclosing an entire system.
+                let mut hull: Vec<(f32, f32)> = Vec::new();
+                for reverse in [false, true] {
+                    let start = hull.len();
+                    for n in 0..points.len() {
+                        let p = points[if reverse { points.len() - 1 - n } else { n }];
+                        while hull.len() >= start + 2 {
+                            let (a, b) = (hull[hull.len() - 2], hull[hull.len() - 1]);
+                            if (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0) > 0.0 { break; }
+                            hull.pop();
+                        }
+                        hull.push(p);
+                    }
+                    hull.pop();
+                }
+                regions.push(SectorRegion { id: g.id, system: s.key.clone(), worlds, hull, bounds });
+            }
+        }
+        regions
+    }
+}
 
 /// `s`, cut to `n` chars with an ellipsis.
 pub fn clip(s: &str, n: usize) -> String {
@@ -2139,7 +2654,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                     match result {
                         Ok(()) => {
                             let launched = matches!(app.mode, Mode::Brief { launch: true, .. });
-                            app.mode = app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet);
+                            app.mode = app.anomaly_return.take().map_or_else(|| app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet), |id| Mode::Anomalies { id, typing: false });
                             app.toast(if launched { "mission launched" } else { "mission queued" }, t);
                         }
                         Err(e) => {
@@ -2273,6 +2788,8 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                 }
             }
             app.survey = snap;
+            app.refresh_anomalies();
+            let _ = app.sync_sectors(|_| Ok(0));
             for (path, id, pts, why) in awards {
                 app.award(&path, id, pts, &why, &mut cues);
             }
@@ -2629,6 +3146,14 @@ fn handle(
         return false;
     }
 
+    if matches!(app.mode, Mode::Sectors) {
+        sector_input(app, w, l, &ev, t);
+        return false;
+    }
+    if let Mode::Anomalies { id, typing } = app.mode {
+        anomaly_input(app, w, l, &ev, id, typing, t);
+        return false;
+    }
     if let Event::Paste(pasted) = &ev {
         if let Mode::Brief { text, attachments, sending: false, .. } = &mut app.mode {
             if let Err(e) = paste_brief(text, attachments, pasted, &screenshots::directory()) {
@@ -2936,7 +3461,7 @@ fn handle(
             match k.code {
                 KeyCode::Esc => {
                     screenshots::discard(attachments);
-                    app.mode = app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet);
+                    app.mode = app.anomaly_return.take().map_or_else(|| app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet), |id| Mode::Anomalies { id, typing: false });
                 }
                 KeyCode::Char('v') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     let result = if attachments.len() >= screenshots::MAX_ATTACHMENTS {
@@ -3061,7 +3586,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Galaxy | Mode::Planet(_) | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
+        Mode::Galaxy | Mode::Sectors | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
     // ── galaxy
@@ -3078,8 +3603,10 @@ fn handle(
     match k.code {
         KeyCode::Char('q') => return true,
         KeyCode::Char('C') => app.open_commander(w),
+        KeyCode::Char('A') => app.open_anomalies(),
+        KeyCode::Char('V') => app.open_sectors(),
         KeyCode::Char('c') if ctrl => return true,
-        KeyCode::Esc => app.sel = None,
+        KeyCode::Esc => { app.sel = None; app.sector_focus = None; },
         KeyCode::Down | KeyCode::Char('j') => pick(app, cur.map_or(0, |c| (c + 1).min(rows.len().saturating_sub(1)))),
         KeyCode::Up | KeyCode::Char('k') => pick(app, cur.map_or(0, |c| c.saturating_sub(1))),
         KeyCode::Home | KeyCode::Char('g') => pick(app, 0),
@@ -3088,8 +3615,8 @@ fn handle(
         KeyCode::Enter
             if let Some(id) = app.transmission().map(|a| a.id)
                 && app.sel != Some(Sel::GitHub)
-                && !matches!(app.sel, Some(Sel::Planet(_)))
-                && !(app.cam.z < OVERVIEW_ZOOM && matches!(app.sel, Some(Sel::Sys(_))))
+                && !matches!(app.sel, Some(Sel::Planet(_) | Sel::Sector(_, _)))
+                && !(app.cam.z < SECTOR_ZOOM && matches!(app.sel, Some(Sel::Sys(_))))
                 && !matches!(app.sel, Some(Sel::Agent(s)) if s != id) =>
         {
             app.sel = Some(Sel::Agent(id));
@@ -3173,6 +3700,9 @@ fn handle(
         },
         KeyCode::Char('S') => app.mode = Mode::Situation { id: app.log.front().map_or(0, |e| e.id), typing: false },
         KeyCode::Char('X') => match app.sel_planet() {
+            Some(p) if w.planet(&p).is_some_and(|p| p.dormant) && app.sectors.sectors.iter().any(|s| s.contains(&p, None)) => {
+                app.toast("this world is kept by a sector · V to remove its membership first", t);
+            }
             Some(p) if w.planet(&p).is_some_and(|p| p.dormant) => {
                 app.history.remove(&p);
                 let _ = std::fs::write(history_file(), serde_json::to_string(&app.history).unwrap_or_default());
@@ -3227,7 +3757,9 @@ fn handle(
         KeyCode::Char('-') | KeyCode::Char('_') => app.cam.tz = (app.cam.tz / 1.3).max(0.12),
         KeyCode::Char('z') => app.fit(w, l),
         KeyCode::Char('f') => {
-            if let Some(Sel::Planet(k)) = app.sel.clone() {
+            if matches!(app.sel, Some(Sel::Sector(_, _))) {
+                app.activate(w, l, client);
+            } else if let Some(Sel::Planet(k)) = app.sel.clone() {
                 app.mode = Mode::Planet(PlanetView::new(k));
             } else {
                 app.glide_to_sel(w);
@@ -3437,7 +3969,7 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
     }
 }
 
-/// The object under a screen pixel: ships first, then planets, then stars.
+/// Pick visible objects and labels at the current map scale; ships lead in close-up.
 fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
     let z = app.cam.z;
     let dist = |p: (f32, f32)| {
@@ -3454,6 +3986,19 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
             (px >= label.col as f32 * 2.0 && px < (label.col as f32 + width) * 2.0
                 && py >= label.row as f32 * 4.0 && py < (label.row as f32 + label.lines.len() as f32) * 4.0).then_some(label.target)
         }));
+    }
+    if app.sector_map() {
+        let mut nodes: Vec<_> = w.planets.iter().filter(|p| p.host.is_none()).map(|p| (dist(p.wpos), 5.0, Sel::Planet(p.key.clone()))).collect();
+        nodes.extend(w.systems.iter().map(|s| (dist(s.wpos), 5.0, Sel::Sys(s.key.clone()))));
+        if let Some(p) = w.station { nodes.push((dist(p), 8.0, Sel::GitHub)); }
+        return nearest(nodes).or_else(|| draw::sector_labels(app, w, l).into_iter().find_map(|label| {
+            let width = label.lines.iter().map(|(s, _)| s.chars().count()).max().unwrap_or(0) as f32;
+            (px >= label.col as f32 * 2.0 && px < (label.col as f32 + width) * 2.0
+                && py >= label.row as f32 * 4.0 && py < (label.row as f32 + label.lines.len() as f32) * 4.0).then_some(label.target)
+        })).or_else(|| {
+            let p = ((px - l.vw * 0.5) / z + app.cam.x, (py - l.vy0 - l.vh * 0.5) / z + app.cam.y);
+            app.sector_regions(w).into_iter().find(|r| r.contains(p)).map(|r| Sel::Sector(r.id, r.system))
+        });
     }
     let ships = app.agents.iter().filter(|a| a.dying.is_none()).map(|a| (dist(a.wpos), 6.0 * z.clamp(0.7, 2.2), Sel::Agent(a.id))).collect();
     let planets = w.planets.iter().map(|p| (dist(p.wpos), (p.r * z).max(4.0) + 3.0, Sel::Planet(p.key.clone()))).collect();
@@ -3668,6 +4213,89 @@ mod chat_input_tests {
 #[cfg(test)]
 mod overview_tests {
     use super::*;
+
+
+    #[test]
+    fn middle_zoom_reveals_sectors_and_does_not_pick_hidden_ships() {
+        let (mut app, w, l) = fixture();
+        let id = app.sectors.create("Kiplat").unwrap();
+        app.sectors.toggle(id, "/empire/api").unwrap();
+        app.sectors.toggle(id, "/empire/web").unwrap();
+        app.cam.z = 0.7;
+        (app.cam.x, app.cam.y) = w.systems[0].wpos;
+        let mut fb = Fb::new(100, 36);
+        draw::frame(&mut fb, &mut app, &w, &l, 4.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("KIPLAT"), "sector names must appear without opening or focusing a sector");
+        app.agents[0].wpos = w.planets[0].wpos;
+        let point = l.to_screen(&app.cam, app.agents[0].wpos);
+        assert_eq!(pick_at(&app, &w, &l, point), Some(Sel::Planet(w.planets[0].key.clone())));
+    }
+
+    #[test]
+    fn sector_labels_select_local_region_and_enter_reveals_its_worlds() {
+        let (mut app, w, l) = fixture();
+        let id = app.sectors.create("Kiplat").unwrap();
+        for p in ["/empire/api", "/empire/web"] { app.sectors.toggle(id, p).unwrap(); }
+        app.cam.z = 0.7;
+        (app.cam.x, app.cam.y) = w.systems[0].wpos;
+        let target = Sel::Sector(id, "/empire".into());
+        let labels = draw::sector_labels(&app, &w, &l);
+        let label = labels.iter().find(|p| p.target == target).unwrap();
+        assert_eq!(pick_at(&app, &w, &l, (label.col as f32 * 2.0 + 1.0, label.row as f32 * 4.0 + 2.0)), Some(target.clone()));
+        assert!(app.rows(&w).contains(&target));
+        app.agents[2].ask = Some(Ask { question: "Allow this?".into(), options: vec![crate::proto::Choice { key: "y".into(), label: "Yes".into() }], ..Default::default() });
+        app.sel = Some(target);
+        let center = app.sector_regions(&w)[0].center();
+        handle(&mut app, &w, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), 4.0, &mut None);
+        assert!(matches!(app.mode, Mode::Galaxy));
+        assert_eq!((app.cam.tx, app.cam.ty), center);
+        assert!(app.cam.tz > SECTOR_ZOOM);
+        assert_eq!(app.sector_focus, Some(id));
+        app.sector_focus = Some(app.sectors.create("Other").unwrap());
+        app.open_sectors();
+        assert_eq!(app.sector_view.id, id);
+    }
+
+    #[test]
+    fn sector_regions_are_local_and_moons_share_the_host_marker() {
+        let (mut app, _, _) = fixture();
+        let mut other = ship_card_tests::ship(4, false);
+        other.cwd = "/elsewhere/runtime".into();
+        app.agents.push(other);
+        let id = app.sectors.create("Kiplat").unwrap();
+        for p in ["/empire/api", "/elsewhere/runtime"] { app.sectors.toggle(id, p).unwrap(); }
+        let w = app.world(4.0, 0.0);
+        let regions = app.sector_regions(&w);
+        assert_eq!(regions.len(), 2);
+        assert_ne!(regions[0].system, regions[1].system);
+        for r in &regions {
+            assert_eq!(r.id, id);
+            assert_eq!(r.worlds.len(), 1);
+            let p = &w.planets[r.worlds[0]];
+            assert!(p.host.is_none());
+            assert!(r.contains(p.wpos));
+            assert!(!r.contains((r.bounds.2 + 1.0, r.bounds.3 + 1.0)));
+        }
+        let shared = app.sectors.create("Shared").unwrap();
+        app.sectors.toggle(shared, "/empire/api").unwrap();
+        assert_eq!(app.sector_regions(&w).iter().filter(|r| r.system == "/empire").count(), 2);
+    }
+
+    #[test]
+    fn system_enter_visits_sector_layer_before_planetary_detail() {
+        let (mut app, w, l) = fixture();
+        let id = app.sectors.create("Kiplat").unwrap();
+        app.sectors.toggle(id, "/empire/api").unwrap();
+        app.sel = Some(Sel::Sys("/empire".into()));
+        app.activate(&w, &l, &Client::isolated());
+        app.cam.z = app.cam.tz;
+        assert!(app.sector_map());
+        app.activate(&w, &l, &Client::isolated());
+        app.cam.z = app.cam.tz;
+        assert!(!app.sector_map());
+        assert!(app.cam.z >= SECTOR_ZOOM);
+    }
 
     fn fixture() -> (App, World, Lay) {
         let mut app = App::new();
@@ -4564,4 +5192,323 @@ mod panel_scroll_tests {
         for _ in 0..20 { wheel(&mut app, &w, &l, last, false); }
         assert_eq!(msg(&app, top).as_deref(), Some("entry 29"));
     }
+}
+
+#[cfg(test)]
+mod anomaly_tests {
+    use super::*;
+    use crate::anomaly::{Book, Observation, State};
+
+    fn fixture() -> (App, World, Lay) {
+        let mut app = App::new();
+        app.history.clear();
+        app.online = true;
+        app.loaded = true;
+        let mut a = ship_card_tests::ship(1, false);
+        a.cwd = "/alpha/api".into();
+        app.agents = vec![a];
+        app.survey.worlds.insert("/alpha/api".into(), survey::World { git: true, checked: Some(10), conflicts: vec!["src/login.rs".into()], ..Default::default() });
+        app.refresh_anomalies();
+        let w = app.world(0.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 40), false);
+        (app, w, l)
+    }
+
+    fn key(app: &mut App, w: &World, l: &Lay, code: KeyCode) {
+        handle(app, w, l, &Client::isolated(), None, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 1.0, &mut None);
+    }
+
+    fn text(app: &mut App, w: &World, cols: usize, rows: usize) -> String {
+        let mut fb = Fb::new(cols, rows);
+        let l = Lay::new(&fb, false);
+        draw::frame(&mut fb, app, w, &l, 1.0, None);
+        fb.txt.chunks(cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn browser_filters_and_dismissal_keep_the_evidence_and_history() {
+        let (mut app, w, l) = fixture();
+        key(&mut app, &w, &l, KeyCode::Char('A'));
+        let screen = text(&mut app, &w, 120, 40);
+        assert!(screen.contains("ANOMALIES"));
+        assert!(screen.contains("src/login.rs"));
+        assert!(screen.contains("System: /alpha"));
+        key(&mut app, &w, &l, KeyCode::Char('/'));
+        handle(&mut app, &w, &l, &Client::isolated(), None, Event::Paste("not found".into()), 1.0, &mut None);
+        assert!(app.anomaly_rows().is_empty());
+        key(&mut app, &w, &l, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Anomalies { .. }));
+        key(&mut app, &w, &l, KeyCode::Char('x'));
+        key(&mut app, &w, &l, KeyCode::Char('i'));
+        app.refresh_anomalies();
+        assert!(app.anomaly_rows().is_empty());
+        assert_eq!(app.anomalies.findings[0].state, State::Dismissed);
+        key(&mut app, &w, &l, KeyCode::Char('v'));
+        assert_eq!(app.anomaly_rows().len(), 1);
+        assert!(text(&mut app, &w, 120, 40).contains("Marked dismissed"));
+        key(&mut app, &w, &l, KeyCode::Char('o'));
+        assert_eq!(app.anomalies.findings[0].state, State::Open);
+        assert!(text(&mut app, &w, 80, 24).contains("ANOMALIES"));
+    }
+
+    #[test]
+    fn long_anomaly_lists_mouse_selection_and_details_scroll() {
+        let (mut app, w, l) = fixture();
+        for i in 0..40 {
+            app.anomalies.observe(Observation { key: format!("report:{i}"), world: "/alpha/api".into(), host: "/alpha/api".into(), kind: "Report".into(),
+                title: format!("finding {i}"), evidence: (0..60).map(|n| format!("evidence line {n}\n")).collect(), at: 100 + i, present: true });
+        }
+        key(&mut app, &w, &l, KeyCode::Char('A'));
+        key(&mut app, &w, &l, KeyCode::End);
+        let screen = text(&mut app, &w, 120, 40);
+        let row = screen.lines().position(|s| s.contains("open · Git · api · #1")).unwrap();
+        assert_eq!(draw::anomaly_hit(&l, 41, 40, 5, row as i32), Some(40));
+        key(&mut app, &w, &l, KeyCode::Home);
+        for _ in 0..30 { key(&mut app, &w, &l, KeyCode::PageDown); }
+        assert!(text(&mut app, &w, 120, 40).contains("evidence line 59"));
+        key(&mut app, &w, &l, KeyCode::Char('d'));
+        assert_eq!(app.anomalies.findings.last().unwrap().state, State::Deferred);
+        assert!(!app.attention(&w).iter().any(|r| r.title == "finding 39"));
+        assert!(app.attention(&w).iter().any(|r| r.title == "finding 38"));
+    }
+
+    #[test]
+    fn stale_or_missing_surveys_do_not_resolve_findings() {
+        let (mut app, _, _) = fixture();
+        let s = app.survey.worlds.get_mut("/alpha/api").unwrap();
+        s.prs_checked = Some(10);
+        s.prs.push(survey::Pr { number: 42, ci: "fail", title: "Login".into(), ..Default::default() });
+        app.refresh_anomalies();
+        assert_eq!(app.anomalies.findings.len(), 2);
+        let s = app.survey.worlds.get_mut("/alpha/api").unwrap();
+        s.prs[0].ci = "pass";
+        s.prs_checked = Some(20);
+        s.prs_error = Some("offline".into());
+        s.checked = None;
+        s.conflicts.clear();
+        app.refresh_anomalies();
+        assert!(app.anomalies.findings.iter().all(|f| f.state == State::Open));
+        app.survey.worlds.clear();
+        app.refresh_anomalies();
+        assert!(app.anomalies.findings.iter().all(|f| f.state == State::Open));
+    }
+
+    #[test]
+    fn a_moons_anomaly_counts_once_in_its_host_system() {
+        let (mut app, w, l) = fixture();
+        app.survey.worlds.insert("/moons/api-fix".into(), survey::World { git: true, checked: Some(20), host: Some("/alpha/api".into()), branch: "fix".into(), ..Default::default() });
+        app.refresh_anomalies();
+        assert_eq!(app.anomaly_count("/alpha", true), 2);
+        assert_eq!(app.anomaly_count("/alpha/api", false), 2);
+        assert_eq!(app.anomaly_count("/moons/api-fix", false), 1);
+        app.cam.z = 0.3;
+        let labels = draw::overview_labels(&app, &w, &l);
+        assert!(labels.iter().flat_map(|l| l.lines.iter()).any(|(s, _)| s.contains("2 anomalies")));
+        app.anomaly_filter.system = Some("/alpha".into());
+        assert_eq!(app.anomaly_rows().len(), 2);
+        app.anomaly_filter.world = Some("/alpha/api".into());
+        app.anomaly_filter.kind = 3;
+        assert_eq!(app.anomaly_rows()[0].world, "/moons/api-fix");
+        app.online = false;
+        app.agents.clear();
+        app.refresh_anomalies();
+        assert_eq!(app.anomalies.findings.len(), 2);
+    }
+
+    #[test]
+    fn investigation_is_a_scout_draft_and_cancel_does_not_start_it() {
+        let (mut app, w, l) = fixture();
+        app.anomalies = Book::default();
+        app.anomalies.observe(Observation { key: "report".into(), world: "/tmp".into(), host: "/tmp".into(), kind: "Report".into(), title: "Check fixture".into(), evidence: "Explicit report".into(), at: 10, present: true });
+        key(&mut app, &w, &l, KeyCode::Char('A'));
+        key(&mut app, &w, &l, KeyCode::Char('t'));
+        assert!(matches!(&app.mode, Mode::Brief { launch: true, role, text, .. } if ROLES[*role] == Role::Scout && text.s.starts_with("[anomaly #1] ")));
+        assert!(app.jev.touched);
+        assert_eq!(app.anomalies.findings[0].state, State::Open);
+        key(&mut app, &w, &l, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Anomalies { id: 1, .. }));
+        assert_eq!(app.anomalies.findings[0].state, State::Open);
+        app.missions.push(Mission { id: 7, cwd: "/tmp".into(), text: "[anomaly #1] Investigate".into(), at: 20, state: "active".into(), ..Default::default() });
+        app.survey.worlds.clear();
+        app.refresh_anomalies();
+        assert_eq!(app.anomalies.findings[0].state, State::Investigating);
+        app.missions[0].state = "done".into();
+        app.refresh_anomalies();
+        app.refresh_anomalies();
+        let f = &app.anomalies.findings[0];
+        assert_eq!(f.missions, vec![7]);
+        assert_eq!(f.state, State::Investigating, "a finished turn does not prove the anomaly resolved");
+        assert_eq!(f.history.iter().filter(|e| e.note.contains("finished its turn")).count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod sector_tests {
+    use super::*;
+
+    fn fixture() -> App {
+        let mut app = App::new();
+        app.online = true;
+        app.loaded = true;
+        let id = app.sectors.create("Kiplat").unwrap();
+        for world in ["/work/runtime", "/other/frontend", "/services/bifrost"] { app.sectors.toggle(id, world).unwrap(); }
+        for (i, (path, status)) in [("/work/runtime", Status::Working), ("/other/frontend", Status::Blocked), ("/moons/frontend-fix", Status::Done), ("/unrelated/world", Status::Working)].into_iter().enumerate() {
+            let mut a = ship_card_tests::ship(i as u32 + 1, false);
+            a.cwd = path.into(); a.status = status;
+            app.agents.push(a);
+        }
+        app.survey.worlds.insert("/moons/frontend-fix".into(), survey::World { host: Some("/other/frontend".into()), ..Default::default() });
+        app.missions.push(Mission { id: 1, cwd: "/moons/frontend-fix".into(), state: "queued".into(), ..Default::default() });
+        app.missions.push(Mission { id: 2, cwd: "/work/runtime".into(), state: "active".into(), ..Default::default() });
+        app.missions.push(Mission { id: 3, cwd: "/unrelated/world".into(), state: "queued".into(), ..Default::default() });
+        for (path, host, present) in [("/other/frontend", "/other/frontend", true), ("/moons/frontend-fix", "/other/frontend", true), ("/unrelated/world", "/unrelated/world", true)] {
+            app.anomalies.observe(crate::anomaly::Observation { key: "report".into(), world: path.into(), host: host.into(), kind: "Report".into(), title: "Finding".into(), evidence: "Evidence".into(), at: 10, present });
+        }
+        app
+    }
+
+    #[test]
+    fn sector_totals_follow_moons_and_exclude_unrelated_worlds() {
+        let mut app = fixture();
+        let stats = app.sector_stats(&app.sectors.sectors[0]);
+        assert_eq!(stats, SectorStats { worlds: 3, ships: 3, working: 1, blocked: 1, finished: 1, missions: 1, queued: 1, anomalies: 2 });
+        app.agents[0].dying = Some(1.0);
+        app.anomalies.set_state(1, crate::anomaly::State::Dismissed, 20);
+        let stats = app.sector_stats(&app.sectors.sectors[0]);
+        assert_eq!(stats.ships, 2);
+        assert_eq!(stats.working, 0);
+        assert_eq!(stats.anomalies, 1);
+    }
+
+    fn key(app: &mut App, w: &World, l: &Lay, code: KeyCode) {
+        handle(app, w, l, &Client::isolated(), None, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 1.0, &mut None);
+    }
+
+    fn paste(app: &mut App, w: &World, l: &Lay, value: &str) {
+        handle(app, w, l, &Client::isolated(), None, Event::Paste(value.into()), 1.0, &mut None);
+    }
+
+    fn screen(app: &mut App, w: &World, cols: usize, rows: usize) -> String {
+        let mut fb = Fb::new(cols, rows);
+        let l = Lay::new(&fb, false);
+        draw::frame(&mut fb, app, w, &l, 1.0, None);
+        fb.txt.chunks(cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn sector_editor_creates_renames_and_assigns_worlds_without_sending_orders() {
+        let mut app = fixture();
+        app.sectors = Default::default();
+        let w = app.world(0.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 40), false);
+        key(&mut app, &w, &l, KeyCode::Char('V'));
+        assert!(matches!(app.mode, Mode::Sectors));
+        key(&mut app, &w, &l, KeyCode::Char('n'));
+        paste(&mut app, &w, &l, "Kiplat");
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert_eq!(app.sectors.sectors[0].name, "Kiplat");
+        let candidates = app.sector_worlds(&w);
+        assert!(!candidates.iter().any(|p| p.starts_with("/moons")));
+        for path in ["/other/frontend", "/work/runtime"] {
+            app.sector_view.world = path.into();
+            key(&mut app, &w, &l, KeyCode::Char(' '));
+        }
+        let rendered = screen(&mut app, &w, 120, 40);
+        assert!(rendered.contains("Kiplat · 2 worlds"));
+        assert!(rendered.contains("3 ships · 1 working · 1 waiting · 1 finished"));
+        assert!(rendered.contains("1 missions under way · 1 queued · 2 anomalies"));
+        assert!(rendered.contains("[+] /other/frontend"));
+        assert!(screen(&mut app, &w, 80, 24).contains("Space membership"));
+        key(&mut app, &w, &l, KeyCode::Char('r'));
+        app.sector_view.text.set("Kiplat platform".into());
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert_eq!(app.sectors.sectors[0].name, "Kiplat platform");
+        assert_eq!(app.agents.len(), 4);
+        assert_eq!(app.missions.len(), 3);
+    }
+
+    #[test]
+    fn sector_focus_and_anomaly_filter_keep_the_rest_of_the_galaxy_available() {
+        let mut app = fixture();
+        let w = app.world(0.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 40), false);
+        key(&mut app, &w, &l, KeyCode::Char('V'));
+        key(&mut app, &w, &l, KeyCode::Char('a'));
+        assert_eq!(app.anomaly_rows().len(), 2);
+        assert!(app.anomaly_rows().iter().all(|f| f.host == "/other/frontend"));
+        assert!(screen(&mut app, &w, 120, 40).contains("Kiplat sector"));
+        key(&mut app, &w, &l, KeyCode::Char('x'));
+        assert_eq!(app.anomaly_rows().len(), 3);
+        key(&mut app, &w, &l, KeyCode::Esc);
+        key(&mut app, &w, &l, KeyCode::Char('V'));
+        key(&mut app, &w, &l, KeyCode::Char('f'));
+        assert!(matches!(app.mode, Mode::Galaxy));
+        assert_eq!(app.sector_focus, Some(1));
+        assert!(app.world(0.0, 0.0).planet("/unrelated/world").is_some());
+        assert!(screen(&mut app, &w, 120, 40).contains("Kiplat · 3 worlds"));
+        app.cam.z = 0.3;
+        let labels = draw::overview_labels(&app, &w, &l);
+        assert!(labels.iter().flat_map(|l| &l.lines).any(|(s, _)| s == "▱ WORK"));
+        key(&mut app, &w, &l, KeyCode::Esc);
+        assert!(app.sector_focus.is_none());
+    }
+
+    #[test]
+    fn sector_lists_scroll_and_mouse_hits_match_the_visible_rows() {
+        let mut app = fixture();
+        for n in 0..35 { app.sectors.create(&format!("Sector {n}")).unwrap(); }
+        for n in 0..35 { app.sectors.toggle(1, &format!("/archive/world-{n:02}")).unwrap(); }
+        let w = app.world(0.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 40), false);
+        key(&mut app, &w, &l, KeyCode::Char('V'));
+        key(&mut app, &w, &l, KeyCode::End);
+        let text = screen(&mut app, &w, 120, 40);
+        let row = text.lines().position(|r| r.contains("Sector 34") && !r.contains("worlds")).unwrap();
+        assert_eq!(draw::sector_hit(&l, 36, 3, 35, 0, 5, row as i32), Some((false, 35)));
+        key(&mut app, &w, &l, KeyCode::Home);
+        key(&mut app, &w, &l, KeyCode::Tab);
+        key(&mut app, &w, &l, KeyCode::End);
+        let worlds = app.sector_worlds(&w);
+        let text = screen(&mut app, &w, 120, 40);
+        let row = text.lines().position(|r| r.contains("[+] /work/runtime")).unwrap();
+        assert_eq!(draw::sector_hit(&l, 36, worlds.len(), 0, worlds.len() - 1, 50, row as i32), Some((true, worlds.len() - 1)));
+    }
+
+    #[test]
+    fn path_membership_persists_and_dissolving_leaves_the_folder_untouched() {
+        let dir = std::env::temp_dir().join(format!("empire-sector-ui-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("frontend")).unwrap();
+        std::fs::write(dir.join("frontend/keep.txt"), "keep me").unwrap();
+        let mut app = fixture();
+        app.sectors = Default::default();
+        app.sector_path = Some(dir.join("sectors.json"));
+        let w = app.world(0.0, 0.0);
+        let l = Lay::new(&Fb::new(100, 30), false);
+        key(&mut app, &w, &l, KeyCode::Char('V'));
+        key(&mut app, &w, &l, KeyCode::Char('n'));
+        paste(&mut app, &w, &l, "Kiplat");
+        key(&mut app, &w, &l, KeyCode::Enter);
+        key(&mut app, &w, &l, KeyCode::Char('p'));
+        paste(&mut app, &w, &l, dir.join("missing").to_str().unwrap());
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert!(app.sector_view.error.contains("existing folder"));
+        assert!(!dir.join("missing").exists());
+        app.sector_view.text.set(dir.join("frontend").to_string_lossy().into_owned());
+        key(&mut app, &w, &l, KeyCode::Enter);
+        let path = dir.join("frontend").canonicalize().unwrap().to_string_lossy().into_owned();
+        let saved = crate::sector::edit(&dir.join("sectors.json"), |_| {}).unwrap();
+        assert_eq!(saved.sectors[0].worlds, vec![path.clone()]);
+        let mapped = app.world(0.0, 0.0);
+        assert!(mapped.planet(&path).is_some());
+        key(&mut app, &mapped, &l, KeyCode::Char('x'));
+        key(&mut app, &mapped, &l, KeyCode::Esc);
+        assert_eq!(app.sectors.sectors.len(), 1);
+        key(&mut app, &mapped, &l, KeyCode::Char('x'));
+        key(&mut app, &mapped, &l, KeyCode::Char('y'));
+        assert!(crate::sector::edit(&dir.join("sectors.json"), |_| {}).unwrap().sectors.is_empty());
+        assert_eq!(std::fs::read_to_string(dir.join("frontend/keep.txt")).unwrap(), "keep me");
+        assert_eq!(app.agents.len(), 4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }
