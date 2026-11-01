@@ -3206,6 +3206,9 @@ const HISTORY_WORLDS: usize = 40;
 pub const OVERVIEW_ZOOM: f32 = 0.45;
 /// Between the galaxy overview and planetary detail, sectors trace their member worlds.
 pub const SECTOR_ZOOM: f32 = 1.05;
+/// Scale change per wheel notch and per ± press; small so each view lingers before the next.
+const WHEEL_ZOOM: f32 = 1.07;
+const KEY_ZOOM: f32 = 1.14;
 
 /// One sector's territory within a star system; moons belong to their host marker.
 pub struct SectorRegion {
@@ -4523,12 +4526,12 @@ fn handle(
         KeyCode::Char('a') | KeyCode::Left => app.cam.tx -= pan,
         KeyCode::Char('d') | KeyCode::Right => app.cam.tx += pan,
         KeyCode::Char('+') | KeyCode::Char('=') => {
-            app.cam.tz = (app.cam.tz * 1.3).min(6.0);
+            app.cam.tz = (app.cam.tz * KEY_ZOOM).min(6.0);
             if app.cam.tz >= 3.0 && let Some(Sel::Planet(k)) = app.sel.clone() {
                 app.mode = Mode::Planet(PlanetView::new(k));
             }
         }
-        KeyCode::Char('-') | KeyCode::Char('_') => app.cam.tz = (app.cam.tz / 1.3).max(0.12),
+        KeyCode::Char('-') | KeyCode::Char('_') => app.cam.tz = (app.cam.tz / KEY_ZOOM).max(0.12),
         KeyCode::Char('z') => app.fit(w, l),
         KeyCode::Char('f') => {
             if let Some(Sel::Lane(id)) = app.sel {
@@ -4671,13 +4674,13 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
     match me.kind {
         MouseEventKind::ScrollUp if !in_panel => {
             let hit = pick_at(app, w, l, px);
-            app.zoom_at(l, 1.15, px);
+            app.zoom_at(l, WHEEL_ZOOM, px);
             if app.cam.z >= 3.0 && let Some(Sel::Planet(k)) = hit {
                 app.sel = Some(Sel::Planet(k.clone()));
                 app.mode = Mode::Planet(PlanetView::new(k));
             }
         }
-        MouseEventKind::ScrollDown if !in_panel => app.zoom_at(l, 1.0 / 1.15, px),
+        MouseEventKind::ScrollDown if !in_panel => app.zoom_at(l, 1.0 / WHEEL_ZOOM, px),
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => draw::panel_scroll(app, w, l, mr as i32, if me.kind == MouseEventKind::ScrollUp { -3 } else { 3 }),
         MouseEventKind::Down(MouseButton::Left) => *drag = Some(((mc, mr), (app.cam.x, app.cam.y), false)),
         MouseEventKind::Drag(MouseButton::Left) => {
