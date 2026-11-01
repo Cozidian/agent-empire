@@ -19,7 +19,8 @@ Single binary crate, no workspace. `src/main.rs` dispatches subcommands (`daemon
   has a draw function dispatched from `frame()`.
 - `survey.rs`: background thread surveying each world (git, `gh` PRs, usage limits).
 - `structure.rs`: AI resources found in a world (AGENTS.md, skills, MCP, hooks…) and their
-  construction briefs. `role.rs`: ship roles and their launch flags. `advisor.rs`: Provider Advisor
+  construction briefs. `role.rs`: ship roles and their launch flags. `design.rs`: saved ship
+  designs and where each species finds skills. `advisor.rs`: Provider Advisor
   suggestions (needs `PROVIDER_API_KEY`). `screenshots.rs`: mission image attachments.
 - `gfx.rs` / `octant.rs`: framebuffer and octant renderer. `sound.rs`: synthesized cues and music.
 

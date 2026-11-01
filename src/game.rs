@@ -8,7 +8,7 @@ use crate::draw;
 use crate::gfx::*;
 use crate::role::{ROLES, Role};
 use crate::structure::{Built, KINDS, Kind};
-use crate::proto::{AgentView, Ask, Mission, Report, ScreenView, War};
+use crate::proto::{AgentView, Ask, Mission, Report, ScreenView, ShipSpec, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crate::screenshots::{self, Attachment};
@@ -188,6 +188,8 @@ pub struct Agent {
     pub ask: Option<Ask>,
     pub war: Vec<War>,
     pub role: Role,
+    /// The design it was launched from, by name ("" for none).
+    pub design: String,
     pub wpos: (f32, f32),
     /// In front of its planet (drawn after it).
     pub front: bool,
@@ -485,6 +487,17 @@ pub struct LaneView {
     pub error: String,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum CampaignEdit { Objective, Criteria, World, Task, Handoff, Verify, Link, Complete }
+
+#[derive(Default)]
+pub struct CampaignView {
+    pub id: u64, pub stage: u64, pub stages: bool, pub edit: Option<CampaignEdit>, pub new: bool, pub stage_edit: bool,
+    pub objective: String, pub world: String, pub text: Line, pub mission: usize, pub scroll: usize, pub error: String, pub details: bool,
+}
+
+struct CampaignDraft { link: crate::proto::CampaignRef, context: String }
+
 pub enum Mode {
     Galaxy,
     /// On a world's surface, browsing its buildings and their files.
@@ -492,6 +505,7 @@ pub enum Mode {
     Commander,
     Sectors,
     Hyperlanes,
+    Campaigns,
     Anomalies { id: u64, typing: bool },
     Trade { sel: usize },
     /// Talking to an agent in a popup over the galaxy: its terminal, and a line to write in.
@@ -518,11 +532,47 @@ pub enum Mode {
     /// Writing a mission for a world: hand it to a new ship now, or queue it.
     /// `role` is an index into `role::ROLES`, for a ship launched with it. When not
     /// launching, `to` gives it to one ship here, or (`None`) to the first free one.
-    Brief { planet: String, text: Line, kind: usize, launch: bool, role: usize, to: Option<u32>, attachments: Vec<Attachment>, sending: bool },
+    /// `ship` is a new ship's outfit: the design it started from, and its own orders and skills.
+    Brief { planet: String, text: Line, kind: usize, launch: bool, role: usize, to: Option<u32>, attachments: Vec<Attachment>, sending: bool, ship: Outfit },
+    /// Refitting the composer's new ship: its standing orders and skills, saved as a design if wanted.
+    Refit(RefitView),
+    /// The saved ship designs: rename or scrap them.
+    Shipyard(YardView),
     /// The situation log in full: filter it, read an entry's details. `id` is the selected entry
     /// (it stays put as news arrives); `typing` edits the search.
     Situation { id: u64, typing: bool },
     Help,
+}
+
+/// A new ship's outfit in the mission composer: the design it started from (if any), and its
+/// standing orders and skills as adjusted for this launch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Outfit {
+    pub design: Option<u64>,
+    pub orders: String,
+    pub skills: Vec<String>,
+}
+
+/// The refit dialog over the composer, which comes back (as `brief`) when it closes.
+pub struct RefitView {
+    pub brief: Box<Mode>,
+    pub orders: Line,
+    /// Skills to choose from (any species' folders, from this world), and those chosen.
+    pub skills: Vec<String>,
+    pub picked: Vec<String>,
+    /// 0 is the orders; then each skill.
+    pub sel: usize,
+    /// The design's name, while saving it.
+    pub naming: Option<Line>,
+    pub error: String,
+}
+
+#[derive(Default)]
+pub struct YardView {
+    pub sel: usize,
+    pub rename: Option<Line>,
+    pub remove: bool,
+    pub error: String,
 }
 
 /// Asking Advisor which ship should take the mission being written: once the text has rested
@@ -639,11 +689,21 @@ pub struct App {
     pub log: VecDeque<LogEntry>,
     /// What the situation log view shows.
     pub sit: SitFilter,
+    pub campaigns: crate::campaign::Book,
+    pub campaign_view: CampaignView,
+    pub campaign_error: String,
+    campaign_path: Option<PathBuf>,
+    campaign_draft: Option<CampaignDraft>,
     pub hyperlanes: crate::hyperlane::Book,
     pub lane_view: LaneView,
     pub dependencies: bool,
     pub lane_error: String,
     lane_path: Option<PathBuf>,
+    /// Saved ship designs (the shipyard), and where they're kept (nowhere in tests).
+    pub designs: crate::design::Book,
+    pub design_path: Option<PathBuf>,
+    /// Where the user's own skill folders are (none in tests).
+    pub skill_home: PathBuf,
     pub sectors: crate::sector::Book,
     pub sector_view: SectorView,
     pub sector_focus: Option<u64>,
@@ -661,6 +721,7 @@ pub struct App {
     pub commander: String,
     pub commander_detail: usize,
     commander_return: bool,
+    campaign_return: bool,
     pub kinds: Vec<String>,
     pub screen: Option<(u32, ScreenView)>,
     pub panel: bool,
@@ -877,7 +938,7 @@ impl App {
         }
         // queue it if someone's there to take it, otherwise send a ship
         let crewed = self.agents.iter().any(|a| a.cwd == row.path && a.dying.is_none());
-        self.mode = Mode::Brief { planet: row.path, text, kind: 0, launch: !crewed, role: 0, to: None, attachments: Vec::new(), sending: false };
+        self.mode = Mode::Brief { planet: row.path, text, kind: 0, launch: !crewed, role: 0, to: None, attachments: Vec::new(), sending: false, ship: Outfit::default() };
     }
 
     fn open_trade_row(&mut self, w: &World, index: usize, client: &Client, t: f32) {
@@ -907,11 +968,19 @@ impl App {
             fx: Vec::new(),
             log: VecDeque::new(),
             sit: SitFilter::default(),
+            campaigns: Default::default(),
+            campaign_view: Default::default(),
+            campaign_error: String::new(),
+            campaign_path: if cfg!(test) { None } else { Some(crate::campaign::path()) },
+            campaign_draft: None,
             hyperlanes: Default::default(),
             lane_view: Default::default(),
             dependencies: false,
             lane_error: String::new(),
             lane_path: if cfg!(test) { None } else { Some(crate::hyperlane::path()) },
+            designs: Default::default(),
+            design_path: if cfg!(test) { None } else { Some(crate::design::path()) },
+            skill_home: if cfg!(test) { std::env::temp_dir().join("empire-no-home") } else { home() },
             sectors: Default::default(),
             sector_view: Default::default(),
             sector_focus: None,
@@ -928,6 +997,7 @@ impl App {
             commander: String::new(),
             commander_detail: 0,
             commander_return: false,
+            campaign_return: false,
             planet_return: None,
             kinds: detect_kinds(),
             screen: None,
@@ -1002,7 +1072,7 @@ impl App {
                 // a free agent there takes it; with no one there, a ship is sent with it
                 let crewed = self.agents.iter().any(|a| a.cwd == key && a.dying.is_none() && a.status != Status::Exited);
                 let kind = self.kinds.first().cloned().unwrap_or_else(|| "claude".into());
-                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed, attachments: Vec::new(), draft: false, role: String::new(), to: None });
+                client.send(Cmd::Mission { cwd: key.to_string(), text: text.clone(), kind, launch: !crewed, attachments: Vec::new(), draft: false, role: String::new(), to: None, campaign: None, spec: ShipSpec::default() });
                 self.mode = Mode::Galaxy;
                 self.toast(if crewed { format!("mission queued: {}", clip(&text, 40)) } else { format!("ship launched: {}", clip(&text, 40)) }, t);
             }
@@ -1030,7 +1100,7 @@ impl App {
         text.set(kind.brief(self.structure(key, kind)));
         let crewed = self.agents.iter().any(|a| a.cwd == key && a.dying.is_none() && a.status != Status::Exited);
         let role = ROLES.iter().position(|r| *r == Role::Builder).unwrap_or(0);
-        self.mode = Mode::Brief { planet: key.to_string(), text, kind: 0, launch: !crewed, role, to: None, attachments: Vec::new(), sending: false };
+        self.mode = Mode::Brief { planet: key.to_string(), text, kind: 0, launch: !crewed, role, to: None, attachments: Vec::new(), sending: false, ship: Outfit::default() };
     }
 
     /// Missions in log order, each with its group heading. Within a group: under way,
@@ -1127,7 +1197,7 @@ impl App {
         let cwd = a.cwd.clone();
         match act {
             ShipAct::Comms => self.open_comms(id, client, l),
-            ShipAct::Mission => self.mode = Mode::Brief { planet: cwd, text: Line::default(), kind: 0, launch: false, role: 0, to: None, attachments: Vec::new(), sending: false },
+            ShipAct::Mission => self.mode = Mode::Brief { planet: cwd, text: Line::default(), kind: 0, launch: false, role: 0, to: None, attachments: Vec::new(), sending: false, ship: Outfit::default() },
             ShipAct::Priority => self.act(&cwd, Act::Priority(id), client, l, t),
             ShipAct::Decommission => self.mode = Mode::Confirm { id },
         }
@@ -1187,6 +1257,8 @@ impl App {
                 self.say(Ev::Mission, format!("★ fleet order complete · {} ships · {what}", all.len()), v3(1.0, 0.85, 0.4));
             }
         }
+        let at = survey::now().max(0) as u64;
+        let _ = self.sync_campaigns(|b| { b.refresh(&missions, at); Ok(0) });
         self.missions = missions;
     }
 
@@ -1313,6 +1385,7 @@ impl App {
                     ask: v.ask.clone(),
                     war: v.war.clone(),
                     role: Role::parse(&v.role),
+                    design: v.design.clone(),
                     wpos: (0.0, 0.0),
                     front: true,
                 });
@@ -1411,6 +1484,9 @@ impl App {
             if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
         }
         for key in self.hyperlanes.lanes.iter().flat_map(|l| [&l.from, &l.to]) {
+            if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
+        }
+        for key in self.campaigns.campaigns.iter().filter(|c| !c.archived).flat_map(|c| c.stages.iter().map(|s| &s.world)) {
             if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
         }
         // worktrees are moons of the world they were split from (which shows up even if empty)
@@ -1824,7 +1900,7 @@ impl App {
         }
         client.watch(None);
         self.screen = None;
-        self.mode = if std::mem::take(&mut self.commander_return) { Mode::Commander } else { self.planet_return.take().map_or(Mode::Galaxy, Mode::Planet) };
+        self.mode = if std::mem::take(&mut self.campaign_return) { Mode::Campaigns } else if std::mem::take(&mut self.commander_return) { Mode::Commander } else { self.planet_return.take().map_or(Mode::Galaxy, Mode::Planet) };
     }
 
     fn chat_sent(&mut self, id: u32, result: Result<(), String>, client: &Client, l: &Lay, t: f32) {
@@ -2103,7 +2179,7 @@ impl App {
         let role = ROLES.iter().position(|r| *r == Role::Scout).unwrap_or(0);
         self.anomaly_return = Some(id);
         self.advisor.touched = true;
-        self.mode = Mode::Brief { planet, text, kind: 0, launch: true, role, to: None, attachments: vec![], sending: false };
+        self.mode = Mode::Brief { planet, text, kind: 0, launch: true, role, to: None, attachments: vec![], sending: false, ship: Outfit::default() };
     }
 }
 
@@ -2294,6 +2370,92 @@ impl App {
         paths.into_iter().collect()
     }
 
+    fn sync_designs(&mut self, change: impl FnOnce(&mut crate::design::Book) -> Result<u64, String>) -> Result<u64, String> {
+        let mut result = Ok(0);
+        let apply = |b: &mut crate::design::Book| { result = change(b); };
+        let loaded = match &self.design_path {
+            Some(path) => crate::design::edit(path, apply),
+            None => { apply(&mut self.designs); Ok(self.designs.clone()) }
+        };
+        match loaded {
+            Ok(book) => { self.designs = book; result }
+            Err(e) => {
+                let msg = format!("Ship designs could not be saved or loaded: {e}");
+                self.say(Ev::Error, msg.clone(), RED);
+                Err(msg)
+            }
+        }
+    }
+
+    pub fn open_shipyard(&mut self) {
+        let _ = self.sync_designs(|_| Ok(0));
+        self.mode = Mode::Shipyard(YardView::default());
+    }
+
+    /// Outfit the composer's new ship from the next design, then from none again.
+    fn next_design(&mut self, t: f32) {
+        let _ = self.sync_designs(|_| Ok(0));
+        let Mode::Brief { kind, launch, role, ship, .. } = &mut self.mode else { return };
+        let list = &self.designs.designs;
+        let next = ship.design.and_then(|id| list.iter().position(|d| d.id == id)).map_or(0, |i| i + 1);
+        let mut note = None;
+        match list.get(next) {
+            Some(d) => {
+                match self.kinds.iter().position(|k| *k == d.kind) {
+                    Some(i) => *kind = i,
+                    None => note = Some(format!("{} isn't installed here; {} launches as {}", d.kind, d.name, self.kinds.get(*kind).map_or("", String::as_str))),
+                }
+                *role = ROLES.iter().position(|&r| r == Role::parse(&d.role)).unwrap_or(0);
+                *ship = Outfit { design: Some(d.id), orders: d.orders.clone(), skills: d.skills.clone() };
+                *launch = true; // a design is for a new ship
+            }
+            None => {
+                *ship = Outfit::default();
+                if list.is_empty() { note = Some("No ship designs yet: Ctrl+R refits this ship, Ctrl+S there saves it".into()); }
+            }
+        }
+        self.advisor.touched = true;
+        if let Some(n) = note { self.toast(n, t); }
+    }
+
+    /// Open the refit dialog over the composer.
+    fn open_refit(&mut self) {
+        let Mode::Brief { planet, ship, .. } = &self.mode else { return };
+        let mut skills = crate::design::available(Path::new(planet), &self.skill_home);
+        skills.extend(ship.skills.iter().filter(|s| !skills.contains(s)).cloned().collect::<Vec<_>>());
+        let orders = Line { cur: ship.orders.chars().count(), s: ship.orders.clone() };
+        let picked = ship.skills.clone();
+        let brief = std::mem::replace(&mut self.mode, Mode::Galaxy);
+        self.mode = Mode::Refit(RefitView { brief: Box::new(brief), orders, skills, picked, sel: 0, naming: None, error: String::new() });
+    }
+
+    /// Close the refit dialog, keeping its changes for this launch or not.
+    fn close_refit(&mut self, keep: bool) {
+        let Mode::Refit(v) = std::mem::replace(&mut self.mode, Mode::Galaxy) else { return };
+        let mut brief = *v.brief;
+        if keep && let Mode::Brief { ship, .. } = &mut brief {
+            ship.orders = v.orders.s.trim().to_string();
+            ship.skills = v.picked;
+        }
+        self.mode = brief;
+    }
+
+    /// Save the refit ship as a design under `name` (over a design of that name, if there is one).
+    fn save_design(&mut self, name: &str) -> Result<u64, String> {
+        let Mode::Refit(v) = &self.mode else { return Err("Nothing to save".into()) };
+        let Mode::Brief { kind, role, .. } = &*v.brief else { return Err("Nothing to save".into()) };
+        let d = crate::design::Design {
+            id: 0, name: name.into(), kind: self.kinds.get(*kind).cloned().unwrap_or_default(), role: ROLES[*role].name().into(),
+            orders: v.orders.s.clone(), skills: v.picked.clone(),
+        };
+        let id = self.sync_designs(|b| b.save(d))?;
+        if let Mode::Refit(v) = &mut self.mode && let Mode::Brief { ship, launch, .. } = &mut *v.brief {
+            ship.design = Some(id);
+            *launch = true;
+        }
+        Ok(id)
+    }
+
     fn sync_hyperlanes(&mut self, change: impl FnOnce(&mut crate::hyperlane::Book) -> Result<u64, String>) -> Result<u64, String> {
         let mut result = Ok(0);
         let apply = |b: &mut crate::hyperlane::Book| { result = change(b); };
@@ -2390,6 +2552,337 @@ impl App {
     fn toggle_dependencies(&mut self) {
         self.dependencies = !self.dependencies;
         if !self.dependencies && matches!(self.sel, Some(Sel::Lane(_))) { self.sel = None; }
+    }
+}
+
+// ─────────────────────────────── campaigns ───────────────────────────────
+
+impl App {
+    pub fn selected_campaign(&self) -> Option<&crate::campaign::Campaign> {
+        self.campaigns.campaigns.iter().find(|c| c.id == self.campaign_view.id).or(self.campaigns.campaigns.first())
+    }
+    pub fn campaign_stage(&self) -> Option<&crate::campaign::Stage> {
+        self.selected_campaign().and_then(|c| c.stages.iter().find(|s| s.id == self.campaign_view.stage).or(c.stages.first()))
+    }
+    /// The stage's waiting ship first, then its most recent live mission's ship.
+    pub fn campaign_ship(&self, stage: &crate::campaign::Stage) -> Option<&Agent> {
+        stage.missions.iter().rev().filter(|l| l.available).filter_map(|l| {
+            self.agent(l.mission.agent?).filter(|a| a.cwd == l.mission.cwd && a.dying.is_none() && a.status != Status::Exited)
+        }).min_by_key(|a| if a.status == Status::Blocked { 0 } else { 1 })
+    }
+    pub fn campaign_worlds(&self, w: &World) -> Vec<String> {
+        let mut paths: std::collections::BTreeSet<_> = w.planets.iter().map(|p| p.key.clone()).collect();
+        if let Some(c) = self.selected_campaign() { paths.extend(c.stages.iter().map(|s| s.world.clone())); }
+        paths.into_iter().collect()
+    }
+    pub fn campaign_missions(&self) -> Vec<&Mission> {
+        let c = self.selected_campaign();
+        self.missions.iter().filter(|m| !c.is_some_and(|c| c.stages.iter().any(|s| s.missions.iter().any(|l| l.mission.id == m.id && l.mission.at == m.at)))).collect()
+    }
+    fn sync_campaigns(&mut self, change: impl FnOnce(&mut crate::campaign::Book) -> Result<u64, String>) -> Result<u64, String> {
+        let mut result = Ok(0);
+        let apply = |b: &mut crate::campaign::Book| { result = change(b); };
+        let loaded = match &self.campaign_path {
+            Some(path) => crate::campaign::edit(path, apply),
+            None => { apply(&mut self.campaigns); Ok(self.campaigns.clone()) }
+        };
+        match loaded {
+            Ok(book) => { self.campaigns = book; self.campaign_error.clear(); result }
+            Err(e) => {
+                let msg = format!("Campaigns could not be saved or loaded: {e}");
+                if self.campaign_error != msg { self.say(Ev::Error, msg.clone(), RED); }
+                self.campaign_error = msg.clone(); Err(msg)
+            }
+        }
+    }
+    fn open_campaigns(&mut self) {
+        let _ = self.sync_campaigns(|_| Ok(0));
+        self.campaign_view.edit = None; self.campaign_view.error.clear();
+        self.mode = Mode::Campaigns;
+    }
+    fn campaign_draft(&mut self, w: &World) {
+        let (Some(c), Some(s)) = (self.selected_campaign(), self.campaign_stage()) else { return };
+        let link = crate::proto::CampaignRef { campaign: c.id, stage: s.id };
+        let world = s.world.clone();
+        let context = match self.campaigns.brief(c.id, s.id) { Ok(s) => s, Err(e) => { self.campaign_view.error = e; return; } };
+        if w.planet(&world).is_none() { self.campaign_view.error = "This world's folder is unavailable; the stage is kept".into(); return; }
+        self.campaign_view.id = link.campaign; self.campaign_view.stage = link.stage;
+        let mut text = Line::default(); text.set(context.clone());
+        self.campaign_draft = Some(CampaignDraft { link, context });
+        // Queueing is the safe default; the normal composer still offers every ship and role.
+        self.mode = Mode::Brief { planet: world, text, kind: 0, launch: false, role: 0, to: None, attachments: vec![], sending: false, ship: Outfit::default() };
+    }
+    fn campaign_edit(&mut self, edit: CampaignEdit) {
+        let value = match edit {
+            CampaignEdit::Objective => self.selected_campaign().map(|c| c.objective.clone()).unwrap_or_default(),
+            CampaignEdit::Task if self.campaign_view.stage_edit => self.campaign_stage().map(|s| s.task.clone()).unwrap_or_default(),
+            CampaignEdit::Handoff => self.campaign_stage().map(|s| s.handoff.clone()).unwrap_or_default(),
+            CampaignEdit::Verify => self.campaign_stage().map(|s| s.verification.clone()).unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.campaign_view.edit = Some(edit); self.campaign_view.text.set(value); self.campaign_view.scroll = 0; self.campaign_view.error.clear();
+    }
+    fn campaign_save(&mut self, w: &World) {
+        let view = &self.campaign_view;
+        let (id, stage) = (self.selected_campaign().map_or(0, |c| c.id), self.campaign_stage().map_or(0, |s| s.id));
+        let (edit, text, at) = (view.edit, view.text.s.clone(), survey::now().max(0) as u64);
+        let result = match edit {
+            Some(CampaignEdit::Objective) => {
+                if text.trim().is_empty() || text.trim().chars().count() > 120 || text.chars().any(char::is_control) {
+                    self.campaign_view.error = "Use a single-line objective of 1–120 characters".into(); return;
+                }
+                self.campaign_view.objective = text;
+                let criteria = if self.campaign_view.new { String::new() } else { self.selected_campaign().map_or(String::new(), |c| c.criteria.clone()) };
+                self.campaign_view.text.set(criteria); self.campaign_view.edit = Some(CampaignEdit::Criteria); return;
+            }
+            Some(CampaignEdit::Criteria) => {
+                let objective = self.campaign_view.objective.clone(); let new = self.campaign_view.new;
+                self.sync_campaigns(|b| if new { b.create(&objective, &text, at) } else { b.update(id, &objective, &text, at).map(|_| id) })
+            }
+            Some(CampaignEdit::World) => {
+                if self.campaign_view.world.is_empty() || !self.campaign_worlds(w).contains(&self.campaign_view.world) { self.campaign_view.error = "Choose a charted world".into(); return; }
+                self.campaign_edit(CampaignEdit::Task); return;
+            }
+            Some(CampaignEdit::Task) => {
+                let world = self.campaign_view.world.clone();
+                let editing = self.campaign_view.stage_edit;
+                self.sync_campaigns(|b| if editing { b.update_stage(id, stage, &world, &text, at).map(|_| stage) } else { b.add_stage(id, &world, &text, at) })
+            }
+            Some(CampaignEdit::Handoff) => self.sync_campaigns(|b| b.handoff(id, stage, &text, at).map(|_| stage)),
+            Some(CampaignEdit::Verify) => self.sync_campaigns(|b| b.verify(id, stage, &text, at).map(|_| stage)),
+            Some(CampaignEdit::Link) => {
+                let Some(m) = self.campaign_missions().get(self.campaign_view.mission).copied().cloned() else { return };
+                self.sync_campaigns(|b| b.link(id, stage, &m, at).map(|_| stage))
+            }
+            _ => return,
+        };
+        match result {
+            Ok(key) => {
+                if edit == Some(CampaignEdit::Criteria) { self.campaign_view.id = key; self.campaign_view.stages = true; }
+                if edit == Some(CampaignEdit::Task) { self.campaign_view.stage = key; self.campaign_view.stages = true; }
+                self.campaign_view.edit = None; self.campaign_view.error.clear(); self.campaign_view.scroll = 0;
+            }
+            Err(e) => self.campaign_view.error = e,
+        }
+    }
+}
+
+fn campaign_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event) {
+    if let Event::Key(k) = ev && k.kind == KeyEventKind::Release { return; }
+    let edit = app.campaign_view.edit;
+    if let Event::Key(k) = ev && k.code == KeyCode::Esc {
+        if edit.is_some() { app.campaign_view.edit = None; app.campaign_view.error.clear(); }
+        else { app.mode = Mode::Galaxy; }
+        return;
+    }
+    let (id, stage) = (app.selected_campaign().map_or(0, |c| c.id), app.campaign_stage().map_or(0, |s| s.id));
+    let at = survey::now().max(0) as u64;
+    if edit == Some(CampaignEdit::Complete) {
+        if let Event::Key(k) = ev {
+            if matches!(k.code, KeyCode::Char('y' | 'Y')) {
+                match app.sync_campaigns(|b| b.complete(id, at).map(|_| id)) {
+                    Ok(_) => { app.campaign_view.edit = None; app.campaign_view.error.clear(); }
+                    Err(e) => app.campaign_view.error = e,
+                }
+            } else { app.campaign_view.edit = None; }
+        }
+        return;
+    }
+    let picking = matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link));
+    if edit.is_some() && !picking {
+        match ev {
+            Event::Key(k) if (k.code == KeyCode::Enter && k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
+                || (k.code == KeyCode::Char('j') && k.modifiers.contains(KeyModifiers::CONTROL)) => app.campaign_view.text.paste_lines("\n"),
+            Event::Key(k) if k.code == KeyCode::Enter => app.campaign_save(w),
+            Event::Key(k) if matches!(k.code, KeyCode::Up | KeyCode::Down) => { app.campaign_view.text.vertical(k.code == KeyCode::Up); }
+            Event::Key(k) => { app.campaign_view.text.key(k); }
+            Event::Paste(s) => app.campaign_view.text.paste_lines(s),
+            _ => {}
+        }
+        return;
+    }
+    let worlds = app.campaign_worlds(w);
+    let ids: Vec<_> = app.campaigns.campaigns.iter().map(|c| c.id).collect();
+    let stages: Vec<_> = app.selected_campaign().map_or(vec![], |c| c.stages.iter().map(|s| s.id).collect());
+    let (pos, len) = match edit {
+        Some(CampaignEdit::World) => (worlds.iter().position(|p| p == &app.campaign_view.world).unwrap_or(0), worlds.len()),
+        Some(CampaignEdit::Link) => (app.campaign_view.mission, app.campaign_missions().len()),
+        _ if app.campaign_view.stages => (stages.iter().position(|s| *s == stage).unwrap_or(0), stages.len()),
+        _ => (ids.iter().position(|c| *c == id).unwrap_or(0), ids.len()),
+    };
+    let mut next = pos;
+    match ev {
+        Event::Key(k) => match k.code {
+            KeyCode::Up | KeyCode::Char('k') => next = pos.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => next = (pos + 1).min(len.saturating_sub(1)),
+            KeyCode::Home => next = 0,
+            KeyCode::End => next = len.saturating_sub(1),
+            KeyCode::PageUp => { app.campaign_view.scroll = app.campaign_view.scroll.saturating_sub(8); return; }
+            KeyCode::PageDown => { app.campaign_view.scroll = app.campaign_view.scroll.saturating_add(8); return; }
+            KeyCode::Enter if picking => { app.campaign_save(w); return; }
+            KeyCode::Tab | KeyCode::BackTab if !picking => { app.campaign_view.stages = !app.campaign_view.stages; return; }
+            KeyCode::Char('n') if !picking => { app.campaign_view.new = true; app.campaign_edit(CampaignEdit::Objective); app.campaign_view.text.set(String::new()); return; }
+            KeyCode::Char('e') if !picking && id != 0 => { app.campaign_view.new = false; app.campaign_edit(CampaignEdit::Objective); return; }
+            KeyCode::Char('s') if !picking && id != 0 => {
+                app.campaign_view.stage_edit = false;
+                app.campaign_edit(CampaignEdit::World);
+                app.campaign_view.world = app.sel_planet().or_else(|| worlds.first().cloned()).unwrap_or_default(); return;
+            }
+            KeyCode::Char('t') if !picking && stage != 0 => {
+                app.campaign_view.stage_edit = true;
+                app.campaign_view.world = app.campaign_stage().unwrap().world.clone();
+                app.campaign_edit(CampaignEdit::World); return;
+            }
+            KeyCode::Char('h' | 'v') if !picking && stage != 0 => { app.campaign_edit(if k.code == KeyCode::Char('h') { CampaignEdit::Handoff } else { CampaignEdit::Verify }); return; }
+            KeyCode::Char('l') if !picking && stage != 0 => { app.campaign_view.mission = 0; app.campaign_edit(CampaignEdit::Link); return; }
+            KeyCode::Char('m') if !picking => { app.campaign_draft(w); return; }
+            KeyCode::Char('d') if !picking => { app.campaign_view.details = !app.campaign_view.details; app.campaign_view.scroll = 0; return; }
+            KeyCode::Char('o') if !picking => {
+                if let Some(id) = app.campaign_stage().and_then(|s| app.campaign_ship(s)).map(|a| a.id) {
+                    app.campaign_return = true;
+                    app.open_comms(id, client, l);
+                } else { app.campaign_view.error = "No live ship linked to this stage; m drafts a mission, Enter opens its log".into(); }
+                return;
+            }
+            KeyCode::Enter if !picking => {
+                if let Some(s) = app.campaign_stage() { app.mode = Mode::Log { world: s.world.clone(), sel: 0, open: HashSet::new() }; }
+                return;
+            }
+            KeyCode::Char('a' | 'r' | 'x') if !picking && id != 0 => {
+                let result = app.sync_campaigns(|b| match k.code {
+                    KeyCode::Char('a') => b.accept(id, stage, at), KeyCode::Char('r') => b.reopen(id, stage, at), _ => b.archive(id, at),
+                }.map(|_| id));
+                app.campaign_view.error = result.err().unwrap_or_default(); return;
+            }
+            KeyCode::Char('c') if !picking && id != 0 => { app.campaign_edit(CampaignEdit::Complete); return; }
+            _ => {}
+        },
+        Event::Mouse(me) if matches!(me.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+            let down = me.kind == MouseEventKind::ScrollDown;
+            let (_, y, _, _, _, room) = draw::campaign_layout(app, l);
+            if !picking && me.row as i32 >= y + 4 + room as i32 { app.campaign_view.scroll = app.campaign_view.scroll.saturating_add_signed(if down { 3 } else { -3 }); return; }
+            next = if down { (pos + 3).min(len.saturating_sub(1)) } else { pos.saturating_sub(3) };
+        }
+        Event::Mouse(me) if me.kind == MouseEventKind::Up(MouseButton::Left) => {
+            if let Some((right, index)) = draw::campaign_hit(app, w, l, me.column as i32, me.row as i32) {
+                if !picking { app.campaign_view.stages = right; }
+                next = index;
+            }
+        }
+        _ => {}
+    }
+    if edit == Some(CampaignEdit::World) { if let Some(p) = worlds.get(next) { app.campaign_view.world = p.clone(); } }
+    else if edit == Some(CampaignEdit::Link) { app.campaign_view.mission = next; }
+    else if app.campaign_view.stages { if let Some(s) = stages.get(next) { app.campaign_view.stage = *s; } }
+    else if let Some(c) = ids.get(next) { app.campaign_view.id = *c; }
+    if next != pos { app.campaign_view.scroll = 0; }
+}
+
+/// The refit dialog: write the new ship's standing orders, pick its skills, save it as a design.
+fn refit_input(app: &mut App, ev: &Event, t: f32) {
+    if let Event::Key(k) = ev && k.kind == KeyEventKind::Release { return; }
+    let Mode::Refit(v) = &mut app.mode else { return };
+    if let Some(name) = &mut v.naming {
+        match ev {
+            Event::Key(k) if k.code == KeyCode::Esc => { v.naming = None; v.error.clear(); }
+            Event::Key(k) if k.code == KeyCode::Enter => {
+                let name = name.s.clone();
+                match app.save_design(&name) {
+                    Ok(_) => {
+                        if let Mode::Refit(v) = &mut app.mode { v.naming = None; v.error.clear(); }
+                        app.toast(format!("Design {} saved to the shipyard", name.trim()), t);
+                    }
+                    Err(e) => if let Mode::Refit(v) = &mut app.mode { v.error = e },
+                }
+            }
+            Event::Key(k) => { name.key(k); }
+            Event::Paste(s) => name.paste_lines(&s.chars().filter(|c| !c.is_control()).collect::<String>()),
+            _ => {}
+        }
+        return;
+    }
+    let n = v.skills.len();
+    match ev {
+        Event::Paste(s) if v.sel == 0 => v.orders.paste_lines(s),
+        Event::Mouse(me) if me.kind == MouseEventKind::ScrollUp => v.sel = v.sel.saturating_sub(1),
+        Event::Mouse(me) if me.kind == MouseEventKind::ScrollDown => v.sel = (v.sel + 1).min(n),
+        Event::Key(k) => {
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            match k.code {
+                KeyCode::Esc => app.close_refit(false),
+                KeyCode::Char('s') if ctrl => {
+                    let name = match &*v.brief { Mode::Brief { ship, .. } => ship.design.and_then(|id| app.designs.get(id)).map(|d| d.name.clone()).unwrap_or_default(), _ => String::new() };
+                    v.naming = Some(Line { cur: name.chars().count(), s: name });
+                }
+                // new lines in the orders
+                KeyCode::Enter if v.sel == 0 && k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => v.orders.paste_lines("\n"),
+                KeyCode::Char('j') if v.sel == 0 && ctrl => v.orders.paste_lines("\n"),
+                KeyCode::Enter => app.close_refit(true),
+                KeyCode::Tab => v.sel = (v.sel + 1) % (n + 1),
+                KeyCode::BackTab => v.sel = (v.sel + n) % (n + 1),
+                KeyCode::Up if v.sel == 0 => { v.orders.vertical(true); }
+                KeyCode::Down if v.sel == 0 => if !v.orders.vertical(false) { v.sel = 1.min(n); },
+                KeyCode::Up | KeyCode::Char('k') if v.sel > 0 => v.sel -= 1,
+                KeyCode::Down | KeyCode::Char('j') if v.sel > 0 => v.sel = (v.sel + 1).min(n),
+                KeyCode::Char(' ') if v.sel > 0 => {
+                    let s = v.skills[v.sel - 1].clone();
+                    if let Some(i) = v.picked.iter().position(|p| *p == s) { v.picked.remove(i); } else { v.picked.push(s); }
+                }
+                _ if v.sel == 0 => { v.orders.key(k); }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The shipyard: the saved designs, renamed or scrapped. Ships launched from them keep their own copy.
+fn shipyard_input(app: &mut App, ev: &Event) {
+    if let Event::Key(k) = ev && k.kind == KeyEventKind::Release { return; }
+    let n = app.designs.designs.len();
+    let Mode::Shipyard(v) = &mut app.mode else { return };
+    v.sel = v.sel.min(n.saturating_sub(1));
+    let id = app.designs.designs.get(v.sel).map(|d| d.id);
+    if let Some(name) = &mut v.rename {
+        match ev {
+            Event::Key(k) if k.code == KeyCode::Esc => { v.rename = None; v.error.clear(); }
+            Event::Key(k) if k.code == KeyCode::Enter => {
+                let (name, id) = (name.s.clone(), id.unwrap_or(0));
+                let r = app.sync_designs(|b| b.rename(id, &name));
+                if let Mode::Shipyard(v) = &mut app.mode { match r { Ok(_) => { v.rename = None; v.error.clear(); } Err(e) => v.error = e } }
+            }
+            Event::Key(k) => { name.key(k); }
+            Event::Paste(s) => name.paste_lines(&s.chars().filter(|c| !c.is_control()).collect::<String>()),
+            _ => {}
+        }
+        return;
+    }
+    if v.remove {
+        if let Event::Key(k) = ev {
+            v.remove = false;
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) && let Some(id) = id {
+                let r = app.sync_designs(|b| b.remove(id));
+                if let (Err(e), Mode::Shipyard(v)) = (r, &mut app.mode) { v.error = e; }
+            }
+        }
+        return;
+    }
+    match ev {
+        Event::Key(k) => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Y') => app.mode = Mode::Galaxy,
+            KeyCode::Up | KeyCode::Char('k') => v.sel = v.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => v.sel = (v.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('r') if id.is_some() => {
+                let name = app.designs.designs[v.sel].name.clone();
+                v.rename = Some(Line { cur: name.chars().count(), s: name });
+                v.error.clear();
+            }
+            KeyCode::Char('x') if id.is_some() => { v.remove = true; v.error.clear(); }
+            _ => {}
+        },
+        Event::Mouse(me) if me.kind == MouseEventKind::ScrollUp => v.sel = v.sel.saturating_sub(1),
+        Event::Mouse(me) if me.kind == MouseEventKind::ScrollDown => v.sel = (v.sel + 1).min(n.saturating_sub(1)),
+        _ => {}
     }
 }
 
@@ -2632,7 +3125,7 @@ fn commander_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
         let mut text = Line::default();
         text.set(pr_brief(pr, mine));
         let crewed = app.agents.iter().any(|a| a.cwd == row.world && a.dying.is_none() && a.status != Status::Exited);
-        app.mode = Mode::Brief { planet: row.world.clone(), text, kind: 0, launch: !crewed, role: 0, to: None, attachments: vec![], sending: false };
+        app.mode = Mode::Brief { planet: row.world.clone(), text, kind: 0, launch: !crewed, role: 0, to: None, attachments: vec![], sending: false, ship: Outfit::default() };
     } else if open {
         app.sel = Some(Sel::Planet(row.world.clone()));
         match &row.target {
@@ -2882,7 +3375,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                     match result {
                         Ok(()) => {
                             let launched = matches!(app.mode, Mode::Brief { launch: true, .. });
-                            app.mode = app.anomaly_return.take().map_or_else(|| app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet), |id| Mode::Anomalies { id, typing: false });
+                            app.mode = if app.campaign_draft.take().is_some() { Mode::Campaigns } else { app.anomaly_return.take().map_or_else(|| app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet), |id| Mode::Anomalies { id, typing: false }) };
                             app.toast(if launched { "mission launched" } else { "mission queued" }, t);
                         }
                         Err(e) => {
@@ -3375,8 +3868,20 @@ fn handle(
         return false;
     }
 
+    if matches!(app.mode, Mode::Campaigns) {
+        campaign_input(app, w, l, client, &ev);
+        return false;
+    }
     if matches!(app.mode, Mode::Hyperlanes) {
         hyperlane_input(app, w, l, &ev);
+        return false;
+    }
+    if matches!(app.mode, Mode::Refit(_)) {
+        refit_input(app, &ev, t);
+        return false;
+    }
+    if matches!(app.mode, Mode::Shipyard(_)) {
+        shipyard_input(app, &ev);
         return false;
     }
     if matches!(app.mode, Mode::Sectors) {
@@ -3465,6 +3970,8 @@ fn handle(
                 *role = i;
                 *launch = true;
             }
+            Some(draw::BriefHit::Design) => app.next_design(t),
+            Some(draw::BriefHit::Refit) => app.open_refit(),
             None => return false,
         }
         app.advisor.touched = true;
@@ -3484,6 +3991,22 @@ fn handle(
     let nk = app.kinds.len().max(1);
 
     // ── dialogs
+    if matches!(app.mode, Mode::Brief { sending: false, .. }) && k.code == KeyCode::Enter && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        && let Some(draft) = &app.campaign_draft
+    {
+        let (link, context) = (draft.link, draft.context.clone());
+        let result = app.sync_campaigns(|_| Ok(0)).and_then(|_| app.campaigns.brief(link.campaign, link.stage));
+        match result {
+            Ok(now) if now == context => {}
+            Ok(_) => { app.toast("Campaign changed; cancel and reopen the mission to refresh its handoff", t); return false; }
+            Err(e) => { app.toast(e, t); return false; }
+        }
+    }
+    // a design outfits the composer's new ship; a refit adjusts its orders and skills
+    if matches!(app.mode, Mode::Brief { sending: false, .. }) && k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('d' | 'r')) {
+        if k.code == KeyCode::Char('d') { app.next_design(t); } else { app.open_refit(); }
+        return false;
+    }
     match &mut app.mode {
         Mode::Help => {
             app.mode = Mode::Galaxy;
@@ -3689,12 +4212,12 @@ fn handle(
             }
             return false;
         }
-        Mode::Brief { planet, text, kind, launch, role, to, attachments, sending } => {
+        Mode::Brief { planet, text, kind, launch, role, to, attachments, sending, ship } => {
             if *sending { return false; }
             match k.code {
                 KeyCode::Esc => {
                     screenshots::discard(attachments);
-                    app.mode = app.anomaly_return.take().map_or_else(|| app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet), |id| Mode::Anomalies { id, typing: false });
+                    app.mode = if app.campaign_draft.take().is_some() { Mode::Campaigns } else { app.anomaly_return.take().map_or_else(|| app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet), |id| Mode::Anomalies { id, typing: false }) };
                 }
                 KeyCode::Char('v') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     let result = if attachments.len() >= screenshots::MAX_ATTACHMENTS {
@@ -3745,9 +4268,17 @@ fn handle(
                     let prompt = if text.s.trim().is_empty() { "Review the attached screenshots." } else { text.s.trim() };
                     let role = if *launch { ROLES[*role].name().into() } else { String::new() };
                     let to = if *launch { None } else { *to };
-                    let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: app.kinds[*kind].clone(), launch: *launch, attachments: attachments.clone(), draft: true, role, to };
+                    let species = app.kinds[*kind].clone();
+                    let spec = if *launch {
+                        let design = ship.design.and_then(|id| app.designs.get(id)).map(|d| d.name.clone()).unwrap_or_default();
+                        ShipSpec { orders: ship.orders.clone(), skills: ship.skills.clone(), design }
+                    } else { ShipSpec::default() };
+                    // launch anyway, but say which skills this species won't find
+                    let missing: Vec<String> = spec.skills.iter().filter(|s| !crate::design::reachable(&species, s, Path::new(planet), &app.skill_home)).cloned().collect();
+                    let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: species.clone(), launch: *launch, attachments: attachments.clone(), draft: true, role, to, campaign: app.campaign_draft.as_ref().map(|d| d.link), spec };
                     *sending = true;
                     client.send(cmd);
+                    if !missing.is_empty() { app.toast(format!("{species} can't find skill {}; launching without it", missing.join(", ")), t); }
                 }
                 _ => {
                     text.key(&k);
@@ -3819,7 +4350,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Galaxy | Mode::Sectors | Mode::Hyperlanes | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
+        Mode::Galaxy | Mode::Refit(_) | Mode::Shipyard(_) | Mode::Sectors | Mode::Hyperlanes | Mode::Campaigns | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
     // ── galaxy
@@ -3839,6 +4370,8 @@ fn handle(
         KeyCode::Char('A') => app.open_anomalies(),
         KeyCode::Char('V') => app.open_sectors(),
         KeyCode::Char('H') => app.open_hyperlanes(),
+        KeyCode::Char('O') => app.open_campaigns(),
+        KeyCode::Char('Y') => app.open_shipyard(),
         KeyCode::Char('h') => app.toggle_dependencies(),
         KeyCode::Char('c') if ctrl => return true,
         KeyCode::Esc => { app.sel = None; app.sector_focus = None; },
@@ -3935,6 +4468,9 @@ fn handle(
         },
         KeyCode::Char('S') => app.mode = Mode::Situation { id: app.log.front().map_or(0, |e| e.id), typing: false },
         KeyCode::Char('X') => match app.sel_planet() {
+            Some(p) if w.planet(&p).is_some_and(|p| p.dormant) && app.campaigns.campaigns.iter().any(|c| !c.archived && c.stages.iter().any(|s| s.world == p)) => {
+                app.toast("this world is kept by a campaign · O to archive it first", t);
+            }
             Some(p) if w.planet(&p).is_some_and(|p| p.dormant) && app.hyperlanes.lanes.iter().any(|l| l.from == p || l.to == p) => {
                 app.toast("this world is kept by a hyperlane · H to remove its links first", t);
             }
@@ -3962,7 +4498,7 @@ fn handle(
             Some(planet) => {
                 // queue it if someone's there to take it, otherwise send a ship
                 let crewed = app.agents.iter().any(|a| a.cwd == planet && a.dying.is_none());
-                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed, role: 0, to: None, attachments: Vec::new(), sending: false };
+                app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed, role: 0, to: None, attachments: Vec::new(), sending: false, ship: Outfit::default() };
             }
             None => app.toast("select a world to give it a mission", t),
         },
@@ -4294,7 +4830,7 @@ mod screenshot_tests {
         let attachments = (0..8).map(|i| Attachment { name: format!("screen-{i}.png"), path: format!("/saved/{i}.png") }).collect();
         let mut text = Line::default();
         text.set("Fix the spacing".into());
-        app.mode = Mode::Brief { planet: "/world".into(), text, kind: 0, launch: false, role: 0, to: None, attachments, sending: false };
+        app.mode = Mode::Brief { planet: "/world".into(), text, kind: 0, launch: false, role: 0, to: None, attachments, sending: false, ship: Outfit::default() };
         let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
         let mut fb = Fb::new(80, 24);
         let layout = Lay::new(&fb, false);
@@ -4805,6 +5341,7 @@ mod ship_card_tests {
             ask: None,
             war: if war { vec![crate::proto::War { rival: 9, files: vec!["src/a.rs".into()] }] } else { vec![] },
             role: Role::None,
+            design: String::new(),
             wpos: (0.0, 0.0),
             front: true,
         }
@@ -5177,7 +5714,7 @@ mod role_tests {
     #[test]
     fn composer_offers_roles_and_a_click_picks_one_and_launches() {
         let mut app = App::new();
-        app.mode = Mode::Brief { planet: "/world".into(), text: Line::default(), kind: 0, launch: false, role: 0, to: None, attachments: Vec::new(), sending: false };
+        app.mode = Mode::Brief { planet: "/world".into(), text: Line::default(), kind: 0, launch: false, role: 0, to: None, attachments: Vec::new(), sending: false, ship: Outfit::default() };
         let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
         let mut fb = Fb::new(100, 30);
         let l = Lay::new(&fb, false);
@@ -5201,7 +5738,7 @@ mod advisor_tests {
     fn composer() -> (App, World, Lay) {
         let mut app = App::new();
         app.agents = vec![ship_card_tests::ship(4, false), ship_card_tests::ship(7, false)];
-        app.mode = Mode::Brief { planet: "/home/me/world".into(), text: Line::default(), kind: 0, launch: true, role: 0, to: None, attachments: Vec::new(), sending: false };
+        app.mode = Mode::Brief { planet: "/home/me/world".into(), text: Line::default(), kind: 0, launch: true, role: 0, to: None, attachments: Vec::new(), sending: false, ship: Outfit::default() };
         let fb = Fb::new(100, 34);
         (app, World { systems: vec![], planets: vec![], lanes: vec![], station: None }, Lay::new(&fb, false))
     }
@@ -5929,4 +6466,296 @@ mod hyperlane_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod campaign_tests {
+    use super::*;
+
+    fn fixture() -> (App, World, Lay) {
+        let mut app = App::new(); app.loaded = true; app.online = true; app.kinds = vec!["codex".into()];
+        let mut a = ship_card_tests::ship(1, false); a.cwd = "/world/app".into(); app.agents.push(a);
+        let mut moon = ship_card_tests::ship(2, false); moon.cwd = "/moons/auth".into(); app.agents.push(moon);
+        app.survey.worlds.insert("/moons/auth".into(), survey::World { host: Some("/world/app".into()), ..Default::default() });
+        let w = app.world(0.0, 0.0);
+        app.sel = Some(Sel::Planet("/world/app".into()));
+        (app, w, Lay::new(&Fb::new(120, 42), false))
+    }
+    fn key(app: &mut App, w: &World, l: &Lay, client: &Client, code: KeyCode) {
+        handle(app, w, l, client, None, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 1.0, &mut None);
+    }
+    fn paste(app: &mut App, w: &World, l: &Lay, client: &Client, text: &str) {
+        handle(app, w, l, client, None, Event::Paste(text.into()), 1.0, &mut None);
+    }
+    fn plan(app: &mut App, w: &World, l: &Lay, client: &Client) {
+        key(app, w, l, client, KeyCode::Char('O'));
+        key(app, w, l, client, KeyCode::Char('n'));
+        paste(app, w, l, client, "Ship authentication"); key(app, w, l, client, KeyCode::Enter);
+        paste(app, w, l, client, "Anonymous access is rejected\nExisting sessions still work"); key(app, w, l, client, KeyCode::Enter);
+        key(app, w, l, client, KeyCode::Char('s')); key(app, w, l, client, KeyCode::Enter);
+        paste(app, w, l, client, "Scout auth routes and propose a plan"); key(app, w, l, client, KeyCode::Enter);
+    }
+
+    #[test]
+    fn campaign_opens_waiting_ship_and_returns_without_sending_a_reply() {
+        let (mut app, w, l) = fixture(); let (client, commands) = Client::recording(); plan(&mut app, &w, &l, &client);
+        for (id, agent, cwd) in [(8, 1, "/world/app"), (9, 2, "/moons/auth")] {
+            app.campaigns.link(1, 1, &Mission { id, agent: Some(agent), cwd: cwd.into(), state: "active".into(), at: id as u64, ..Default::default() }, 10).unwrap();
+        }
+        app.agents[0].status = Status::Blocked;
+        app.agents[0].ask = Some(Ask { question: "Which storage format?".into(), ..Default::default() });
+        key(&mut app, &w, &l, &client, KeyCode::Char('o'));
+        assert!(matches!(app.mode, Mode::Chat { id: 1, .. }), "Open the waiting ship before another linked ship");
+        key(&mut app, &w, &l, &client, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Campaigns));
+        assert_eq!(app.campaign_stage().unwrap().id, 1);
+        key(&mut app, &w, &l, &client, KeyCode::Char('o'));
+        key(&mut app, &w, &l, &client, KeyCode::Tab);
+        assert!(matches!(app.mode, Mode::Comms(1)));
+        key(&mut app, &w, &l, &client, KeyCode::F(12));
+        assert!(matches!(app.mode, Mode::Campaigns));
+        assert!(commands.try_iter().all(|c| matches!(c, Cmd::Seen(_) | Cmd::Resize { .. })));
+        app.campaigns.campaigns[0].stages[0].missions[0].available = false;
+        key(&mut app, &w, &l, &client, KeyCode::Char('o'));
+        assert!(matches!(app.mode, Mode::Chat { id: 2, .. }), "An unavailable snapshot must not point to a reused ship id");
+        key(&mut app, &w, &l, &client, KeyCode::Esc);
+        for a in &mut app.agents { a.status = Status::Exited; }
+        key(&mut app, &w, &l, &client, KeyCode::Char('o'));
+        assert!(matches!(app.mode, Mode::Campaigns));
+        assert!(app.campaign_view.error.contains("No live ship"));
+    }
+
+    #[test]
+    fn campaign_summary_shows_question_without_repeating_the_saved_prompt() {
+        let (mut app, w, _) = fixture(); let client = Client::isolated();
+        let mut fb = Fb::new(120, 60); let l = Lay::new(&fb, false); plan(&mut app, &w, &l, &client);
+        app.campaigns.link(1, 1, &Mission { id: 8, agent: Some(1), cwd: "/world/app".into(), state: "active".into(), at: 8,
+            text: "ARCHIVED PROMPT SENTINEL".into(), ..Default::default() }, 10).unwrap();
+        app.agents[0].status = Status::Blocked;
+        app.agents[0].ask = Some(Ask { question: "Which storage format?".into(), ..Default::default() });
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("Waiting for your input") && text.contains("Which storage format?"));
+        assert!(text.contains("o open ship") && text.contains("Objective") && text.contains("Acceptance criteria"));
+        assert!(!text.contains("ARCHIVED PROMPT SENTINEL") && !text.contains("Campaign history"));
+        key(&mut app, &w, &l, &client, KeyCode::Char('d'));
+        app.campaign_view.scroll = usize::MAX;
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("ARCHIVED PROMPT SENTINEL") && text.contains("Campaign history"));
+    }
+
+    #[test]
+    fn campaign_planning_and_cancel_do_not_send_orders_and_submission_keeps_metadata() {
+        let (mut app, w, l) = fixture(); let (client, commands) = Client::recording();
+        plan(&mut app, &w, &l, &client);
+        assert_eq!(app.campaigns.campaigns[0].criteria, "Anonymous access is rejected\nExisting sessions still work");
+        assert_eq!(app.campaigns.campaigns[0].stages[0].world, "/world/app");
+        assert!(commands.try_recv().is_err());
+        key(&mut app, &w, &l, &client, KeyCode::Char('m'));
+        assert!(matches!(&app.mode, Mode::Brief { text, launch: false, .. } if text.s.contains("Acceptance criteria") && text.s.contains("Scout auth routes")));
+        key(&mut app, &w, &l, &client, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Campaigns));
+        assert!(app.campaign_draft.is_none());
+        assert!(commands.try_recv().is_err());
+        key(&mut app, &w, &l, &client, KeyCode::Char('m'));
+        key(&mut app, &w, &l, &client, KeyCode::Enter);
+        assert!(matches!(commands.try_recv().unwrap(), Cmd::Mission { cwd, text, launch: false, campaign: Some(crate::proto::CampaignRef { campaign: 1, stage: 1 }), .. }
+            if cwd == "/world/app" && text.contains("Anonymous access is rejected")));
+        assert!(matches!(app.mode, Mode::Brief { sending: true, .. }));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn existing_missions_need_handoff_verification_and_explicit_campaign_acceptance() {
+        let (mut app, w, l) = fixture(); let (client, commands) = Client::recording(); plan(&mut app, &w, &l, &client);
+        app.missions.push(Mission { id: 9, cwd: "/moons/auth".into(), text: "Inspect auth".into(), state: "done".into(), at: 10, ..Default::default() });
+        key(&mut app, &w, &l, &client, KeyCode::Char('l')); key(&mut app, &w, &l, &client, KeyCode::Enter);
+        assert_eq!(app.campaign_stage().unwrap().status(), "reported finished");
+        key(&mut app, &w, &l, &client, KeyCode::Char('a'));
+        assert!(app.campaign_view.error.contains("handoff"));
+        for (action, text) in [('h', "Found an unguarded route. Open question: cookie expiry."), ('v', "Inspected the route and reproduced the missing-session test")] {
+            key(&mut app, &w, &l, &client, KeyCode::Char(action)); paste(&mut app, &w, &l, &client, text); key(&mut app, &w, &l, &client, KeyCode::Enter);
+        }
+        assert_eq!(app.campaign_stage().unwrap().status(), "verified");
+        key(&mut app, &w, &l, &client, KeyCode::Char('a'));
+        assert_eq!(app.campaign_stage().unwrap().status(), "accepted");
+        assert!(app.selected_campaign().unwrap().completed.is_none());
+        key(&mut app, &w, &l, &client, KeyCode::Char('c')); key(&mut app, &w, &l, &client, KeyCode::Char('n'));
+        assert!(app.selected_campaign().unwrap().completed.is_none());
+        key(&mut app, &w, &l, &client, KeyCode::Char('c')); key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert!(app.selected_campaign().unwrap().completed.is_some());
+        key(&mut app, &w, &l, &client, KeyCode::Char('x'));
+        assert!(app.selected_campaign().unwrap().archived);
+        assert_eq!(app.campaign_stage().unwrap().missions[0].mission.cwd, "/moons/auth");
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn changed_handoff_blocks_a_stale_draft_without_losing_the_prompt() {
+        let (mut app, w, l) = fixture(); let (client, commands) = Client::recording(); plan(&mut app, &w, &l, &client);
+        key(&mut app, &w, &l, &client, KeyCode::Char('m'));
+        app.campaigns.update(1, "Ship revised authentication", "Expired sessions also fail", 100).unwrap();
+        key(&mut app, &w, &l, &client, KeyCode::Enter);
+        assert!(commands.try_recv().is_err());
+        assert!(matches!(&app.mode, Mode::Brief { text, sending: false, .. } if text.s.contains("Anonymous access is rejected")));
+        assert!(app.toast.as_ref().unwrap().0.contains("Campaign changed"));
+    }
+
+    #[test]
+    fn campaign_history_scrolls_and_mouse_selects_visible_stage_rows() {
+        let (mut app, w, l) = fixture(); let client = Client::isolated(); plan(&mut app, &w, &l, &client);
+        for i in 1..30 { app.campaigns.add_stage(1, "/world/app", &format!("Stage {i}"), i).unwrap(); }
+        key(&mut app, &w, &l, &client, KeyCode::End);
+        let (x, y, _, _, left, room) = draw::campaign_layout(&app, &l);
+        assert_eq!(draw::campaign_hit(&app, &w, &l, x + left + 2, y + 4), Some((true, 30 - room)));
+        handle(&mut app, &w, &l, &client, None, Event::Mouse(event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left), column: (x + left + 2) as u16, row: (y + 4) as u16, modifiers: KeyModifiers::NONE,
+        }), 1.0, &mut None);
+        assert_eq!(app.campaign_view.stage, (30 - room + 1) as u64);
+        app.campaign_view.stage = 1;
+        app.campaigns.handoff(1, 1, &format!("{}END OF HANDOFF", "finding\n".repeat(40)), 40).unwrap();
+        for (cols, rows) in [(80, 24), (120, 42)] {
+            let mut fb = Fb::new(cols, rows); let l = Lay::new(&fb, false);
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+            assert!(text.contains("CAMPAIGNS") && text.contains("h handoff") && text.contains("n new"));
+            app.campaign_view.scroll = usize::MAX;
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+            assert!(text.contains("END OF HANDOFF"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod design_tests {
+    use super::*;
+    use crate::design::Design;
+
+    fn press(app: &mut App, w: &World, l: &Lay, client: &Client, code: KeyCode, m: KeyModifiers) {
+        handle(app, w, l, client, None, Event::Key(KeyEvent::new(code, m)), 1.0, &mut None);
+    }
+    fn typed(app: &mut App, w: &World, l: &Lay, client: &Client, s: &str) {
+        for c in s.chars() { press(app, w, l, client, KeyCode::Char(c), KeyModifiers::NONE); }
+    }
+    fn screen(app: &mut App, w: &World, l: &Lay) -> String {
+        let mut fb = Fb::new(120, 40);
+        draw::frame(&mut fb, app, w, l, 1.0, None);
+        fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()
+    }
+    /// A world with one Claude skill (which Codex can't see), and a composer open on it.
+    fn setup(name: &str) -> (App, World, Lay, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("empire-design-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".claude/skills/empire-test-release")).unwrap();
+        std::fs::write(dir.join(".claude/skills/empire-test-release/SKILL.md"), "---\nname: empire-test-release\n---").unwrap();
+        let mut app = App::new();
+        app.kinds = vec!["claude".into(), "codex".into()];
+        app.mode = Mode::Brief { planet: dir.to_string_lossy().into(), text: Line::default(), kind: 0, launch: false, role: 0, to: None, attachments: vec![], sending: false, ship: Outfit::default() };
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        (app, world, Lay::new(&Fb::new(120, 40), false), dir)
+    }
+
+    #[test]
+    fn a_design_outfits_the_new_ship_and_can_be_adjusted_before_launch() {
+        let (mut app, w, l, dir) = setup("pick");
+        let (client, commands) = Client::recording();
+        let ctrl = KeyModifiers::CONTROL;
+        let id = app.designs.save(Design { name: "Frigate".into(), kind: "codex".into(), role: "builder".into(), orders: "Keep diffs small.".into(), skills: vec!["empire-test-release".into()], ..Default::default() }).unwrap();
+        press(&mut app, &w, &l, &client, KeyCode::Char('d'), ctrl);
+        assert!(matches!(&app.mode, Mode::Brief { kind: 1, launch: true, role, ship, .. } if ROLES[*role] == Role::Builder && ship.design == Some(id) && ship.orders == "Keep diffs small."));
+        // inspect: the design, its orders, and a skill Codex can't find from here
+        let s = screen(&mut app, &w, &l);
+        assert!(s.contains("Frigate") && s.contains("“Keep diffs small.”") && s.contains("✗empire-test-release"), "{s}");
+        // switch species: Claude finds it
+        press(&mut app, &w, &l, &client, KeyCode::Up, KeyModifiers::NONE);
+        assert!(screen(&mut app, &w, &l).contains("✓empire-test-release"));
+        // refit for this launch only
+        press(&mut app, &w, &l, &client, KeyCode::Char('r'), ctrl);
+        assert!(matches!(app.mode, Mode::Refit(_)));
+        typed(&mut app, &w, &l, &client, " Run the tests.");
+        press(&mut app, &w, &l, &client, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(&app.mode, Mode::Brief { ship, .. } if ship.orders == "Keep diffs small. Run the tests."));
+        assert_eq!(app.designs.get(id).unwrap().orders, "Keep diffs small.");
+        typed(&mut app, &w, &l, &client, "Fix the bug");
+        press(&mut app, &w, &l, &client, KeyCode::Enter, KeyModifiers::NONE);
+        match commands.try_recv().unwrap() {
+            Cmd::Mission { kind, launch, role, spec, text, .. } => {
+                assert_eq!((kind.as_str(), launch, role.as_str(), text.as_str()), ("claude", true, "builder", "Fix the bug"));
+                assert_eq!(spec, ShipSpec { orders: "Keep diffs small. Run the tests.".into(), skills: vec!["empire-test-release".into()], design: "Frigate".into() });
+            }
+            _ => panic!("expected a mission"),
+        }
+        // the design cycle ends back at none
+        let (mut app2, w2, l2, _) = setup("pick2");
+        app2.designs = app.designs.clone();
+        press(&mut app2, &w2, &l2, &client, KeyCode::Char('d'), ctrl);
+        press(&mut app2, &w2, &l2, &client, KeyCode::Char('d'), ctrl);
+        assert!(matches!(&app2.mode, Mode::Brief { ship, .. } if *ship == Outfit::default()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("empire-design-pick2-{}", std::process::id())));
+    }
+
+    #[test]
+    fn without_a_design_the_composer_launches_as_before() {
+        let (mut app, w, l, dir) = setup("bare");
+        let (client, commands) = Client::recording();
+        assert!(screen(&mut app, &w, &l).contains("no orders or skills of its own"));
+        press(&mut app, &w, &l, &client, KeyCode::Tab, KeyModifiers::NONE); // queue → launch
+        typed(&mut app, &w, &l, &client, "Fix it");
+        press(&mut app, &w, &l, &client, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(commands.try_recv().unwrap(), Cmd::Mission { role, spec, .. } if role.is_empty() && spec == ShipSpec::default()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refit_is_saved_to_the_shipyard_and_kept_across_restarts() {
+        let (mut app, w, l, dir) = setup("yard");
+        app.design_path = Some(dir.join("state/designs.json"));
+        let (client, _commands) = Client::recording();
+        let ctrl = KeyModifiers::CONTROL;
+        press(&mut app, &w, &l, &client, KeyCode::BackTab, KeyModifiers::NONE); // scout
+        press(&mut app, &w, &l, &client, KeyCode::Char('r'), ctrl);
+        typed(&mut app, &w, &l, &client, "Only read docs.");
+        press(&mut app, &w, &l, &client, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, &w, &l, &client, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(screen(&mut app, &w, &l).contains("[x] ✓ empire-test-release"));
+        press(&mut app, &w, &l, &client, KeyCode::Char('s'), ctrl);
+        typed(&mut app, &w, &l, &client, "Survey boat");
+        press(&mut app, &w, &l, &client, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut app, &w, &l, &client, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(&app.mode, Mode::Brief { ship, launch: true, .. } if ship.design.is_some() && ship.skills == ["empire-test-release"]));
+        // a fresh galaxy finds it in its shipyard
+        let mut later = App::new();
+        later.design_path = app.design_path.clone();
+        press(&mut later, &w, &l, &client, KeyCode::Char('Y'), KeyModifiers::NONE);
+        assert!(matches!(later.mode, Mode::Shipyard(_)));
+        let d = later.designs.designs[0].clone();
+        assert_eq!((d.name.as_str(), d.kind.as_str(), d.role.as_str(), d.orders.as_str()), ("Survey boat", "claude", "scout", "Only read docs."));
+        assert!(screen(&mut later, &w, &l).contains("Survey boat"));
+        // rename and scrap it
+        press(&mut later, &w, &l, &client, KeyCode::Char('r'), KeyModifiers::NONE);
+        press(&mut later, &w, &l, &client, KeyCode::Char('u'), ctrl);
+        typed(&mut later, &w, &l, &client, "Tender");
+        press(&mut later, &w, &l, &client, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(crate::design::edit(later.design_path.as_ref().unwrap(), |_| {}).unwrap().designs[0].name, "Tender");
+        press(&mut later, &w, &l, &client, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(screen(&mut later, &w, &l).contains("Scrap Tender?"));
+        press(&mut later, &w, &l, &client, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(crate::design::edit(later.design_path.as_ref().unwrap(), |_| {}).unwrap().designs.is_empty());
+        // the composer that launched from it shows the design as scrapped, its outfit intact
+        let _ = app.sync_designs(|_| Ok(0));
+        assert!(matches!(&app.mode, Mode::Brief { ship, .. } if ship.orders == "Only read docs."));
+        assert!(screen(&mut app, &w, &l).contains("scrapped"));
+        // small terminals squeeze the dialogs without panicking
+        for (cols, rows) in [(80, 24), (48, 14), (30, 8)] {
+            let small = Lay::new(&Fb::new(cols, rows), false);
+            for mode in [Mode::Shipyard(YardView::default()), Mode::Refit(RefitView { brief: Box::new(Mode::Galaxy), orders: Line::default(), skills: vec!["a".into(); 9], picked: vec![], sel: 4, naming: Some(Line::default()), error: "oops".into() })] {
+                later.mode = mode;
+                draw::frame(&mut Fb::new(cols, rows), &mut later, &w, &small, 1.0, None);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -56,6 +56,11 @@ pub enum Req {
         /// Queue it for this ship only (it takes it when it's next free).
         #[serde(default)]
         to: Option<u32>,
+        #[serde(default)]
+        campaign: Option<CampaignRef>,
+        /// A newly launched ship's own orders and skills, beyond its role.
+        #[serde(default)]
+        spec: ShipSpec,
     },
     /// One order to many agents at once, followed as one fleet order.
     Broadcast { ids: Vec<u32>, text: String },
@@ -96,6 +101,26 @@ pub struct AgentView {
     /// Border conflicts: other agents on this world editing the same files.
     #[serde(default)]
     pub war: Vec<War>,
+    /// The design it was launched from, by name ("" for none).
+    #[serde(default)]
+    pub design: String,
+}
+
+/// A ship's outfit beyond its role: standing orders and skills to lean on, and the name of
+/// the design it came from. The ship keeps this copy for life, whatever becomes of the design.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct ShipSpec {
+    #[serde(default)]
+    pub orders: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub design: String,
+}
+
+impl ShipSpec {
+    /// Nothing of its own to tell the ship.
+    pub fn is_bare(&self) -> bool { self.orders.trim().is_empty() && self.skills.is_empty() }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -104,6 +129,10 @@ pub struct War {
     /// Contested files, relative to the world.
     pub files: Vec<String>,
 }
+
+/// A mission's place in a campaign; the harness still owns its execution.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CampaignRef { pub campaign: u64, pub stage: u64 }
 
 /// A task written on a world, carried out by one of its agents.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -122,6 +151,8 @@ pub struct Mission {
     /// Missions given together as one fleet order share this.
     #[serde(default)]
     pub fleet: Option<u32>,
+    #[serde(default)]
+    pub campaign: Option<CampaignRef>,
 }
 
 /// A question read off an agent's screen, answerable from the galaxy.
@@ -251,15 +282,17 @@ mod attachment_tests {
     #[test]
     fn old_requests_and_saved_missions_remain_readable() {
         let request: Req = serde_json::from_str(r#"{"op":"mission","cwd":"/world","text":"fix it","kind":"codex","launch":false}"#).unwrap();
-        assert!(matches!(request, Req::Mission { attachments, .. } if attachments.is_empty()));
+        assert!(matches!(request, Req::Mission { attachments, campaign: None, spec, .. } if attachments.is_empty() && spec == ShipSpec::default()));
         let mission: Mission = serde_json::from_str(r#"{"id":1,"cwd":"/world","text":"fix it","state":"queued","agent":null,"at":0,"done_at":null}"#).unwrap();
         assert!(mission.attachments.is_empty());
+        assert!(mission.campaign.is_none());
     }
 
     #[test]
     fn attachment_references_survive_mission_persistence() {
         let mission = Mission {
             text: "Fix the screenshot".into(),
+            campaign: Some(CampaignRef { campaign: 4, stage: 2 }),
             attachments: vec![crate::screenshots::Attachment { name: "screenshot.png".into(), path: "/saved/123.png".into() }],
             ..Mission::default()
         };

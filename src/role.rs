@@ -3,6 +3,7 @@
 //! species supports one.
 
 use crate::gfx::{V3, v3};
+use crate::proto::ShipSpec;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Role {
@@ -67,44 +68,77 @@ impl Role {
         }
     }
 
+    /// Everything a ship is told for life: its role's order, then a design's own orders,
+    /// then the skills it should lean on.
+    pub fn standing(self, spec: &ShipSpec) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self != Role::None { parts.push(self.orders().into()); }
+        if !spec.orders.trim().is_empty() { parts.push(spec.orders.trim().into()); }
+        if !spec.skills.is_empty() { parts.push(format!("Skills to use when they fit the task: {}.", spec.skills.join(", "))); }
+        parts.join("\n\n")
+    }
+
     /// Launch flags for a species: Claude and Grok take the standing order beside the mission
     /// (a system prompt, or `--rules`), and a scout runs read-only where the species can enforce it.
-    pub fn args(self, kind: &str) -> Vec<String> {
+    #[cfg(test)]
+    pub fn args(self, kind: &str) -> Vec<String> { self.launch_args(kind, &ShipSpec::default()) }
+
+    /// Launch flags for a ship with its own outfit. Codex takes a design's orders as developer
+    /// instructions; with only a role it still gets the order in front of the mission, as before.
+    pub fn launch_args(self, kind: &str, spec: &ShipSpec) -> Vec<String> {
         let mut v: Vec<String> = Vec::new();
-        match (kind, self) {
-            (_, Role::None) => {}
-            ("claude", r) => {
-                if r == Role::Scout {
-                    v.extend(["--permission-mode".into(), "plan".into()]);
-                }
-                v.extend(["--append-system-prompt".into(), r.orders().into()]);
+        if self == Role::Scout {
+            match kind {
+                "claude" => v.extend(["--permission-mode".into(), "plan".into()]),
+                // plan mode refuses edits outside the plan file; the sandbox refuses the rest
+                "grok" => v.extend(["--permission-mode".into(), "plan".into(), "--sandbox".into(), "read-only".into()]),
+                "codex" => v.extend(["--sandbox".into(), "read-only".into()]),
+                _ => {}
             }
-            ("grok", r) => {
-                if r == Role::Scout {
-                    // plan mode refuses edits outside the plan file; the sandbox refuses the rest
-                    v.extend(["--permission-mode".into(), "plan".into(), "--sandbox".into(), "read-only".into()]);
-                }
-                v.extend(["--rules".into(), r.orders().into()]);
+        }
+        let standing = self.standing(spec);
+        if !standing.is_empty() {
+            match kind {
+                "claude" => v.extend(["--append-system-prompt".into(), standing]),
+                "grok" => v.extend(["--rules".into(), standing]),
+                "codex" if !spec.is_bare() => v.extend(["-c".into(), format!("developer_instructions={}", toml_string(&standing))]),
+                _ => {}
             }
-            ("codex", Role::Scout) => v.extend(["--sandbox".into(), "read-only".into()]),
-            _ => {}
         }
         v
     }
 
     /// The opening prompt: species without a system-prompt flag get the standing order first.
-    pub fn prompt(self, kind: &str, text: &str) -> String {
-        if self == Role::None || matches!(kind, "claude" | "grok") {
-            text.to_string()
-        } else {
-            format!("{}\n\nYour mission: {text}", self.orders())
-        }
+    #[cfg(test)]
+    pub fn prompt(self, kind: &str, text: &str) -> String { self.opening(kind, &ShipSpec::default(), text) }
+
+    pub fn opening(self, kind: &str, spec: &ShipSpec, text: &str) -> String {
+        let standing = self.standing(spec);
+        let carried = matches!(kind, "claude" | "grok") || (kind == "codex" && !spec.is_bare());
+        if standing.is_empty() || carried { text.to_string() } else { format!("{standing}\n\nYour mission: {text}") }
     }
 
     /// Whether launching this species read-only is enforced, not just asked for.
     pub fn enforced(self, kind: &str) -> bool {
         self == Role::Scout && matches!(kind, "claude" | "codex" | "grok")
     }
+}
+
+/// A TOML basic string, for a `-c key=value` override that must stay text whatever it says.
+fn toml_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -130,5 +164,32 @@ mod tests {
         assert_eq!(Role::Builder.prompt("claude", "Fix it"), "Fix it");
         assert_eq!(Role::Builder.prompt("grok", "Fix it"), "Fix it");
         assert!(Role::Builder.prompt("codex", "Fix it").ends_with("Your mission: Fix it"));
+    }
+
+    #[test]
+    fn a_design_outfit_rides_with_each_species() {
+        let spec = ShipSpec { orders: "Say \"done\" when done.\nKeep diffs small.".into(), skills: vec!["release".into(), "migrate".into()], design: "Frigate".into() };
+        let claude = Role::Builder.launch_args("claude", &spec);
+        assert_eq!(claude.iter().filter(|a| *a == "--append-system-prompt").count(), 1);
+        let order = &claude[claude.len() - 1];
+        assert!(order.starts_with("You are a builder.") && order.contains("Keep diffs small.") && order.ends_with("Skills to use when they fit the task: release, migrate."));
+        assert!(Role::None.launch_args("grok", &spec).windows(2).any(|w| w[0] == "--rules" && w[1].starts_with("Say")));
+        // codex: developer instructions, quoted as TOML so they can't be read as anything else
+        let codex = Role::Scout.launch_args("codex", &spec);
+        assert!(codex.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        assert!(codex.windows(2).any(|w| w[0] == "-c" && w[1].starts_with("developer_instructions=\"You are a scout.") && w[1].contains("Say \\\"done\\\" when done.\\nKeep") && w[1].ends_with("migrate.\"")));
+        assert_eq!(Role::Scout.opening("codex", &spec, "Fix it"), "Fix it");
+        // species without a flag get it all in front of the mission
+        assert!(Role::None.launch_args("cursor", &spec).is_empty());
+        assert!(Role::None.opening("cursor", &spec, "Fix it").starts_with("Say \"done\"") && Role::None.opening("cursor", &spec, "Fix it").ends_with("Your mission: Fix it"));
+        // no outfit: exactly the old launch
+        for kind in ["claude", "codex", "grok", "cursor"] {
+            for r in ROLES {
+                assert_eq!(r.launch_args(kind, &ShipSpec::default()), r.args(kind));
+                assert_eq!(r.opening(kind, &ShipSpec::default(), "Fix it"), r.prompt(kind, "Fix it"));
+            }
+        }
+        assert!(!Role::Builder.args("codex").iter().any(|a| a == "-c"));
+        assert!(Role::Builder.prompt("codex", "Fix it").starts_with("You are a builder."));
     }
 }
