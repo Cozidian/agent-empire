@@ -40,6 +40,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     }
     build_bg(app, fb, l);
     fb.px.copy_from_slice(&app.bg);
+    hyperlane_map(fb, app, w, l);
     galaxy(fb, app, w, l, t);
     bloom(fb, 0.5, 0.7);
     labels(fb, app, w, l, t);
@@ -64,6 +65,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     match &app.mode {
         Mode::Commander => commander(fb, app, w, l),
         Mode::Sectors => sectors(fb, app, w, l, t),
+        Mode::Hyperlanes => hyperlanes(fb, app, w, l, t),
         Mode::Anomalies { id, typing } => anomalies(fb, app, l, *id, *typing),
         Mode::Trade { sel } => trade_overview(fb, app, w, l, *sel, t),
         Mode::Situation { id, typing } => situation(fb, app, w, l, *id, *typing, t),
@@ -382,7 +384,7 @@ fn star(fb: &mut Fb, (x, y): (f32, f32), r: f32, seed: u32, col: V3, t: f32) {
 /// A calm system map at distances where full-size ship effects would overlap.
 fn galaxy_overview(fb: &mut Fb, app: &App, w: &World, l: &Lay) {
     let scr = |p| l.to_screen(&app.cam, p);
-    for &(i, j) in &w.lanes {
+    for &(i, j) in w.lanes.iter().filter(|_| !app.dependencies) {
         let (a, b) = (scr(w.systems[i].wpos), scr(w.systems[j].wpos));
         fb.line(a.0, a.1, b.0, b.1, v3(0.025, 0.055, 0.08), v3(0.025, 0.055, 0.08));
     }
@@ -523,6 +525,7 @@ pub fn sector_labels(app: &App, w: &World, l: &Lay) -> Vec<OverviewLabel> {
         entries.push((true, true, Sel::Planet(p.key.clone()), p.wpos, vec![(p.name.clone(), DIM)]));
     }
     if let Some(pos) = w.station { entries.push((true, true, Sel::GitHub, pos, vec![("GITHUB".into(), DIM)])); }
+    entries.extend(lane_entries(app, w, l));
     place_map_labels(app, l, entries)
 }
 
@@ -563,7 +566,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     let z = cam.z;
     let scr = |p: (f32, f32)| l.to_screen(cam, p);
 
-    for &(i, j) in &w.lanes {
+    for &(i, j) in w.lanes.iter().filter(|_| !app.dependencies) {
         let (a, b) = (scr(w.systems[i].wpos), scr(w.systems[j].wpos));
         fb.line(a.0, a.1, b.0, b.1, v3(0.03, 0.08, 0.11), v3(0.03, 0.08, 0.11));
         let s = fract(t * 0.12 + (i * 7 + j * 3) as f32 * 0.13);
@@ -696,7 +699,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         Some(Sel::Agent(id)) => app.agent(*id).map(|a| (a.wpos, 6.0 * z.clamp(0.7, 2.2) + 2.0)),
         Some(Sel::Planet(k)) => w.planet(k).map(|p| (p.wpos, (p.r * z).max(2.5) + 6.0)),
         Some(Sel::Sys(k)) => w.systems.iter().find(|s| &s.key == k).map(|s| (s.wpos, (8.0 * z).max(2.2) + 8.0)),
-        Some(Sel::Sector(_, _)) | None => None,
+        Some(Sel::Sector(_, _) | Sel::Lane(_)) | None => None,
     };
     if let Some((p, rr)) = target {
         let (x, y) = scr(p);
@@ -935,6 +938,12 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         }
         return;
     }
+    if app.dependencies {
+        for label in sector_labels(app, w, l) {
+            for (i, (text, col)) in label.lines.iter().enumerate() { fb.text(label.col, label.row + i as i32, text, *col); }
+        }
+        return;
+    }
     let cam = &app.cam;
     let z = cam.z;
     let cw = l.cols - l.pw;
@@ -1013,7 +1022,7 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
 fn top_bar(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     fb.panel(0, 0, l.cols, 1, BAR);
-    let title = if app.sector_map() { " ◆ AGENT EMPIRE · SECTORS " } else { " ◆ AGENT EMPIRE " };
+    let title = if app.dependencies { " ◆ EMPIRE · DEPENDENCIES " } else if app.sector_map() { " ◆ AGENT EMPIRE · SECTORS " } else { " ◆ AGENT EMPIRE " };
     for (k, ch) in title.chars().enumerate() {
         fb.put_bg(k as i32, 0, ch, hsv(0.52 + k as f32 * 0.015 - t * 0.04, 0.45, 1.0), Some(BAR));
     }
@@ -1362,6 +1371,12 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         && let Some(s) = w.systems.iter().find(|s| &s.key == k)
     {
         (format!("✶ {} SYSTEM", s.name.to_uppercase()), tilde(&s.key), s.star, system_rows(app, w, s, t))
+    } else if let Some(Sel::Lane(id)) = &app.sel
+        && let Some(lane) = app.hyperlanes.lanes.iter().find(|p| p.id == *id)
+    {
+        (format!("⇢ {}", lane.label), "Source → destination · charted by you".into(), LANE, vec![
+            ("from", vec![(tilde(&lane.from), TEXT)]), ("to", vec![(tilde(&lane.to), TEXT)]), ("inspect", vec![("⏎ details and editing · h hide connections".into(), DIM)]),
+        ])
     } else if let Some(Sel::Sector(id, system)) = &app.sel
         && let Some(g) = app.sectors.sectors.iter().find(|g| g.id == *id)
     {
@@ -1464,10 +1479,11 @@ fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
         Some(Sel::Planet(_)) => "⏎ land · r needs · t mission · B build · L missions · b fleet · u moon · e deploy · ",
         Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
         Some(Sel::Sector(_, _)) => "⏎ zoom into sector · ",
+        Some(Sel::Lane(_)) => "⏎ inspect link · f focus · ",
         Some(Sel::GitHub) => "⏎ projects and pull requests · ",
         None => "",
     };
-    let s = format!("{}{music}· V sectors · A anomalies · {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
+    let s = format!("{}{music}· H links · h overlay · V sectors · A anomalies · {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1548,6 +1564,7 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 let shown = if n > room { format!("…{}", path.chars().skip(n + 1 - room).collect::<String>()) } else { path };
                 seg(fb, x, row, &shown, room as i32, DIM * 0.7, Some(bg));
             }
+            Sel::Lane(_) => {}
             Sel::Sector(id, _) => {
                 if let Some(g) = app.sectors.sectors.iter().find(|g| g.id == *id) { seg(fb, c0 + 1, row, &format!("▱ {}", g.name), inner as i32 - 1, sector_color(*id), Some(bg)); }
             }
@@ -1721,7 +1738,7 @@ fn fleet_order(fb: &mut Fb, app: &App, w: &World, target: &Sel, text: &Line, l: 
     let name = match target {
         Sel::Sys(k) => format!("{} SYSTEM", base_name(k).to_uppercase()),
         Sel::Planet(k) => base_name(k).to_uppercase(),
-        Sel::Agent(_) | Sel::GitHub | Sel::Sector(_, _) => String::new(),
+        Sel::Agent(_) | Sel::GitHub | Sel::Sector(_, _) | Sel::Lane(_) => String::new(),
     };
     frame_box(fb, x, y, bw, h, &format!("◆ FLEET ORDER · {name}"), accent);
     let ships = app.fleet(w, target);
@@ -2329,6 +2346,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("C", "commander: your attention queue across all systems"),
         ("A", "anomalies: findings, investigations and history across systems"),
         ("V", "sectors: group worlds, inspect activity and focus the map"),
+        ("H / h", "hyperlanes: name connections / toggle dependency overlay"),
         ("n", "colonize: launch an agent in a folder (new or existing)"),
         ("e", "deploy another agent to the selected world"),
         ("x", "decommission the selected agent"),
@@ -2824,4 +2842,141 @@ fn situation(fb: &mut Fb, app: &App, w: &World, l: &Lay, id: u64, typing: bool, 
         "↑↓ select · 0-7 / f kind · w this world · / search · x clear · ⏎ go to · c comms · esc close".into()
     };
     seg(fb, x + 3, y + h - 2, &help, bw - 6, DIM, Some(BOX));
+}
+
+// ─────────────────────────────── hyperlanes ───────────────────────────────
+
+const LANE: V3 = v3(0.45, 0.75, 0.95);
+
+/// A visible curved route in screen pixels; drawing and picking share its geometry.
+pub struct LanePath { pub id: u64, pub points: Vec<(f32, f32)> }
+
+pub fn lane_paths(app: &App, w: &World, l: &Lay) -> Vec<LanePath> {
+    if !app.dependencies { return vec![]; }
+    let mut paths = Vec::new();
+    for lane in &app.hyperlanes.lanes {
+        let (Some(a), Some(b)) = (w.planet(&lane.from), w.planet(&lane.to)) else { continue };
+        let (a, b) = (l.to_screen(&app.cam, a.wpos), l.to_screen(&app.cam, b.wpos));
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let length = dx.hypot(dy);
+        if length < 12.0 { continue; }
+        let rank = app.hyperlanes.lanes.iter().filter(|p| p.id < lane.id && p.from == lane.from && p.to == lane.to).count();
+        let bend = 12.0 + rank as f32 * 12.0;
+        let c = ((a.0 + b.0) * 0.5 - dy / length * bend, (a.1 + b.1) * 0.5 + dx / length * bend);
+        let pad = (6.0 / length).min(0.3);
+        let points = (0..=24).map(|i| {
+            let t = pad + (1.0 - 2.0 * pad) * i as f32 / 24.0;
+            let u = 1.0 - t;
+            (u * u * a.0 + 2.0 * u * t * c.0 + t * t * b.0, u * u * a.1 + 2.0 * u * t * c.1 + t * t * b.1)
+        }).collect();
+        paths.push(LanePath { id: lane.id, points });
+    }
+    paths
+}
+
+pub fn lane_pick(app: &App, w: &World, l: &Lay, p: (f32, f32)) -> Option<Sel> {
+    lane_paths(app, w, l).into_iter().filter_map(|route| {
+        let d = route.points.windows(2).map(|s| {
+            let (a, b) = (s[0], s[1]);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / (dx * dx + dy * dy).max(0.001)).clamp(0.0, 1.0);
+            (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+        }).fold(f32::MAX, f32::min);
+        (d < 3.0).then_some((d, route.id))
+    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, id)| Sel::Lane(id))
+}
+
+fn hyperlane_map(fb: &mut Fb, app: &App, w: &World, l: &Lay) {
+    for route in lane_paths(app, w, l) {
+        let col = LANE * if app.sel == Some(Sel::Lane(route.id)) { 0.95 } else { 0.42 };
+        for s in route.points.windows(2) { fb.line(s[0].0, s[0].1, s[1].0, s[1].1, col, col); }
+        let (a, b) = (route.points[15], route.points[16]);
+        let angle = (b.1 - a.1).atan2(b.0 - a.0);
+        for side in [-0.55, 0.55] {
+            fb.line(b.0, b.1, b.0 - (angle + side).cos() * 6.0, b.1 - (angle + side).sin() * 6.0, col * 1.5, col);
+        }
+    }
+}
+
+fn lane_entries(app: &App, w: &World, l: &Lay) -> Vec<MapEntry> {
+    lane_paths(app, w, l).into_iter().filter_map(|route| {
+        let lane = app.hyperlanes.lanes.iter().find(|p| p.id == route.id)?;
+        let target = Sel::Lane(lane.id);
+        Some((app.sel != Some(target.clone()), false, target, l.to_world(&app.cam, route.points[12]), vec![(lane.label.clone(), LANE)]))
+    }).collect()
+}
+
+pub fn hyperlane_layout(l: &Lay) -> (i32, i32, i32, i32, usize) {
+    let (x, y, w, h) = centered(l, 112, (l.rows - 2).min(28));
+    (x, y, w, h, (h - 14).max(1) as usize)
+}
+
+pub fn hyperlane_hit(l: &Lay, count: usize, at: usize, col: i32, row: i32) -> Option<usize> {
+    let (x, y, w, _, room) = hyperlane_layout(l);
+    let off = (at + 1).saturating_sub(room);
+    if col < x + 2 || col >= x + w - 2 || row < y + 4 || row >= y + 4 + room as i32 { return None; }
+    let i = off + (row - y - 4) as usize;
+    (i < count).then_some(i)
+}
+
+fn hyperlanes(fb: &mut Fb, app: &App, world: &World, l: &Lay, t: f32) {
+    let (x, y, w, h, room) = hyperlane_layout(l);
+    let view = &app.lane_view;
+    let chosen = app.selected_lane();
+    let step = view.edit;
+    let picking = matches!(step, Some(LaneEdit::From | LaneEdit::To));
+    let paths = app.lane_worlds(world);
+    let current = if step == Some(LaneEdit::To) { &view.to } else { &view.from };
+    let at = if picking { paths.iter().position(|p| p == current).unwrap_or(0) }
+        else { chosen.and_then(|p| app.hyperlanes.lanes.iter().position(|l| l.id == p.id)).unwrap_or(0) };
+    let off = (at + 1).saturating_sub(room);
+    frame_box(fb, x, y, w, h, "⇢ HYPERLANES", LANE);
+    let title = match step {
+        Some(LaneEdit::From) => "1 / 3 · Choose the source world",
+        Some(LaneEdit::To) => "2 / 3 · Choose the destination world",
+        Some(LaneEdit::Label) => "3 / 3 · Name the relationship: calls, depends on, publishes to…",
+        Some(LaneEdit::Remove) => "Remove this relationship? Folders and sectors stay intact.",
+        None => "Named relationships · source → destination · charted by you",
+    };
+    seg(fb, x + 2, y + 1, title, w - 4, TEXT, Some(BOX));
+    let hint = if step.is_some() { "Source → relationship → destination · Esc cancels" }
+        else if app.dependencies { "Dependency overlay ON · h hides connections" } else { "Dependency overlay OFF · h shows connections" };
+    seg(fb, x + 2, y + 2, hint, w - 4, DIM, Some(BOX));
+    if picking {
+        for (i, path) in paths.iter().enumerate().skip(off).take(room) {
+            let row = y + 4 + (i - off) as i32;
+            let bg = if i == at { SELBG } else { BOX };
+            fb.panel(x + 1, row, w - 2, 1, bg);
+            seg(fb, x + 2, row, &format!("{}{}", tilde(path), if world.planet(path).is_none() { " (unavailable)" } else { "" }), w - 4, if i == at { TEXT } else { DIM }, Some(bg));
+        }
+        if paths.is_empty() { seg(fb, x + 2, y + 4, "No worlds to choose. Chart another world with n or V first.", w - 4, DIM, Some(BOX)); }
+    } else {
+        for (i, lane) in app.hyperlanes.lanes.iter().enumerate().skip(off).take(room) {
+            let row = y + 4 + (i - off) as i32;
+            let bg = if i == at { SELBG } else { BOX };
+            let missing = world.planet(&lane.from).is_none() || world.planet(&lane.to).is_none();
+            let text = format!("{} — {} → {}{}", base_name(&lane.from), lane.label, base_name(&lane.to), if missing { " (unavailable)" } else { "" });
+            fb.panel(x + 1, row, w - 2, 1, bg);
+            seg(fb, x + 2, row, &text, w - 4, if i == at { TEXT } else { DIM }, Some(bg));
+        }
+        if app.hyperlanes.lanes.is_empty() { seg(fb, x + 2, y + 4, "No hyperlanes yet · n connects two worlds", w - 4, DIM, Some(BOX)); }
+    }
+    let (from, to, label) = if step.is_some() && step != Some(LaneEdit::Remove) { (view.from.as_str(), view.to.as_str(), view.text.s.as_str()) }
+        else { chosen.map_or(("", "", ""), |p| (p.from.as_str(), p.to.as_str(), p.label.as_str())) };
+    seg(fb, x + 2, y + h - 9, &format!("From: {}", tilde(from)), w - 4, TEXT, Some(BOX));
+    seg(fb, x + 2, y + h - 8, &format!("To:   {}", tilde(to)), w - 4, TEXT, Some(BOX));
+    if step == Some(LaneEdit::Label) { field(fb, x + 2, y + h - 7, w - 4, &view.text, LANE, t); }
+    else { seg(fb, x + 2, y + h - 7, &format!("Link: {label}"), w - 4, LANE, Some(BOX)); }
+    let error = if view.error.is_empty() { &app.lane_error } else { &view.error };
+    seg(fb, x + 2, y + h - 5, error, w - 4, v3(1.0, 0.5, 0.4), Some(BOX));
+    let hint = match step {
+        Some(LaneEdit::Remove) => "y remove · any other key cancels",
+        Some(LaneEdit::Label) => "Enter save · Esc cancel draft",
+        Some(_) => "↑↓ / wheel choose · Enter next · Backspace previous · Esc cancel",
+        None => "n new · e edit · r rename · x remove · Enter/f map · h overlay",
+    };
+    seg(fb, x + 2, y + h - 3, hint, w - 4, LANE, Some(BOX));
+    let nav = if step.is_some() { "Unsaved draft · Esc keeps the existing connections" }
+        else { "↑↓ / wheel · PgUp/Dn · Home/End · 1 source · 2 destination · Esc back" };
+    seg(fb, x + 2, y + h - 2, nav, w - 4, DIM, Some(BOX));
 }

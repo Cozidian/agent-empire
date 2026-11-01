@@ -4,6 +4,7 @@ mod daemon;
 mod draw;
 mod game;
 mod gfx;
+mod hyperlane;
 mod jev;
 mod octant;
 mod proto;

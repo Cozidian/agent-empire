@@ -198,6 +198,7 @@ pub enum Sel {
     GitHub,
     Sys(String),
     Sector(u64, String),
+    Lane(u64),
     Planet(String),
     Agent(u32),
 }
@@ -470,12 +471,27 @@ impl SectorStats {
     pub fn work(&self) -> String { format!("{} missions under way · {} queued · {} anomalies", self.missions, self.queued, self.anomalies) }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum LaneEdit { From, To, Label, Remove }
+
+#[derive(Default)]
+pub struct LaneView {
+    pub id: u64,
+    pub edit: Option<LaneEdit>,
+    pub draft_id: Option<u64>,
+    pub from: String,
+    pub to: String,
+    pub text: Line,
+    pub error: String,
+}
+
 pub enum Mode {
     Galaxy,
     /// On a world's surface, browsing its buildings and their files.
     Planet(PlanetView),
     Commander,
     Sectors,
+    Hyperlanes,
     Anomalies { id: u64, typing: bool },
     Trade { sel: usize },
     /// Talking to an agent in a popup over the galaxy: its terminal, and a line to write in.
@@ -623,6 +639,11 @@ pub struct App {
     pub log: VecDeque<LogEntry>,
     /// What the situation log view shows.
     pub sit: SitFilter,
+    pub hyperlanes: crate::hyperlane::Book,
+    pub lane_view: LaneView,
+    pub dependencies: bool,
+    pub lane_error: String,
+    lane_path: Option<PathBuf>,
     pub sectors: crate::sector::Book,
     pub sector_view: SectorView,
     pub sector_focus: Option<u64>,
@@ -886,6 +907,11 @@ impl App {
             fx: Vec::new(),
             log: VecDeque::new(),
             sit: SitFilter::default(),
+            hyperlanes: Default::default(),
+            lane_view: Default::default(),
+            dependencies: false,
+            lane_error: String::new(),
+            lane_path: if cfg!(test) { None } else { Some(crate::hyperlane::path()) },
             sectors: Default::default(),
             sector_view: Default::default(),
             sector_focus: None,
@@ -1122,7 +1148,7 @@ impl App {
                 .map(|i| &w.planets[i])
                 .collect(),
             Sel::Planet(k) => w.planet(k).into_iter().collect(),
-            Sel::Agent(_) | Sel::GitHub | Sel::Sector(_, _) => Vec::new(),
+            Sel::Agent(_) | Sel::GitHub | Sel::Sector(_, _) | Sel::Lane(_) => Vec::new(),
         };
         planets.iter().flat_map(|p| p.agents.iter().map(|&i| &self.agents[i])).filter(|a| a.dying.is_none() && a.status != Status::Exited).collect()
     }
@@ -1384,6 +1410,9 @@ impl App {
         for key in self.sectors.sectors.iter().flat_map(|s| s.worlds.iter()) {
             if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
         }
+        for key in self.hyperlanes.lanes.iter().flat_map(|l| [&l.from, &l.to]) {
+            if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
+        }
         // worktrees are moons of the world they were split from (which shows up even if empty)
         let host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
         for h in host_of.values() {
@@ -1522,6 +1551,11 @@ impl App {
     pub fn sel_pos(&self, w: &World) -> Option<(f32, f32)> {
         match self.sel.as_ref()? {
             Sel::GitHub => w.station,
+            Sel::Lane(id) => {
+                let lane = self.hyperlanes.lanes.iter().find(|l| l.id == *id)?;
+                let (a, b) = (w.planet(&lane.from)?, w.planet(&lane.to)?);
+                Some(((a.wpos.0 + b.wpos.0) * 0.5, (a.wpos.1 + b.wpos.1) * 0.5))
+            }
             Sel::Sector(id, k) => self.sector_regions(w).into_iter().find(|r| r.id == *id && r.system == *k).map(|r| r.center()),
             Sel::Sys(k) => w.systems.iter().find(|s| &s.key == k).map(|s| s.wpos),
             Sel::Planet(k) => w.planet(k).map(|p| p.wpos),
@@ -1543,7 +1577,7 @@ impl App {
         match self.sel.as_ref()? {
             Sel::Planet(k) => Some(k.clone()),
             Sel::Agent(id) => self.agent(*id).map(|a| a.cwd.clone()),
-            Sel::Sys(_) | Sel::GitHub | Sel::Sector(_, _) => None,
+            Sel::Sys(_) | Sel::GitHub | Sel::Sector(_, _) | Sel::Lane(_) => None,
         }
     }
 
@@ -1836,6 +1870,7 @@ impl App {
     fn activate(&mut self, w: &World, l: &Lay, _client: &Client) {
         match self.sel.clone() {
             Some(Sel::GitHub) => self.mode = Mode::Trade { sel: 0 },
+            Some(Sel::Lane(_)) => self.open_hyperlanes(),
             Some(Sel::Agent(id)) => self.mode = Mode::Ship { id, sel: 0 },
             Some(Sel::Planet(k)) => self.mode = Mode::Planet(PlanetView::new(k)),
             Some(Sel::Sector(id, k)) => {
@@ -1850,10 +1885,10 @@ impl App {
                 if let Some(s) = w.systems.iter().find(|s| s.key == k) {
                     let r = s.orbits.last().copied().unwrap_or(40.0) + 40.0;
                     (self.cam.tx, self.cam.ty) = s.wpos;
-                    self.cam.tz = if self.cam.z < OVERVIEW_ZOOM && !self.sectors.sectors.is_empty() {
+                    self.cam.tz = if self.cam.z < OVERVIEW_ZOOM && (!self.sectors.sectors.is_empty() || self.dependencies) {
                         (OVERVIEW_ZOOM + SECTOR_ZOOM) * 0.5
                     } else {
-                        let min = if self.sectors.sectors.is_empty() { OVERVIEW_ZOOM + 0.1 } else { SECTOR_ZOOM + 0.15 };
+                        let min = if self.sectors.sectors.is_empty() && !self.dependencies { OVERVIEW_ZOOM + 0.1 } else { SECTOR_ZOOM + 0.15 };
                         (l.vw / (2.0 * r)).min(l.vh / (1.2 * r)).clamp(min, 4.0)
                     };
                 }
@@ -2245,6 +2280,199 @@ impl App {
     }
 }
 
+// ─────────────────────────────── hyperlanes ───────────────────────────────
+
+impl App {
+    pub fn selected_lane(&self) -> Option<&crate::hyperlane::Lane> {
+        self.hyperlanes.lanes.iter().find(|p| p.id == self.lane_view.id).or(self.hyperlanes.lanes.first())
+    }
+
+    pub fn lane_worlds(&self, w: &World) -> Vec<String> {
+        let mut paths: std::collections::BTreeSet<_> = w.planets.iter().filter(|p| p.host.is_none()).map(|p| p.key.clone()).collect();
+        for lane in &self.hyperlanes.lanes { paths.extend([lane.from.clone(), lane.to.clone()]); }
+        if self.lane_view.edit == Some(LaneEdit::To) { paths.remove(&self.lane_view.from); }
+        paths.into_iter().collect()
+    }
+
+    fn sync_hyperlanes(&mut self, change: impl FnOnce(&mut crate::hyperlane::Book) -> Result<u64, String>) -> Result<u64, String> {
+        let mut result = Ok(0);
+        let apply = |b: &mut crate::hyperlane::Book| { result = change(b); };
+        let loaded = match &self.lane_path {
+            Some(path) => crate::hyperlane::edit(path, apply),
+            None => { apply(&mut self.hyperlanes); Ok(self.hyperlanes.clone()) }
+        };
+        match loaded {
+            Ok(book) => {
+                self.hyperlanes = book;
+                self.lane_error.clear();
+                if matches!(self.sel, Some(Sel::Lane(id)) if !self.hyperlanes.lanes.iter().any(|l| l.id == id)) { self.sel = None; }
+                result
+            }
+            Err(e) => {
+                let msg = format!("Hyperlanes could not be saved or loaded: {e}");
+                if self.lane_error != msg { self.say(Ev::Error, msg.clone(), RED); }
+                self.lane_error = msg.clone();
+                Err(msg)
+            }
+        }
+    }
+
+    fn open_hyperlanes(&mut self) {
+        let picked = self.sel.clone();
+        let _ = self.sync_hyperlanes(|_| Ok(0));
+        if let Some(Sel::Lane(id)) = picked { self.lane_view.id = id; }
+        else if let Some(p) = self.sel_planet() {
+            let p = self.moon_host(&p).unwrap_or(p);
+            if let Some(lane) = self.hyperlanes.lanes.iter().find(|l| l.from == p || l.to == p) { self.lane_view.id = lane.id; }
+        }
+        self.lane_view.edit = None;
+        self.lane_view.error.clear();
+        self.mode = Mode::Hyperlanes;
+    }
+
+    fn draft_lane(&mut self, w: &World, edit: Option<LaneEdit>) {
+        self.lane_view.error.clear();
+        if let Some(step) = edit {
+            let Some(lane) = self.selected_lane().cloned() else { return };
+            self.lane_view.draft_id = Some(lane.id);
+            self.lane_view.from = lane.from;
+            self.lane_view.to = lane.to;
+            self.lane_view.text.set(lane.label);
+            self.lane_view.edit = Some(step);
+        } else {
+            self.lane_view.draft_id = None;
+            self.lane_view.edit = Some(LaneEdit::From);
+            let paths = self.lane_worlds(w);
+            let picked = self.sel_planet().map(|p| self.moon_host(&p).unwrap_or(p));
+            self.lane_view.from = picked.filter(|p| paths.contains(p)).or_else(|| paths.first().cloned()).unwrap_or_default();
+            self.lane_view.to.clear();
+            self.lane_view.text.set(String::new());
+        }
+    }
+
+    fn advance_lane(&mut self, w: &World) {
+        match self.lane_view.edit {
+            Some(LaneEdit::From) => {
+                if self.lane_view.from.is_empty() { self.lane_view.error = "Chart a world before connecting it".into(); return; }
+                self.lane_view.edit = Some(LaneEdit::To);
+                let paths = self.lane_worlds(w);
+                if !paths.contains(&self.lane_view.to) { self.lane_view.to = paths.first().cloned().unwrap_or_default(); }
+            }
+            Some(LaneEdit::To) => {
+                if self.lane_view.to.is_empty() { self.lane_view.error = "Chart another world to connect to".into(); return; }
+                self.lane_view.edit = Some(LaneEdit::Label);
+            }
+            Some(LaneEdit::Label) => {
+                let (id, from, to, label) = (self.lane_view.draft_id, self.lane_view.from.clone(), self.lane_view.to.clone(), self.lane_view.text.s.clone());
+                match self.sync_hyperlanes(|b| b.save(id, &from, &to, &label)) {
+                    Ok(id) => { self.lane_view.id = id; self.lane_view.edit = None; self.lane_view.error.clear(); }
+                    Err(e) => self.lane_view.error = e,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn focus_lane(&mut self, w: &World, l: &Lay) {
+        let Some(lane) = self.selected_lane().cloned() else { return };
+        let (Some(a), Some(b)) = (w.planet(&lane.from), w.planet(&lane.to)) else {
+            self.lane_view.error = "An endpoint is unavailable; the saved relationship is kept".into(); return;
+        };
+        self.cam.tx = (a.wpos.0 + b.wpos.0) * 0.5;
+        self.cam.ty = (a.wpos.1 + b.wpos.1) * 0.5;
+        // Keep world endpoints visible even when they span several systems.
+        self.cam.tz = (l.vw / ((a.wpos.0 - b.wpos.0).abs() + 100.0)).min(l.vh / ((a.wpos.1 - b.wpos.1).abs() + 100.0)).clamp(0.08, 0.8);
+        self.dependencies = true;
+        self.sel = Some(Sel::Lane(lane.id));
+        self.mode = Mode::Galaxy;
+    }
+
+    fn toggle_dependencies(&mut self) {
+        self.dependencies = !self.dependencies;
+        if !self.dependencies && matches!(self.sel, Some(Sel::Lane(_))) { self.sel = None; }
+    }
+}
+
+fn hyperlane_input(app: &mut App, w: &World, l: &Lay, ev: &Event) {
+    if let Event::Key(k) = ev && k.kind == KeyEventKind::Release { return; }
+    let step = app.lane_view.edit;
+    if let Event::Key(k) = ev {
+        if k.code == KeyCode::Esc {
+            if step.is_some() { app.lane_view.edit = None; app.lane_view.error.clear(); }
+            else { app.mode = Mode::Galaxy; }
+            return;
+        }
+        if step == Some(LaneEdit::Remove) {
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                let id = app.lane_view.id;
+                match app.sync_hyperlanes(|b| b.remove(id).map(|_| 0)) {
+                    Ok(_) => app.lane_view = LaneView::default(),
+                    Err(e) => app.lane_view.error = e,
+                }
+            } else { app.lane_view.edit = None; }
+            return;
+        }
+        if step == Some(LaneEdit::Label) {
+            if k.code == KeyCode::Enter { app.advance_lane(w); }
+            else { app.lane_view.text.key(k); }
+            return;
+        }
+    }
+    if let Event::Paste(s) = ev && step == Some(LaneEdit::Label) {
+        app.lane_view.text.paste_lines(&s.chars().filter(|c| !c.is_control()).collect::<String>());
+        return;
+    }
+    if matches!(step, Some(LaneEdit::Label | LaneEdit::Remove)) { return; }
+    let paths = app.lane_worlds(w);
+    let picking = matches!(step, Some(LaneEdit::From | LaneEdit::To));
+    let current = if step == Some(LaneEdit::To) { &app.lane_view.to } else { &app.lane_view.from };
+    let (at, count) = if picking { (paths.iter().position(|p| p == current).unwrap_or(0), paths.len()) }
+        else { (app.selected_lane().and_then(|p| app.hyperlanes.lanes.iter().position(|l| l.id == p.id)).unwrap_or(0), app.hyperlanes.lanes.len()) };
+    let room = draw::hyperlane_layout(l).4;
+    let mut next = at;
+    match ev {
+        Event::Key(k) => match k.code {
+            KeyCode::Up | KeyCode::Char('k') => next = at.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => next = (at + 1).min(count.saturating_sub(1)),
+            KeyCode::PageUp => next = at.saturating_sub(room),
+            KeyCode::PageDown => next = (at + room).min(count.saturating_sub(1)),
+            KeyCode::Home => next = 0,
+            KeyCode::End => next = count.saturating_sub(1),
+            KeyCode::Enter if picking => { app.advance_lane(w); return; }
+            KeyCode::Backspace if step == Some(LaneEdit::To) => { app.lane_view.edit = Some(LaneEdit::From); return; }
+            KeyCode::Char('n') if !picking => { app.draft_lane(w, None); return; }
+            KeyCode::Char('e' | 'r') if !picking => { app.draft_lane(w, Some(if k.code == KeyCode::Char('r') { LaneEdit::Label } else { LaneEdit::From })); return; }
+            KeyCode::Char('x') if !picking => {
+                if let Some(lane) = app.selected_lane() { app.lane_view.id = lane.id; app.lane_view.edit = Some(LaneEdit::Remove); }
+                return;
+            }
+            KeyCode::Char('f') | KeyCode::Enter if !picking => { app.focus_lane(w, l); return; }
+            KeyCode::Char('h') if !picking => { app.toggle_dependencies(); return; }
+            KeyCode::Char('1' | '2') if !picking => {
+                if let Some(lane) = app.selected_lane().cloned() {
+                    let path = if k.code == KeyCode::Char('1') { lane.from } else { lane.to };
+                    if w.planet(&path).is_some() {
+                        app.sel = Some(Sel::Planet(path)); app.glide_to_sel(w); app.cam.tz = 1.3; app.mode = Mode::Galaxy;
+                    } else { app.lane_view.error = "This world's folder is unavailable".into(); }
+                }
+                return;
+            }
+            _ => {}
+        },
+        Event::Mouse(me) if me.kind == MouseEventKind::ScrollUp => next = at.saturating_sub(3),
+        Event::Mouse(me) if me.kind == MouseEventKind::ScrollDown => next = (at + 3).min(count.saturating_sub(1)),
+        Event::Mouse(me) if me.kind == MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(i) = draw::hyperlane_hit(l, count, at, me.column as i32, me.row as i32) { next = i; }
+        }
+        _ => {}
+    }
+    if picking {
+        if let Some(path) = paths.get(next) {
+            if step == Some(LaneEdit::To) { app.lane_view.to = path.clone(); } else { app.lane_view.from = path.clone(); }
+        }
+    } else if let Some(lane) = app.hyperlanes.lanes.get(next) { app.lane_view.id = lane.id; }
+}
+
 fn sector_input(app: &mut App, w: &World, l: &Lay, ev: &Event, t: f32) {
     if let Event::Key(k) = ev && k.kind == KeyEventKind::Release { return; }
     if let Some(edit) = app.sector_view.edit {
@@ -2506,7 +2734,7 @@ impl SectorRegion {
 }
 
 impl App {
-    pub fn sector_map(&self) -> bool { self.cam.z >= OVERVIEW_ZOOM && self.cam.z < SECTOR_ZOOM && !self.sectors.sectors.is_empty() }
+    pub fn sector_map(&self) -> bool { self.cam.z < SECTOR_ZOOM && (self.dependencies || (self.cam.z >= OVERVIEW_ZOOM && !self.sectors.sectors.is_empty())) }
 
     pub fn sector_regions(&self, w: &World) -> Vec<SectorRegion> {
         let mut regions = Vec::new();
@@ -2790,6 +3018,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             app.survey = snap;
             app.refresh_anomalies();
             let _ = app.sync_sectors(|_| Ok(0));
+            let _ = app.sync_hyperlanes(|_| Ok(0));
             for (path, id, pts, why) in awards {
                 app.award(&path, id, pts, &why, &mut cues);
             }
@@ -3146,6 +3375,10 @@ fn handle(
         return false;
     }
 
+    if matches!(app.mode, Mode::Hyperlanes) {
+        hyperlane_input(app, w, l, &ev);
+        return false;
+    }
     if matches!(app.mode, Mode::Sectors) {
         sector_input(app, w, l, &ev, t);
         return false;
@@ -3586,7 +3819,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Galaxy | Mode::Sectors | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
+        Mode::Galaxy | Mode::Sectors | Mode::Hyperlanes | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
     // ── galaxy
@@ -3605,6 +3838,8 @@ fn handle(
         KeyCode::Char('C') => app.open_commander(w),
         KeyCode::Char('A') => app.open_anomalies(),
         KeyCode::Char('V') => app.open_sectors(),
+        KeyCode::Char('H') => app.open_hyperlanes(),
+        KeyCode::Char('h') => app.toggle_dependencies(),
         KeyCode::Char('c') if ctrl => return true,
         KeyCode::Esc => { app.sel = None; app.sector_focus = None; },
         KeyCode::Down | KeyCode::Char('j') => pick(app, cur.map_or(0, |c| (c + 1).min(rows.len().saturating_sub(1)))),
@@ -3615,7 +3850,7 @@ fn handle(
         KeyCode::Enter
             if let Some(id) = app.transmission().map(|a| a.id)
                 && app.sel != Some(Sel::GitHub)
-                && !matches!(app.sel, Some(Sel::Planet(_) | Sel::Sector(_, _)))
+                && !matches!(app.sel, Some(Sel::Planet(_) | Sel::Sector(_, _) | Sel::Lane(_)))
                 && !(app.cam.z < SECTOR_ZOOM && matches!(app.sel, Some(Sel::Sys(_))))
                 && !matches!(app.sel, Some(Sel::Agent(s)) if s != id) =>
         {
@@ -3700,6 +3935,9 @@ fn handle(
         },
         KeyCode::Char('S') => app.mode = Mode::Situation { id: app.log.front().map_or(0, |e| e.id), typing: false },
         KeyCode::Char('X') => match app.sel_planet() {
+            Some(p) if w.planet(&p).is_some_and(|p| p.dormant) && app.hyperlanes.lanes.iter().any(|l| l.from == p || l.to == p) => {
+                app.toast("this world is kept by a hyperlane · H to remove its links first", t);
+            }
             Some(p) if w.planet(&p).is_some_and(|p| p.dormant) && app.sectors.sectors.iter().any(|s| s.contains(&p, None)) => {
                 app.toast("this world is kept by a sector · V to remove its membership first", t);
             }
@@ -3757,7 +3995,9 @@ fn handle(
         KeyCode::Char('-') | KeyCode::Char('_') => app.cam.tz = (app.cam.tz / 1.3).max(0.12),
         KeyCode::Char('z') => app.fit(w, l),
         KeyCode::Char('f') => {
-            if matches!(app.sel, Some(Sel::Sector(_, _))) {
+            if let Some(Sel::Lane(id)) = app.sel {
+                app.lane_view.id = id; app.focus_lane(w, l);
+            } else if matches!(app.sel, Some(Sel::Sector(_, _))) {
                 app.activate(w, l, client);
             } else if let Some(Sel::Planet(k)) = app.sel.clone() {
                 app.mode = Mode::Planet(PlanetView::new(k));
@@ -3977,7 +4217,7 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
         ((sx - px).powi(2) + (sy - py).powi(2)).sqrt()
     };
     let nearest = |c: Vec<(f32, f32, Sel)>| c.into_iter().filter(|(d, r, _)| d < r).min_by(|a, b| a.0.total_cmp(&b.0)).map(|c| c.2);
-    if z < OVERVIEW_ZOOM {
+    if z < OVERVIEW_ZOOM && !app.sector_map() {
         // Only the visible system and station markers are targets at this scale.
         let mut nodes: Vec<_> = w.systems.iter().map(|s| (dist(s.wpos), 8.0, Sel::Sys(s.key.clone()))).collect();
         if let Some(p) = w.station { nodes.push((dist(p), 8.0, Sel::GitHub)); }
@@ -3995,7 +4235,7 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
             let width = label.lines.iter().map(|(s, _)| s.chars().count()).max().unwrap_or(0) as f32;
             (px >= label.col as f32 * 2.0 && px < (label.col as f32 + width) * 2.0
                 && py >= label.row as f32 * 4.0 && py < (label.row as f32 + label.lines.len() as f32) * 4.0).then_some(label.target)
-        })).or_else(|| {
+        })).or_else(|| draw::lane_pick(app, w, l, (px, py))).or_else(|| {
             let p = ((px - l.vw * 0.5) / z + app.cam.x, (py - l.vy0 - l.vh * 0.5) / z + app.cam.y);
             app.sector_regions(w).into_iter().find(|r| r.contains(p)).map(|r| Sel::Sector(r.id, r.system))
         });
@@ -4004,9 +4244,16 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
     let planets = w.planets.iter().map(|p| (dist(p.wpos), (p.r * z).max(4.0) + 3.0, Sel::Planet(p.key.clone()))).collect();
     let stars = w.systems.iter().map(|s| (dist(s.wpos), (9.0 * z).max(4.0) + 4.0, Sel::Sys(s.key.clone()))).collect();
     nearest(ships).or_else(|| nearest(planets)).or_else(|| nearest(stars)).or_else(|| {
+        if !app.dependencies { return None; }
+        draw::sector_labels(app, w, l).into_iter().find_map(|label| {
+            let width = label.lines.iter().map(|(s, _)| s.chars().count()).max().unwrap_or(0) as f32;
+            (px >= label.col as f32 * 2.0 && px < (label.col as f32 + width) * 2.0
+                && py >= label.row as f32 * 4.0 && py < (label.row as f32 + label.lines.len() as f32) * 4.0).then_some(label.target)
+        })
+    }).or_else(|| draw::lane_pick(app, w, l, (px, py))).or_else(|| {
         let station = w.station?;
         let (c, r, label) = draw::station_label(app, w, l)?;
-        let label_hit = px >= c as f32 * 2.0 && px < (c + label.chars().count() as i32) as f32 * 2.0
+        let label_hit = !app.dependencies && px >= c as f32 * 2.0 && px < (c + label.chars().count() as i32) as f32 * 2.0
             && py >= r as f32 * 4.0 && py < (r + 1) as f32 * 4.0;
         (dist(station) < (13.0 * z).max(5.0) * 2.2 + 3.0 || label_hit).then_some(Sel::GitHub)
     })
@@ -5509,6 +5756,177 @@ mod sector_tests {
         assert_eq!(std::fs::read_to_string(dir.join("frontend/keep.txt")).unwrap(), "keep me");
         assert_eq!(app.agents.len(), 4);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+}
+
+#[cfg(test)]
+mod hyperlane_tests {
+    use super::*;
+
+    fn key(app: &mut App, w: &World, l: &Lay, code: KeyCode) {
+        handle(app, w, l, &Client::isolated(), None, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 1.0, &mut None);
+    }
+
+    #[test]
+    fn hyperlane_editor_opens_from_the_galaxy() {
+        let mut app = App::new();
+        let w = app.world(0.0, 0.0);
+        let mut fb = Fb::new(110, 40);
+        let l = Lay::new(&fb, false);
+        key(&mut app, &w, &l, KeyCode::Char('H'));
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("HYPERLANES"));
+    }
+    fn fixture() -> (App, World, Lay) {
+        let mut app = App::new();
+        app.loaded = true; app.online = true;
+        for (i, path) in ["/front/app", "/back/bifrost", "/moons/fix"].into_iter().enumerate() {
+            let mut a = ship_card_tests::ship(i as u32 + 1, false); a.cwd = path.into(); app.agents.push(a);
+        }
+        app.survey.worlds.insert("/moons/fix".into(), survey::World { host: Some("/front/app".into()), ..Default::default() });
+        let mut w = app.world(0.0, 0.0);
+        for p in &mut w.planets { p.wpos = if p.key == "/front/app" { (-65.0, 0.0) } else { (65.0, 0.0) }; }
+        for s in &mut w.systems { s.wpos = (0.0, -60.0); }
+        for a in &mut app.agents { a.wpos = (1000.0, 1000.0); }
+        app.cam.z = 0.75;
+        (app, w, Lay::new(&Fb::new(110, 40), false))
+    }
+
+    #[test]
+    fn editor_creates_a_directional_link_from_a_moons_host_and_cancels_drafts() {
+        let (mut app, w, l) = fixture();
+        app.sel = Some(Sel::Planet("/moons/fix".into()));
+        for code in [KeyCode::Char('H'), KeyCode::Char('n'), KeyCode::Enter, KeyCode::Enter] { key(&mut app, &w, &l, code); }
+        assert_eq!(app.lane_view.from, "/front/app");
+        assert_eq!(app.lane_view.to, "/back/bifrost");
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert!(app.hyperlanes.lanes.is_empty());
+        assert!(app.lane_view.error.contains("1–48"));
+        handle(&mut app, &w, &l, &Client::isolated(), None, Event::Paste("calls".into()), 1.0, &mut None);
+        key(&mut app, &w, &l, KeyCode::Enter);
+        let lane = app.hyperlanes.lanes[0].clone();
+        assert_eq!((lane.from.as_str(), lane.label.as_str(), lane.to.as_str()), ("/front/app", "calls", "/back/bifrost"));
+        key(&mut app, &w, &l, KeyCode::Char('r'));
+        app.lane_view.text.set("depends on".into());
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert_eq!(app.hyperlanes.lanes[0].id, lane.id);
+        assert_eq!(app.hyperlanes.lanes[0].label, "depends on");
+        key(&mut app, &w, &l, KeyCode::Char('e'));
+        key(&mut app, &w, &l, KeyCode::Esc);
+        key(&mut app, &w, &l, KeyCode::Char('n'));
+        key(&mut app, &w, &l, KeyCode::Esc);
+        assert_eq!(app.hyperlanes.lanes.len(), 1);
+        key(&mut app, &w, &l, KeyCode::Char('x'));
+        key(&mut app, &w, &l, KeyCode::Char('n'));
+        assert_eq!(app.hyperlanes.lanes.len(), 1);
+        key(&mut app, &w, &l, KeyCode::Char('x'));
+        key(&mut app, &w, &l, KeyCode::Char('y'));
+        assert!(app.hyperlanes.lanes.is_empty());
+        assert_eq!(app.agents.len(), 3);
+        assert!(app.missions.is_empty());
+    }
+
+    #[test]
+    fn dependency_overlay_picks_curves_and_labels_and_enter_opens_the_link() {
+        let (mut app, w, l) = fixture();
+        let id = app.hyperlanes.save(None, "/front/app", "/back/bifrost", "calls").unwrap();
+        assert!(draw::lane_paths(&app, &w, &l).is_empty());
+        key(&mut app, &w, &l, KeyCode::Char('h'));
+        assert!(app.sector_map()); // usable even without a sector
+        for z in [0.2, 0.75, 1.4] {
+            app.cam.z = z;
+            let route = draw::lane_paths(&app, &w, &l).remove(0);
+            assert!(route.points.first().unwrap().0 < route.points.last().unwrap().0);
+            assert_eq!(pick_at(&app, &w, &l, route.points[12]), Some(Sel::Lane(id)));
+            let label = draw::sector_labels(&app, &w, &l).into_iter().find(|p| p.target == Sel::Lane(id)).unwrap();
+            assert_eq!(pick_at(&app, &w, &l, (label.col as f32 * 2.0 + 1.0, label.row as f32 * 4.0 + 2.0)), Some(Sel::Lane(id)));
+        }
+        app.sel = Some(Sel::Lane(id));
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Hyperlanes));
+        assert_eq!(app.lane_view.id, id);
+        key(&mut app, &w, &l, KeyCode::Char('f'));
+        assert!(matches!(app.mode, Mode::Galaxy));
+        assert_eq!((app.cam.tx, app.cam.ty), (0.0, 0.0));
+        key(&mut app, &w, &l, KeyCode::Char('h'));
+        assert!(app.sel.is_none());
+        assert!(draw::lane_paths(&app, &w, &l).is_empty());
+    }
+
+    #[test]
+    fn reciprocal_and_parallel_links_have_separate_curves() {
+        let (mut app, w, l) = fixture();
+        for (a, b, label) in [("/front/app", "/back/bifrost", "calls"), ("/back/bifrost", "/front/app", "notifies"), ("/front/app", "/back/bifrost", "depends on")] {
+            app.hyperlanes.save(None, a, b, label).unwrap();
+        }
+        app.dependencies = true;
+        let paths = draw::lane_paths(&app, &w, &l);
+        for (i, a) in paths.iter().enumerate() {
+            for b in paths.iter().skip(i + 1) { assert_ne!(a.points[12], b.points[12]); }
+            assert_eq!(draw::lane_pick(&app, &w, &l, a.points[12]), Some(Sel::Lane(a.id)));
+        }
+        let labels = draw::sector_labels(&app, &w, &l);
+        for (i, a) in labels.iter().enumerate() {
+            let width = a.lines.iter().map(|p| p.0.chars().count()).max().unwrap() as i32;
+            assert!(a.col >= 0 && a.col + width <= l.cols && a.row >= 1 && a.row + (a.lines.len() as i32) < l.rows - 1);
+            for b in labels.iter().skip(i + 1) {
+                let bw = b.lines.iter().map(|p| p.0.chars().count()).max().unwrap() as i32;
+                assert!(a.col + width <= b.col || b.col + bw <= a.col || a.row + a.lines.len() as i32 <= b.row || b.row + b.lines.len() as i32 <= a.row);
+            }
+        }
+    }
+
+    #[test]
+    fn links_keep_worlds_charted_and_missing_endpoints_and_save_errors_visible() {
+        let dir = std::env::temp_dir().join(format!("empire-hyperlane-ui-{}", std::process::id()));
+        for p in ["a", "b"] { std::fs::create_dir_all(dir.join(p)).unwrap(); }
+        let (a, b) = (dir.join("a").to_string_lossy().into_owned(), dir.join("b").to_string_lossy().into_owned());
+        let path = dir.join("hyperlanes.json");
+        crate::hyperlane::edit(&path, |book| { book.save(None, &a, &b, "calls").unwrap(); }).unwrap();
+        let mut app = App::new(); app.lane_path = Some(path.clone()); app.open_hyperlanes();
+        let w = app.world(0.0, 0.0);
+        let l = Lay::new(&Fb::new(100, 36), false);
+        assert!(w.planet(&a).is_some() && w.planet(&b).is_some());
+        std::fs::remove_dir(dir.join("b")).unwrap();
+        let w = app.world(0.0, 0.0);
+        app.dependencies = true;
+        assert!(draw::lane_paths(&app, &w, &l).is_empty());
+        key(&mut app, &w, &l, KeyCode::Char('f'));
+        assert!(app.lane_view.error.contains("unavailable"));
+        assert_eq!(app.hyperlanes.lanes[0].to, b);
+        key(&mut app, &w, &l, KeyCode::Char('r'));
+        app.lane_view.text.set("depends on".into());
+        std::fs::write(&path, "broken").unwrap();
+        key(&mut app, &w, &l, KeyCode::Enter);
+        assert!(app.lane_view.edit == Some(LaneEdit::Label));
+        assert!(app.lane_view.error.contains("could not be saved"));
+        assert_eq!(app.hyperlanes.lanes[0].label, "calls");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_link_lists_scroll_and_mouse_hits_the_visible_row() {
+        let (mut app, w, l) = fixture();
+        for i in 0..40 { app.hyperlanes.save(None, "/front/app", "/back/bifrost", &format!("relationship {i}")).unwrap(); }
+        app.open_hyperlanes();
+        key(&mut app, &w, &l, KeyCode::End);
+        let (x, y, _, _, room) = draw::hyperlane_layout(&l);
+        let hit = draw::hyperlane_hit(&l, 40, 39, x + 3, y + 4).unwrap();
+        assert_eq!(hit, 40 - room);
+        handle(&mut app, &w, &l, &Client::isolated(), None, Event::Mouse(event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left), column: (x + 3) as u16, row: (y + 4) as u16, modifiers: KeyModifiers::NONE,
+        }), 1.0, &mut None);
+        assert_eq!(app.lane_view.id, app.hyperlanes.lanes[hit].id);
+        for (cols, rows) in [(80, 24), (110, 40)] {
+            let mut fb = Fb::new(cols, rows); let l = Lay::new(&fb, false);
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+            assert!(text.contains("From: /front/app") && text.contains("To:   /back/bifrost"));
+            assert!(text.contains("n new") && text.contains("Esc back"));
+        }
     }
 
 }

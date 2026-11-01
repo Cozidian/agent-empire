@@ -74,6 +74,7 @@ zoom and still lets you select individual worlds and agents at any distance.
 | `C`              | **commander**: your attention queue across all star systems         |
 | `A`              | **anomalies**: discoveries, investigations and history across worlds |
 | `V`              | **sectors**: group worlds and inspect their combined activity       |
+| `H` / `h`        | **hyperlanes**: manage named connections / toggle dependency overlay |
 | `t`              | **mission**: write a task for the selected world (launch a ship with it, or queue it) |
 | `b`              | **fleet order**: one order to every agent in the selected system or world |
 | `u`              | **moon**: found a git worktree off the selected world, with its own agent |
@@ -256,7 +257,7 @@ spread groups. It highlights member worlds; at a distance, their star systems ar
 and its alerts remain available. **Esc on the galaxy** clears the sector highlight and selection.
 At middle zoom, **V** opens the editor on the selected sector. Region outlines show group membership,
 not exclusive borders: a world can belong to several sectors. This grouping does not declare
-dependency relationships; labelled hyperlanes remain on the backlog.
+dependency relationships; use **hyperlanes** to name those connections explicitly.
 
 Available sector members stay charted even without ships. Remove a dormant world's memberships
 in `V` before forgetting it with `X`. Dissolving a sector removes only the group: folders, agents,
@@ -266,6 +267,53 @@ Sectors are saved in `$XDG_STATE_HOME/empire/sectors.json` (normally
 `~/.local/state/empire/sectors.json`). Galaxy windows refresh the shared record and use locked,
 atomic updates. A corrupt or unreadable record is preserved and reported in the editor and
 situation log. Sector names are unique ignoring case and contain 1–48 characters.
+
+## Hyperlanes
+
+Press **`H`** to chart named, directional relationships between worlds. A sector says which
+worlds belong together; a hyperlane says how they relate. For example, you could chart
+`frontend — calls → Bifrost` and `Bifrost — depends on → runtime`. These are your descriptions,
+not automatically discovered dependencies, and do not send orders to agents.
+
+Press **`n`** in the editor, choose the source world, press **Enter**, choose the destination,
+press **Enter**, then type the relationship and press **Enter** to save. The selected planet
+is the suggested source; a selected moon uses its parent world. Choose from charted worlds
+and saved endpoints. To chart another existing folder without a ship, add it through `V`.
+Labels need 1–48 characters. Identical links are rejected, while reverse directions and different
+relationships between the same worlds are allowed. **Esc** cancels an unfinished draft.
+
+| key in hyperlanes | action |
+| ----------------- | ------ |
+| `↑↓` / wheel / click | select a link or world |
+| `PgUp/Dn` / `Home/End` | move through longer lists |
+| `n` | create a connection: source → destination → label |
+| `e` / `r` | edit endpoints and label / rename the relationship |
+| `Backspace` | return from destination selection to source selection |
+| `⏎` / `f` | show the selected connection on the map |
+| `1` / `2` | locate its source / destination world |
+| `h` | toggle the dependency overlay |
+| `x` | remove the connection after `y` confirmation |
+| `Esc` | cancel the draft, or return to the galaxy |
+
+**`h` on the galaxy** toggles connections without opening the editor. The title changes to
+**DEPENDENCIES**. This view retains small world markers even at distant zoom, so links always
+join their actual endpoints. Sector boundaries remain visible, and decorative system lanes
+are hidden. Curved arrows run from source to destination; opposite directions and parallel
+relationships get separate curves. Labels move or disappear when space is tight; select a
+curve to read its relationship and paths in the card. **Enter** or a second click opens that
+connection in the editor; **f** fits its endpoints. At close zoom, full planets and ships return
+with the dependency labels. Toggle **h** again for the ordinary map. Overlay visibility is
+local to the current galaxy window and starts off.
+
+Hyperlane endpoints stay charted while their folders exist. A missing endpoint remains in the
+editor as **unavailable**, and its connection is kept but not drawn. Remove a dormant world's
+links in `H` before forgetting it with `X`. Removing a link leaves folders, agents, sectors and
+missions intact.
+
+Connections are saved in `$XDG_STATE_HOME/empire/hyperlanes.json` (normally
+`~/.local/state/empire/hyperlanes.json`). Galaxy windows refresh the shared record; edits use
+locked, atomic writes. Corrupt or unreadable data is preserved and reported, and a failed save
+keeps your draft open.
 
 ## Anomalies
 
@@ -485,6 +533,7 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
 - `draw.rs`: procedural dithered planets, ships, outliner, situation log, dialogs, comms.
 - `structure.rs`: structures (AI resources) a world has built, and their construction orders.
 - `anomaly.rs`: persistent findings, lifecycle history, filters and explicit reports.
+- `hyperlane.rs`: named, directional relationships between worlds.
 - `sector.rs`: named groups of worlds; `state.rs`: shared locked, atomic local storage.
 - `survey.rs`: background git survey of every world (status, size, worktrees, PRs via `gh`) and
   Claude/Codex usage.
