@@ -266,16 +266,6 @@ pub struct Line {
 }
 
 impl Line {
-    fn paste(&mut self, text: &str) {
-        let clean: String = text.chars().filter_map(|c| {
-            if c == '\n' || c == '\r' || c == '\t' { Some(' ') }
-            else if c.is_control() { None } else { Some(c) }
-        }).collect();
-        let byte = self.byte(self.cur);
-        self.s.insert_str(byte, &clean);
-        self.cur += clean.chars().count();
-    }
-
     /// Paste keeping line breaks, for text that can span lines.
     fn paste_lines(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
@@ -326,7 +316,7 @@ impl Line {
                 self.set(String::new());
                 true
             }
-            KeyCode::Char('w') if ctrl => {
+            KeyCode::Char('w') | KeyCode::Backspace if ctrl || (k.code == KeyCode::Backspace && k.modifiers.contains(KeyModifiers::ALT)) => {
                 let head: String = self.s.chars().take(self.cur).collect();
                 let trimmed = head.trim_end_matches('/');
                 let cut = trimmed.rfind('/').map_or(0, |i| i + 1);
@@ -392,12 +382,77 @@ pub struct Colonize {
     pub mkdir: bool,
 }
 
+/// A landed view of a world's AI buildings. Files are read only when selected.
+#[derive(Clone)]
+pub struct PlanetView {
+    pub key: String,
+    pub built: Vec<Built>,
+    pub sel: usize,
+    pub file: usize,
+    /// Buildings, files, or the file preview.
+    pub focus: usize,
+    pub scroll: usize,
+    pub preview: String,
+}
+
+impl PlanetView {
+    fn new(key: String) -> Self {
+        let built = crate::structure::survey(&key);
+        let mut v = Self { key, built, sel: 0, file: 0, focus: 0, scroll: 0, preview: String::new() };
+        v.read();
+        v
+    }
+
+    pub fn building(&self) -> Option<&Built> { self.built.iter().find(|b| b.kind == KINDS[self.sel]) }
+    pub fn files(&self) -> &[String] { self.building().map_or(&[], |b| b.files.as_slice()) }
+    pub fn path(&self) -> Option<String> {
+        self.files().get(self.file).map(|f| if KINDS[self.sel] == Kind::Academy { format!("{f}/SKILL.md") } else { f.clone() })
+    }
+
+    fn read(&mut self) {
+        use std::io::Read;
+        self.scroll = 0;
+        self.preview = match self.path() {
+            None => "This plot is empty. Press B to draft a construction order.".into(),
+            Some(p) => {
+                let read = || -> io::Result<String> {
+                    let p = Path::new(&self.key).join(p);
+                    if !std::fs::metadata(&p)?.is_file() { return Err(io::Error::other("not a regular file")); }
+                    let f = std::fs::File::open(p)?;
+                    let mut bytes = Vec::new();
+                    f.take(65_537).read_to_end(&mut bytes)?;
+                    let truncated = bytes.len() > 65_536;
+                    bytes.truncate(65_536);
+                    let mut text: String = String::from_utf8_lossy(&bytes).chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+                    text = text.replace('\t', "    ");
+                    if truncated { text.push_str("\n[Preview limited to 64 KiB]"); }
+                    if text.is_empty() { text = "[Empty file]".into(); }
+                    Ok(text)
+                };
+                read().unwrap_or_else(|e| format!("Cannot read this file: {e}. Press R to refresh."))
+            }
+        };
+    }
+
+    pub fn lines(&self, width: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in self.preview.lines() {
+            let chars: Vec<char> = line.chars().collect();
+            if chars.is_empty() { out.push(String::new()); }
+            for part in chars.chunks(width.max(1)) { out.push(part.iter().collect()); }
+        }
+        out
+    }
+}
+
 pub enum Mode {
     Galaxy,
+    /// On a world's surface, browsing its buildings and their files.
+    Planet(PlanetView),
     Commander,
     Trade { sel: usize },
     /// Talking to an agent in a popup over the galaxy: its terminal, and a line to write in.
-    Chat { id: u32, text: Line },
+    Chat { id: u32, text: Line, attachments: Vec<Attachment>, sending: bool },
     /// Its terminal, full screen.
     Comms(u32),
     Colonize(Colonize),
@@ -543,6 +598,7 @@ pub struct App {
     pub sit: SitFilter,
     pub toast: Option<(String, f32)>,
     pub mode: Mode,
+    planet_return: Option<PlanetView>,
     pub commander: String,
     pub commander_detail: usize,
     commander_return: bool,
@@ -668,16 +724,38 @@ fn complete(input: &str) -> Vec<String> {
     };
     let base = if dir.is_empty() { PathBuf::from(".") } else { expand(dir) };
     let Ok(rd) = std::fs::read_dir(base) else { return Vec::new() };
-    let mut v: Vec<String> = rd
+    let mut v: Vec<_> = rd
         .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with(prefix) && (prefix.starts_with('.') || !n.starts_with('.')))
-        .map(|n| format!("{dir}{n}/"))
+        .filter(|n| prefix.starts_with('.') || !n.starts_with('.'))
+        .filter_map(|n| fuzzy_score(prefix, &n).map(|score| (score, n.to_lowercase(), n)))
         .collect();
     v.sort();
-    v.truncate(8);
-    v
+    v.into_iter().map(|(_, _, n)| format!("{dir}{n}/")).collect()
+}
+
+/// Exact names, prefixes, substrings, then ordered letters with the fewest gaps.
+fn fuzzy_score(query: &str, name: &str) -> Option<(u8, usize, usize)> {
+    let (q, n) = (query.to_lowercase(), name.to_lowercase());
+    if q == n { return Some((0, 0, 0)); }
+    if n.starts_with(&q) { return Some((1, 0, 0)); }
+    if let Some(i) = n.find(&q) { return Some((2, 0, n[..i].chars().count())); }
+    let (q, n): (Vec<_>, Vec<_>) = (q.chars().collect(), n.chars().collect());
+    let mut best = None;
+    for start in 0..n.len() {
+        if n[start] != q[0] { continue; }
+        let mut at = 1;
+        for end in start + 1..n.len() {
+            if n[end] == q[at] { at += 1; }
+            if at == q.len() {
+                let score = (3, end - start + 1 - q.len(), start);
+                best = Some(best.map_or(score, |b| std::cmp::min(b, score)));
+                break;
+            }
+        }
+    }
+    best
 }
 
 // ─────────────────────────────── layout ────────────────────────────────
@@ -775,6 +853,7 @@ impl App {
             commander: String::new(),
             commander_detail: 0,
             commander_return: false,
+            planet_return: None,
             kinds: detect_kinds(),
             screen: None,
             panel: true,
@@ -1527,7 +1606,7 @@ impl App {
 
     /// Talk to an agent: the chat popup first; ⇥ there goes full screen.
     fn open_comms(&mut self, id: u32, client: &Client, l: &Lay) {
-        self.mode = Mode::Chat { id, text: Line::default() };
+        self.mode = Mode::Chat { id, text: Line::default(), attachments: Vec::new(), sending: false };
         self.comms_at = Instant::now();
         self.screen = None;
         self.scroll = 0;
@@ -1547,19 +1626,23 @@ impl App {
 
     /// Size the agent's terminal to the window it's shown in.
     fn fit_comms(&self, client: &Client, l: &Lay) {
-        let (id, (cols, rows)) = match self.mode {
-            Mode::Chat { id, .. } => (id, draw::chat_term(l)),
-            Mode::Comms(id) => (id, (l.cols - 2, l.rows - 3)),
-            _ => return,
-        };
+        let Some(id) = self.talking_to() else { return };
+        let (_, _, cols, rows) = self.terminal_rect(l);
         client.send(Cmd::Resize(id, cols.max(2) as u16, rows.max(2) as u16));
+    }
+
+    pub fn terminal_rect(&self, l: &Lay) -> (i32, i32, i32, i32) {
+        match &self.mode {
+            Mode::Chat { text, attachments, .. } => draw::chat_terminal(l, text, attachments.len()),
+            _ => (1, 2, l.cols - 2, l.rows - 3),
+        }
     }
 
     /// Click and drag in comms selects text, like a terminal: double-click a word,
     /// triple-click a line, and letting go copies it.
     fn select(&mut self, me: event::MouseEvent, l: &Lay, t: f32) {
-        let (iw, ih) = (l.cols - 2, l.rows - 3);
-        let cell = ((me.row as i32 - 2).clamp(0, ih - 1), (me.column as i32 - 1).clamp(0, iw - 1));
+        let (x, y, iw, ih) = self.terminal_rect(l);
+        let cell = ((me.row as i32 - y).clamp(0, ih - 1), (me.column as i32 - x).clamp(0, iw - 1));
         match me.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let (at, when, n) = self.click;
@@ -1611,7 +1694,14 @@ impl App {
     }
 
     fn copy(&mut self, t: f32) {
-        let Some(p) = self.pick else { return };
+        let text = self.selected_text();
+        if text.trim().is_empty() { return; }
+        let n = text.chars().count();
+        self.toast(if copy_to_clipboard(&text) { format!("copied {n} characters") } else { "✖ no clipboard (install wl-copy or xclip)".into() }, t);
+    }
+
+    fn selected_text(&self) -> String {
+        let Some(p) = self.pick else { return String::new() };
         let ((r0, c0), (r1, c1)) = p.span();
         let rows = self.screen_rows();
         let mut lines = Vec::new();
@@ -1622,18 +1712,13 @@ impl App {
             let s: String = row.get(from.min(to)..to).unwrap_or(&[]).iter().filter(|&&c| c != '\0').collect();
             lines.push(s.trim_end().to_string());
         }
-        let text = lines.join("\n");
-        if text.trim().is_empty() {
-            return;
-        }
-        let n = text.chars().count();
-        self.toast(if copy_to_clipboard(&text) { format!("copied {n} characters") } else { "✖ no clipboard (install wl-copy or xclip)".into() }, t);
+        lines.join("\n")
     }
 
     /// Scroll the comms window back (positive) or toward live (negative).
     fn scroll_by(&mut self, lines: isize, client: &Client) {
         let max = self.screen.as_ref().map_or(0, |(_, s)| s.history);
-        let next = (self.scroll as isize + lines).clamp(0, max as isize) as usize;
+        let next = (self.scroll as isize).saturating_add(lines).clamp(0, max as isize) as usize;
         if next != self.scroll {
             self.scroll = next;
             self.pick = None;
@@ -1642,22 +1727,60 @@ impl App {
     }
 
     fn close_comms(&mut self, client: &Client) {
+        if let Mode::Chat { attachments, sending, .. } = &self.mode {
+            if *sending { return; }
+            screenshots::discard(attachments);
+        }
         client.watch(None);
         self.screen = None;
-        self.mode = if std::mem::take(&mut self.commander_return) { Mode::Commander } else { Mode::Galaxy };
+        self.mode = if std::mem::take(&mut self.commander_return) { Mode::Commander } else { self.planet_return.take().map_or(Mode::Galaxy, Mode::Planet) };
+    }
+
+    fn chat_sent(&mut self, id: u32, result: Result<(), String>, client: &Client, l: &Lay, t: f32) {
+        let Mode::Chat { id: current, text, attachments, sending } = &mut self.mode else { return };
+        if *current != id || !*sending { return; }
+        *sending = false;
+        match result {
+            Ok(()) => {
+                // Submitted image copies must remain available for the agent to read.
+                attachments.clear();
+                *text = Line::default();
+                self.fit_comms(client, l);
+                self.toast("Reply sent", t);
+            }
+            Err(e) => self.toast(format!("Not sent: {e}. Your draft is kept."), t),
+        }
+    }
+
+    /// Scroll either the embedded application or the emulator's history, using
+    /// coordinates relative to the terminal, never the outer popup.
+    fn terminal_scroll(&mut self, client: &Client, l: &Lay, lines: isize, at: Option<(i32, i32)>) {
+        let Some(id) = self.talking_to() else { return };
+        let Some((_, s)) = &self.screen else { return };
+        let (tx, ty, width, height) = self.terminal_rect(l);
+        let (c, r) = at.unwrap_or((tx + width / 2, ty + height / 2));
+        if c < tx || c >= tx + width || r < ty || r >= ty + height { return; }
+        if s.mouse && self.scroll == 0 {
+            let (x, y) = (c - tx + 1, r - ty + 1);
+            let b = if lines > 0 { 64 } else { 65 };
+            let sequence = if s.sgr { format!("\x1b[<{b};{x};{y}M") } else {
+                let enc = |v: i32| char::from_u32((32 + v).min(255) as u32).unwrap_or(' ');
+                format!("\x1b[M{}{}{}", enc(b), enc(x), enc(y))
+            };
+            self.pick = None;
+            // A wheel event is one tick; page keys send enough ticks for a page.
+            client.send(Cmd::Input(id, sequence.repeat(if at.is_some() { 1 } else { (lines.unsigned_abs() / 3).max(1) })));
+        } else if !s.alt {
+            self.scroll_by(lines, client);
+        }
     }
 
     /// Enter on the current selection.
-    fn activate(&mut self, w: &World, l: &Lay, client: &Client) {
+    fn activate(&mut self, w: &World, l: &Lay, _client: &Client) {
         match self.sel.clone() {
             Some(Sel::GitHub) => self.mode = Mode::Trade { sel: 0 },
             Some(Sel::Agent(id)) => self.mode = Mode::Ship { id, sel: 0 },
-            Some(Sel::Planet(k)) => {
-                if let Some(id) = self.lead_agent(&k) {
-                    self.sel = Some(Sel::Agent(id));
-                    self.open_comms(id, client, l);
-                }
-            }
+            Some(Sel::Planet(k)) => self.mode = Mode::Planet(PlanetView::new(k)),
             Some(Sel::Sys(k)) => {
                 if let Some(s) = w.systems.iter().find(|s| s.key == k) {
                     let r = s.orbits.last().copied().unwrap_or(40.0) + 40.0;
@@ -1922,15 +2045,21 @@ fn copy_to_clipboard(text: &str) -> bool {
         let Ok(mut child) = Command::new(tool[0]).args(&tool[1..]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
             continue;
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        // wl-copy stays around to serve the clipboard; don't wait for it
-        std::thread::spawn(move || child.wait());
-        return true;
+        let written = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        // wl-copy and xclip fork their clipboard owner; their parent reports
+        // connection errors. Do not call a failed Wayland connection a copy.
+        let start = Instant::now();
+        let success = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if start.elapsed() < Duration::from_secs(2) => std::thread::sleep(Duration::from_millis(10)),
+                _ => { let _ = child.kill(); let _ = child.wait(); break false; }
+            }
+        };
+        if written && success { return true; }
     }
-    let _ = write!(io::stdout(), "\x1b]52;c;{}\x07", base64(text.as_bytes()));
-    true
+    let mut out = io::stdout();
+    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes())).and_then(|_| out.flush()).is_ok()
 }
 
 fn base64(b: &[u8]) -> String {
@@ -2005,11 +2134,12 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         let mut cues = Vec::new();
         while let Ok(m) = client.rx.try_recv() {
             match m {
+                Msg::ChatSent(id, result) => app.chat_sent(id, result, client, &Lay::new(&fb, app.panel), t),
                 Msg::MissionResult(result) => {
                     match result {
                         Ok(()) => {
                             let launched = matches!(app.mode, Mode::Brief { launch: true, .. });
-                            app.mode = Mode::Galaxy;
+                            app.mode = app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet);
                             app.toast(if launched { "mission launched" } else { "mission queued" }, t);
                         }
                         Err(e) => {
@@ -2223,8 +2353,214 @@ fn chat_text(app: &mut App) -> Option<&mut Line> {
     }
 }
 
+fn chat_paste(app: &mut App, pasted: &str, dir: &Path) -> Result<(), String> {
+    if let Mode::Chat { text, attachments, sending: false, .. } = &mut app.mode {
+        paste_brief(text, attachments, pasted, dir)?;
+    }
+    Ok(())
+}
+
+fn handle_chat(app: &mut App, l: &Lay, client: &Client, ev: Event, t: f32) {
+    let Mode::Chat { id, ref text, ref attachments, sending } = app.mode else { return };
+    let (empty, images) = (text.s.is_empty(), attachments.len());
+    let asking = app.agent(id).is_some_and(|a| a.status == Status::Blocked);
+    let before = app.terminal_rect(l);
+    let page = (before.3 - 1).max(1) as isize;
+    match ev {
+        Event::Key(k) if k.kind != KeyEventKind::Release => {
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            match k.code {
+                _ if is_leave(&k) || k.code == KeyCode::Esc => {
+                    if sending { app.toast("Sending reply…", t); } else { app.close_comms(client); }
+                }
+                KeyCode::Tab => {
+                    if empty && images == 0 && !sending { app.fullscreen_comms(id, client, l); }
+                    else { app.toast("Send or clear your draft before opening full screen", t); }
+                }
+                KeyCode::PageUp => app.terminal_scroll(client, l, page, None),
+                KeyCode::PageDown => app.terminal_scroll(client, l, -page, None),
+                KeyCode::Home if ctrl => app.scroll_by(isize::MAX, client),
+                KeyCode::End if ctrl => app.scroll_by(-(app.scroll as isize), client),
+                KeyCode::Char('c' | 'C') if ctrl => app.copy(t),
+                KeyCode::Char('v' | 'V') | KeyCode::Insert
+                    if !sending && (ctrl || k.code == KeyCode::Insert && k.modifiers.contains(KeyModifiers::SHIFT)) => {
+                    let result = screenshots::clipboard_content(&screenshots::directory());
+                    match result {
+                        Ok(screenshots::Clipboard::Text(s)) => {
+                            if let Err(e) = chat_paste(app, &s, &screenshots::directory()) { app.toast(e, t); }
+                        }
+                        Ok(screenshots::Clipboard::Image(image)) => {
+                            if let Mode::Chat { attachments, .. } = &mut app.mode {
+                                if attachments.len() < screenshots::MAX_ATTACHMENTS { attachments.push(image); }
+                                else { screenshots::discard(&[image]); app.toast("Attach up to 8 screenshots per reply", t); }
+                            }
+                        }
+                        Err(e) => app.toast(e, t),
+                    }
+                }
+                KeyCode::Char('x') if ctrl && !sending => {
+                    if let Mode::Chat { attachments, .. } = &mut app.mode {
+                        if let Some(image) = attachments.pop() { screenshots::discard(&[image]); }
+                    }
+                }
+                KeyCode::Char('o') if ctrl && !sending => {
+                    if let Mode::Chat { text, attachments, .. } = &mut app.mode {
+                        if let Some(paths) = screenshots::dropped_paths(&text.s) {
+                            match attach_paths(attachments, &paths, &screenshots::directory()) {
+                                Ok(()) => *text = Line::default(),
+                                Err(e) => app.toast(e, t),
+                            }
+                        } else { app.toast("Type an image path, then Ctrl+O to attach it", t); }
+                    }
+                }
+                KeyCode::Enter if !sending && k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                    chat_text(app).unwrap().paste_lines("\n");
+                }
+                KeyCode::Char('j') if ctrl && !sending => chat_text(app).unwrap().paste_lines("\n"),
+                KeyCode::Enter if !sending => {
+                    app.scroll_by(-(app.scroll as isize), client);
+                    if let Mode::Chat { text, attachments, sending, .. } = &mut app.mode {
+                        if text.s.trim().is_empty() && attachments.is_empty() {
+                            client.send(Cmd::Input(id, "\r".into()));
+                        } else if let Err(e) = screenshots::validate(attachments) {
+                            app.toast(e, t);
+                        } else {
+                            let text = if text.s.trim().is_empty() { "Please inspect the attached screenshots." } else { &text.s };
+                            client.send(Cmd::Say(id, screenshots::prompt(text, attachments)));
+                            *sending = true;
+                        }
+                    }
+                }
+                KeyCode::Up | KeyCode::Down if empty && images == 0 && !sending => {
+                    client.send(Cmd::Input(id, if k.code == KeyCode::Up { "\x1b[A" } else { "\x1b[B" }.into()));
+                }
+                KeyCode::Up | KeyCode::Down if !sending => { chat_text(app).unwrap().vertical(k.code == KeyCode::Up); }
+                KeyCode::Char(c) if empty && images == 0 && asking && c.is_ascii_digit() && k.modifiers.is_empty() && !sending => {
+                    client.send(Cmd::Answer(id, c.to_string()));
+                }
+                _ if !sending => { chat_text(app).unwrap().key(&k); }
+                _ => {}
+            }
+        }
+        Event::Paste(p) if !sending => {
+            if let Err(e) = chat_paste(app, &p, &screenshots::directory()) { app.toast(e, t); }
+        }
+        Event::Mouse(me) => {
+            let (x, y, width, height) = app.terminal_rect(l);
+            let (c, r) = (me.column as i32, me.row as i32);
+            let in_term = c >= x && c < x + width && r >= y && r < y + height;
+            match me.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    app.terminal_scroll(client, l, if me.kind == MouseEventKind::ScrollUp { 3 } else { -3 }, Some((c, r)));
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if in_term { app.select(me, l, t); }
+                    else if c == x + width && r >= y && r < y + height {
+                        let history = app.screen.as_ref().map_or(0, |(_, s)| s.history);
+                        let target = history * (height - 1 - (r - y)) as usize / (height - 1).max(1) as usize;
+                        app.scroll_by(target as isize - app.scroll as isize, client);
+                    } else {
+                        let (bx, by, bw, bh) = draw::chat_box(l);
+                        if c < bx || c >= bx + bw || r < by || r >= by + bh { app.close_comms(client); }
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) if app.pick.is_some() => app.select(me, l, t),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    if matches!(app.mode, Mode::Chat { .. }) && before != app.terminal_rect(l) { app.fit_comms(client, l); }
+}
+
 /// Handle one input event. Returns true to quit.
 #[allow(clippy::too_many_arguments)]
+/// Navigate the buildings without sending any order until its draft is submitted.
+fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event) {
+    let Mode::Planet(mut v) = std::mem::replace(&mut app.mode, Mode::Galaxy) else { return };
+    let g = draw::PlanetLayout::new(l);
+    let before = (v.sel, v.file);
+    let mut delta: isize = 0;
+    let mut edge = None;
+    let mut build = false;
+    let mut comms = false;
+    match ev {
+        Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Tab | KeyCode::Right => v.focus = (v.focus + 1) % 3,
+            KeyCode::BackTab | KeyCode::Left => v.focus = (v.focus + 2) % 3,
+            KeyCode::Up | KeyCode::Char('k') => delta = -1,
+            KeyCode::Down | KeyCode::Char('j') => delta = 1,
+            KeyCode::PageUp => { v.focus = 2; delta = -(g.preview_rows as isize); }
+            KeyCode::PageDown => { v.focus = 2; delta = g.preview_rows as isize; }
+            KeyCode::Home => edge = Some(false),
+            KeyCode::End => edge = Some(true),
+            KeyCode::Char(d @ '1'..='8') => { v.sel = d as usize - '1' as usize; v.focus = 0; }
+            KeyCode::Enter => {
+                if v.files().is_empty() { build = true; }
+                else { v.focus = (v.focus + 1).min(2); }
+            }
+            KeyCode::Char('B' | 'b') => build = true,
+            KeyCode::Char('c') => comms = true,
+            KeyCode::Char('R') => {
+                let path = v.files().get(v.file).cloned();
+                v.built = crate::structure::survey(&v.key);
+                v.file = path.and_then(|p| v.files().iter().position(|f| f == &p)).unwrap_or(0);
+                v.read();
+            }
+            _ => {}
+        },
+        Event::Mouse(me) => {
+            let (x, y) = (me.column as i32, me.row as i32);
+            if me.kind == MouseEventKind::Up(MouseButton::Left) && y == 0 && x < 14 { return; }
+            let focus = if y >= g.y && y < l.rows - 2 {
+                Some(if x < g.split { 0 } else if y < g.preview_y - 1 { 1 } else { 2 })
+            } else { None };
+            if let Some(focus) = focus {
+                match me.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        v.focus = focus;
+                        delta = if me.kind == MouseEventKind::ScrollUp { -1 } else { 1 };
+                        if focus == 2 { delta *= 3; }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        v.focus = focus;
+                        if focus == 0 {
+                            let i = v.sel.saturating_sub(g.buildings - 1) + ((y - g.y) / g.step) as usize;
+                            if i < KINDS.len() { v.sel = i; }
+                        } else if focus == 1 {
+                            let i = v.file.saturating_sub(g.files - 1) + (y - g.y) as usize;
+                            if i < v.files().len() { v.file = i; }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    let max_scroll = v.lines(g.width as usize).len().saturating_sub(g.preview_rows as usize);
+    let max = match v.focus { 0 => KINDS.len() - 1, 1 => v.files().len().saturating_sub(1), _ => max_scroll };
+    let pos = match v.focus { 0 => &mut v.sel, 1 => &mut v.file, _ => &mut v.scroll };
+    *pos = edge.map_or_else(|| pos.saturating_add_signed(delta).min(max), |end| if end { max } else { 0 });
+    if before.0 != v.sel { v.file = 0; }
+    if before != (v.sel, v.file) { v.read(); }
+    if build {
+        let (key, kind) = (v.key.clone(), KINDS[v.sel]);
+        app.survey.worlds.entry(key.clone()).or_default().structures = v.built.clone();
+        app.planet_return = Some(v);
+        app.construct(&key, kind);
+    } else if comms {
+        if let Some(id) = app.lead_agent(&v.key) {
+            app.planet_return = Some(v);
+            app.open_comms(id, client, l);
+        } else {
+            v.preview = "No ships in orbit. Return to the galaxy and press e to deploy one.".into();
+            app.mode = Mode::Planet(v);
+        }
+    } else { app.mode = Mode::Planet(v); }
+}
+
 fn handle(
     app: &mut App,
     w: &World,
@@ -2235,58 +2571,12 @@ fn handle(
     t: f32,
     drag: &mut Option<((u16, u16), (f32, f32), bool)>,
 ) -> bool {
-    // ── chat: a popup with the agent's terminal and a line to write in
-    if let Mode::Chat { id, ref text } = app.mode {
-        let asking = app.agent(id).is_some_and(|a| a.status == Status::Blocked);
-        let empty = text.s.is_empty();
-        match ev {
-            Event::Key(k) if k.kind != KeyEventKind::Release => {
-                let page = (draw::chat_term(l).1 - 1).max(1) as isize;
-                match k.code {
-                    _ if is_leave(&k) => app.close_comms(client),
-                    KeyCode::Esc => app.close_comms(client),
-                    KeyCode::Tab => app.fullscreen_comms(id, client, l),
-                    KeyCode::PageUp => app.scroll_by(page, client),
-                    KeyCode::PageDown => app.scroll_by(-page, client),
-                    KeyCode::Enter => {
-                        let msg = chat_text(app).map(std::mem::take).unwrap_or_default().s;
-                        app.scroll_by(-(app.scroll as isize), client);
-                        // nothing written: Enter goes to the agent (confirming a menu)
-                        client.send(if msg.trim().is_empty() { Cmd::Input(id, "\r".into()) } else { Cmd::Say(id, msg) });
-                    }
-                    // with nothing written, a waiting agent's menu takes arrows and numbers
-                    KeyCode::Up | KeyCode::Down if empty => {
-                        client.send(Cmd::Input(id, if k.code == KeyCode::Up { "\x1b[A" } else { "\x1b[B" }.into()));
-                    }
-                    KeyCode::Char(c) if empty && asking && c.is_ascii_digit() && k.modifiers.is_empty() => {
-                        client.send(Cmd::Answer(id, c.to_string()));
-                    }
-                    _ => {
-                        if let Some(text) = chat_text(app) {
-                            text.key(&k);
-                        }
-                    }
-                }
-            }
-            Event::Paste(p) => {
-                if let Some(text) = chat_text(app) {
-                    text.paste(&p);
-                }
-            }
-            Event::Mouse(me) => match me.kind {
-                MouseEventKind::ScrollUp => app.scroll_by(3, client),
-                MouseEventKind::ScrollDown => app.scroll_by(-3, client),
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let (x, y, w, h) = draw::chat_box(l);
-                    let (c, r) = (me.column as i32, me.row as i32);
-                    if c < x || c >= x + w || r < y || r >= y + h {
-                        app.close_comms(client);
-                    }
-                }
-                _ => {}
-            },
-            _ => {}
-        }
+    if matches!(app.mode, Mode::Planet(_)) {
+        planet_input(app, l, client, &ev);
+        return false;
+    }
+    if matches!(app.mode, Mode::Chat { .. }) {
+        handle_chat(app, l, client, ev, t);
         return false;
     }
 
@@ -2646,7 +2936,7 @@ fn handle(
             match k.code {
                 KeyCode::Esc => {
                     screenshots::discard(attachments);
-                    app.mode = Mode::Galaxy;
+                    app.mode = app.planet_return.take().map_or(Mode::Galaxy, Mode::Planet);
                 }
                 KeyCode::Char('v') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     let result = if attachments.len() >= screenshots::MAX_ATTACHMENTS {
@@ -2725,8 +3015,11 @@ fn handle(
                 KeyCode::Esc => app.mode = Mode::Galaxy,
                 KeyCode::Up => c.kind = (c.kind + nk - 1) % nk,
                 KeyCode::Down => c.kind = (c.kind + 1) % nk,
-                KeyCode::Tab => {
+                KeyCode::Tab | KeyCode::BackTab => {
                     if !c.comps.is_empty() {
+                        if k.code == KeyCode::BackTab {
+                            c.comp_i = if c.comp_i == 0 { c.comps.len() - 1 } else { (c.comp_i + c.comps.len() - 2) % c.comps.len() };
+                        }
                         let pick = c.comps[c.comp_i % c.comps.len()].clone();
                         c.comp_i += 1;
                         if c.comps.len() == 1 {
@@ -2768,7 +3061,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Galaxy | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
+        Mode::Galaxy | Mode::Planet(_) | Mode::Commander | Mode::Comms(_) | Mode::Chat { .. } | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
     // ── galaxy
@@ -2795,6 +3088,7 @@ fn handle(
         KeyCode::Enter
             if let Some(id) = app.transmission().map(|a| a.id)
                 && app.sel != Some(Sel::GitHub)
+                && !matches!(app.sel, Some(Sel::Planet(_)))
                 && !(app.cam.z < OVERVIEW_ZOOM && matches!(app.sel, Some(Sel::Sys(_))))
                 && !matches!(app.sel, Some(Sel::Agent(s)) if s != id) =>
         {
@@ -2924,12 +3218,21 @@ fn handle(
         KeyCode::Char('s') => app.cam.ty += pan,
         KeyCode::Char('a') | KeyCode::Left => app.cam.tx -= pan,
         KeyCode::Char('d') | KeyCode::Right => app.cam.tx += pan,
-        KeyCode::Char('+') | KeyCode::Char('=') => app.cam.tz = (app.cam.tz * 1.3).min(6.0),
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            app.cam.tz = (app.cam.tz * 1.3).min(6.0);
+            if app.cam.tz >= 3.0 && let Some(Sel::Planet(k)) = app.sel.clone() {
+                app.mode = Mode::Planet(PlanetView::new(k));
+            }
+        }
         KeyCode::Char('-') | KeyCode::Char('_') => app.cam.tz = (app.cam.tz / 1.3).max(0.12),
         KeyCode::Char('z') => app.fit(w, l),
         KeyCode::Char('f') => {
-            app.glide_to_sel(w);
-            app.cam.tz = 2.4;
+            if let Some(Sel::Planet(k)) = app.sel.clone() {
+                app.mode = Mode::Planet(PlanetView::new(k));
+            } else {
+                app.glide_to_sel(w);
+                app.cam.tz = 2.4;
+            }
         }
         KeyCode::Char('o') => {
             app.panel = !app.panel;
@@ -3058,7 +3361,14 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
     let px = (mc as f32 * 2.0 + 1.0, mr as f32 * 4.0 + 2.0);
     let in_panel = l.pw > 0 && mc as i32 >= l.cols - l.pw;
     match me.kind {
-        MouseEventKind::ScrollUp if !in_panel => app.zoom_at(l, 1.15, px),
+        MouseEventKind::ScrollUp if !in_panel => {
+            let hit = pick_at(app, w, l, px);
+            app.zoom_at(l, 1.15, px);
+            if app.cam.z >= 3.0 && let Some(Sel::Planet(k)) = hit {
+                app.sel = Some(Sel::Planet(k.clone()));
+                app.mode = Mode::Planet(PlanetView::new(k));
+            }
+        }
         MouseEventKind::ScrollDown if !in_panel => app.zoom_at(l, 1.0 / 1.15, px),
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => draw::panel_scroll(app, w, l, mr as i32, if me.kind == MouseEventKind::ScrollUp { -3 } else { 3 }),
         MouseEventKind::Down(MouseButton::Left) => *drag = Some(((mc, mr), (app.cam.x, app.cam.y), false)),
@@ -3203,6 +3513,155 @@ mod screenshot_tests {
         assert!(rows.iter().any(|r| r.contains("queue it")));
         assert!(rows.iter().any(|r| r.contains("Ctrl+V") && r.contains("Ctrl+X")));
         assert!(rows.iter().any(|r| r.contains("give orders")));
+    }
+}
+
+#[cfg(test)]
+mod chat_input_tests {
+    use super::*;
+
+    fn setup() -> (App, World, Lay, Client, std::sync::mpsc::Receiver<Cmd>) {
+        let mut app = App::new();
+        app.agents.push(ship_card_tests::ship(1, false));
+        let w = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let l = Lay::new(&Fb::new(120, 40), false);
+        let (client, commands) = Client::recording();
+        app.open_comms(1, &client, &l);
+        while commands.try_recv().is_ok() {}
+        app.screen = Some((1, ScreenView { cols: 98, rows: 29, cursor: (0, 0), hide_cursor: true,
+            lines: vec![vec![crate::proto::Run { t: "hello world".into(), fg: None, bg: None, b: false }]],
+            scroll: 0, history: 100, mouse: false, sgr: false, alt: false }));
+        (app, w, l, client, commands)
+    }
+
+    fn event(app: &mut App, w: &World, l: &Lay, client: &Client, ev: Event) {
+        handle(app, w, l, client, None, ev, 1.0, &mut None);
+    }
+
+    fn mouse(kind: MouseEventKind, c: i32, r: i32) -> Event {
+        Event::Mouse(event::MouseEvent { kind, column: c as u16, row: r as u16, modifiers: KeyModifiers::NONE })
+    }
+
+    #[test]
+    fn popup_drag_selects_terminal_cells_at_the_popup_offset() {
+        let (mut app, w, l, client, _) = setup();
+        let (x, y, _, _) = draw::chat_box(&l);
+        event(&mut app, &w, &l, &client, mouse(MouseEventKind::Down(MouseButton::Left), x + 1, y + 1));
+        event(&mut app, &w, &l, &client, mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y + 1));
+        assert_eq!(app.pick.map(|p| p.span()), Some(((0, 0), (0, 4))));
+        assert_eq!(app.selected_text(), "hello");
+    }
+
+    #[test]
+    fn popup_paste_keeps_newlines_and_does_not_send_before_enter() {
+        let (mut app, w, l, client, commands) = setup();
+        event(&mut app, &w, &l, &client, Event::Paste("first\r\nsecond".into()));
+        assert_eq!(chat_text(&mut app).unwrap().s, "first\nsecond");
+        assert!(!commands.try_iter().any(|c| matches!(c, Cmd::Say(..) | Cmd::Input(..))));
+    }
+
+    #[test]
+    fn popup_wheel_uses_agent_mouse_protocol_when_the_agent_owns_scrolling() {
+        let (mut app, w, l, client, commands) = setup();
+        let (_, s) = app.screen.as_mut().unwrap();
+        s.mouse = true; s.sgr = true; s.alt = true; s.history = 0;
+        let (x, y, _, _) = draw::chat_box(&l);
+        event(&mut app, &w, &l, &client, mouse(MouseEventKind::ScrollUp, x + 4, y + 3));
+        assert!(commands.try_iter().any(|c| matches!(c, Cmd::Input(1, data) if data == "\x1b[<64;4;3M")));
+    }
+
+    #[test]
+    fn popup_wheel_and_page_keys_scroll_normal_terminal_history() {
+        let (mut app, w, l, client, _) = setup();
+        let (x, y, _, _) = draw::chat_box(&l);
+        event(&mut app, &w, &l, &client, mouse(MouseEventKind::ScrollUp, x + 4, y + 3));
+        assert_eq!(app.scroll, 3);
+        event(&mut app, &w, &l, &client, Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        assert!(app.scroll > 3);
+        event(&mut app, &w, &l, &client, Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)));
+        assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn dropped_image_is_validated_instead_of_becoming_message_text() {
+        let (mut app, w, l, client, _) = setup();
+        event(&mut app, &w, &l, &client, Event::Paste("/nonexistent/chat-image.png".into()));
+        assert!(app.toast.is_some());
+        assert!(chat_text(&mut app).unwrap().s.is_empty());
+    }
+
+    #[test]
+    fn screenshot_reply_keeps_the_draft_on_failure_and_the_image_after_delivery() {
+        let (mut app, w, l, client, commands) = setup();
+        let dir = std::env::temp_dir().join(format!("empire-chat-delivery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("test shot.png");
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        chat_paste(&mut app, "Look at this\nPlease fix it", &dir.join("copies")).unwrap();
+        chat_paste(&mut app, source.to_str().unwrap(), &dir.join("copies")).unwrap();
+        let saved = match &app.mode { Mode::Chat { attachments, .. } => attachments[0].path.clone(), _ => unreachable!() };
+        assert_ne!(saved, source.to_str().unwrap());
+        event(&mut app, &w, &l, &client, Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(commands.try_iter().any(|c| matches!(c, Cmd::Say(1, text) if text.contains("Look at this\nPlease fix it") && text.contains(&saved))));
+        app.chat_sent(1, Err("connection lost".into()), &client, &l, 1.0);
+        assert!(matches!(&app.mode, Mode::Chat { text, attachments, sending: false, .. } if text.s.contains("Please fix it") && attachments.len() == 1));
+        event(&mut app, &w, &l, &client, Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        app.chat_sent(1, Ok(()), &client, &l, 1.0);
+        assert!(matches!(&app.mode, Mode::Chat { text, attachments, sending: false, .. } if text.s.is_empty() && attachments.is_empty()));
+        assert!(Path::new(&saved).is_file());
+        app.close_comms(&client);
+        assert!(Path::new(&saved).is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn closing_a_draft_cleans_up_only_its_owned_images() {
+        let (mut app, _, _, client, _) = setup();
+        let dir = std::env::temp_dir().join(format!("empire-chat-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("shot.png");
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        chat_paste(&mut app, source.to_str().unwrap(), &dir.join("copies")).unwrap();
+        let saved = match &app.mode { Mode::Chat { attachments, .. } => attachments[0].path.clone(), _ => unreachable!() };
+        app.close_comms(&client);
+        assert!(!Path::new(&saved).exists());
+        assert!(source.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn popup_renders_multiline_drafts_attachments_and_errors_inside_the_frame() {
+        let (mut app, w, _, client, _) = setup();
+        let mut fb = Fb::new(80, 24);
+        let l = Lay::new(&fb, false);
+        if let Mode::Chat { text, attachments, .. } = &mut app.mode {
+            text.set("first line\nsecond line\nlast line".into());
+            attachments.push(Attachment { path: "/not-sent.png".into(), name: "sample.png".into() });
+        }
+        app.toast("Clipboard feedback is visible", 1.0);
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let rows: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+        for text in ["first line", "second line", "last line", "sample.png", "Clipboard feedback is visible"] {
+            assert!(rows.iter().any(|r| r.contains(text)), "missing {text}");
+        }
+        event(&mut app, &w, &l, &client, Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(matches!(app.mode, Mode::Chat { .. }), "Tab must not silently discard a draft");
+    }
+
+    #[test]
+    fn scrollbar_and_history_keys_can_reach_top_and_bottom() {
+        let (mut app, w, l, client, _) = setup();
+        let (x, y, width, height) = app.terminal_rect(&l);
+        event(&mut app, &w, &l, &client, mouse(MouseEventKind::Down(MouseButton::Left), x + width, y));
+        assert_eq!(app.scroll, 100);
+        event(&mut app, &w, &l, &client, mouse(MouseEventKind::Down(MouseButton::Left), x + width, y + height - 1));
+        assert_eq!(app.scroll, 0);
+        event(&mut app, &w, &l, &client, Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL)));
+        assert_eq!(app.scroll, 100);
+        event(&mut app, &w, &l, &client, Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL)));
+        assert_eq!(app.scroll, 100);
+        event(&mut app, &w, &l, &client, Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)));
+        assert_eq!(app.scroll, 0);
     }
 }
 
@@ -3772,6 +4231,71 @@ mod multiline_tests {
 }
 
 #[cfg(test)]
+mod path_menu_tests {
+    use super::*;
+
+    #[test]
+    fn completion_cycles_beyond_eight_results_and_can_go_backwards() {
+        let dir = std::env::temp_dir().join(format!("empire-completion-cycle-{}", std::process::id()));
+        for i in 0..12 { std::fs::create_dir_all(dir.join(format!("Project{i:02}"))).unwrap(); }
+        let mut path = Line::default();
+        path.set(format!("{}/pjt", dir.display()));
+        let comps = complete(&path.s);
+        let mut app = App::new();
+        app.mode = Mode::Colonize(Colonize { path, comps, comp_i: 0, kind: 0, mkdir: false });
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let mut fb = Fb::new(100, 30);
+        let l = Lay::new(&fb, false);
+        let client = Client::isolated();
+        for _ in 0..12 { handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)), 1.0, &mut None); }
+        assert!(matches!(&app.mode, Mode::Colonize(c) if c.path.s.ends_with("Project11/")));
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let rows: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+        assert!(rows.iter().filter(|r| r.contains("Project11")).count() >= 2, "selected completion must remain visible below the input");
+        handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)), 1.0, &mut None);
+        assert!(matches!(&app.mode, Mode::Colonize(c) if c.path.s.ends_with("Project10/")));
+        assert!(fuzzy_score("øp", "ØnskeProsjekt").is_some());
+        assert!(fuzzy_score("zz", "project").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completion_matches_case_insensitively_and_ranks_gaps_after_prefixes() {
+        let dir = std::env::temp_dir().join(format!("empire-fuzzy-{}", std::process::id()));
+        for name in ["Docs", "Documents", "my-docs", "downloads", ".docs"] { std::fs::create_dir_all(dir.join(name)).unwrap(); }
+        let got = complete(&format!("{}/dOCS", dir.display()));
+        let names: Vec<_> = got.iter().map(|s| Path::new(s).file_name().unwrap().to_str().unwrap()).collect();
+        assert_eq!(names, ["Docs", "my-docs", "Documents"]);
+        assert!(complete(&format!("{}/dwn", dir.display())).iter().any(|s| s.ends_with("downloads/")));
+        assert!(complete(&format!("{}/.DOC", dir.display())).iter().any(|s| s.ends_with(".docs/")));
+        assert!(complete(&format!("{}/zzz", dir.display())).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn modified_backspace_removes_a_path_segment_and_preserves_the_tail() {
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            let mut line = Line::default();
+            line.set("code/somethi".into());
+            assert!(line.key(&KeyEvent::new(KeyCode::Backspace, modifier)));
+            assert_eq!(line.s, "code/");
+            line.set("~/code/æøå/tail".into());
+            line.cur = "~/code/æøå".chars().count();
+            line.key(&KeyEvent::new(KeyCode::Backspace, modifier));
+            assert_eq!(line.s, "~/code//tail");
+            assert_eq!(line.cur, 7);
+            line.set("code/folder/".into());
+            line.key(&KeyEvent::new(KeyCode::Backspace, modifier));
+            assert_eq!(line.s, "code/");
+        }
+        let mut line = Line::default();
+        line.set("code/somethi".into());
+        line.key(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(line.s, "code/someth");
+    }
+}
+
+#[cfg(test)]
 mod role_tests {
     use super::*;
 
@@ -3851,6 +4375,106 @@ mod advisor_tests {
 #[cfg(test)]
 mod structure_tests {
     use super::*;
+
+    #[test]
+    fn landing_takes_precedence_over_transmissions_and_focus_enters_the_planet() {
+        let mut app = App::new();
+        let mut ship = ship_card_tests::ship(1, false);
+        ship.status = Status::Blocked;
+        ship.ask = Some(Ask { question: "Allow this?".into(), ..Default::default() });
+        app.agents.push(ship);
+        app.sel = Some(Sel::Planet("/uninhabited/world".into()));
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let l = Lay::new(&Fb::new(100, 30), false);
+        for key in [KeyCode::Enter, KeyCode::Char('f'), KeyCode::Char('+')] {
+            app.mode = Mode::Galaxy;
+            app.cam.tz = 2.9;
+            handle(&mut app, &world, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), 1.0, &mut None);
+            assert!(matches!(&app.mode, Mode::Planet(v) if v.key == "/uninhabited/world"));
+        }
+    }
+
+    #[test]
+    fn planet_files_scroll_refresh_and_return_from_construction() {
+        let dir = std::env::temp_dir().join(format!("empire-planet-view-{}", std::process::id()));
+        for i in 0..12 {
+            let p = dir.join(format!(".agents/skills/skill-{i:02}"));
+            std::fs::create_dir_all(&p).unwrap();
+            let text = (0..40).map(|n| format!("Skill {i}, line {n}\n")).collect::<String>();
+            std::fs::write(p.join("SKILL.md"), text).unwrap();
+        }
+        let mut app = App::new();
+        app.history.clear();
+        let key = dir.to_string_lossy().to_string();
+        app.history.insert(key.clone(), survey::now() as u64);
+        app.sel = Some(Sel::Planet(key.clone()));
+        let world = app.world(1.0, 0.0);
+        let mut fb = Fb::new(100, 30);
+        let l = Lay::new(&fb, true);
+        let (client, commands) = Client::recording();
+        let press = |app: &mut App, code| { handle(app, &world, &l, &client, None, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 1.0, &mut None); };
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::End);
+        assert!(matches!(&app.mode, Mode::Planet(v) if v.file == 11 && v.preview.contains("Skill 11, line 0")));
+        press(&mut app, KeyCode::PageDown);
+        assert!(matches!(&app.mode, Mode::Planet(v) if v.scroll > 0));
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("skill-11") && text.contains("Skill 11, line 20"));
+        press(&mut app, KeyCode::Char('B'));
+        assert!(matches!(&app.mode, Mode::Brief { text, .. } if text.s.starts_with("Renovate") && text.s.contains("skill-11")));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(&app.mode, Mode::Planet(v) if v.file == 11 && v.sel == 2));
+        std::fs::remove_file(dir.join(".agents/skills/skill-11/SKILL.md")).unwrap();
+        press(&mut app, KeyCode::Char('R'));
+        assert!(matches!(&app.mode, Mode::Planet(v) if v.files().len() == 11 && v.file == 0 && v.preview.contains("Skill 0, line 0")));
+        // the same layout drives mouse targets, even when the galaxy outliner is enabled
+        let g = draw::PlanetLayout::new(&l);
+        let me = event::MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: (g.split + 3) as u16, row: (g.y + 1) as u16, modifiers: KeyModifiers::NONE };
+        handle(&mut app, &world, &l, &client, None, Event::Mouse(me), 1.0, &mut None);
+        assert!(matches!(&app.mode, Mode::Planet(v) if v.file == 1 && v.preview.contains("Skill 1, line 0")));
+        for (cols, rows) in [(80, 24), (48, 18), (30, 12)] {
+            let mut small = Fb::new(cols, rows);
+            draw::frame(&mut small, &mut app, &world, &Lay::new(&Fb::new(cols, rows), false), 1.0, None);
+            let text: String = small.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+            assert!(text.contains("Esc galaxy"));
+            if cols >= 48 { assert!(text.contains("BUILDINGS") && text.contains("SKILL.md")); }
+        }
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Galaxy));
+        assert_eq!(app.sel, Some(Sel::Planet(key)));
+        assert!(commands.try_iter().next().is_none(), "browsing and cancelling must never dispatch an order");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn planet_preview_reports_missing_files_and_limits_large_files() {
+        let dir = std::env::temp_dir().join(format!("empire-planet-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "x".repeat(70_000)).unwrap();
+        let mut v = PlanetView::new(dir.to_string_lossy().into_owned());
+        assert!(v.preview.ends_with("[Preview limited to 64 KiB]"));
+        std::fs::remove_file(dir.join("AGENTS.md")).unwrap();
+        v.read();
+        assert!(v.preview.starts_with("Cannot read this file:"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn entering_a_world_opens_its_buildings_even_without_ships() {
+        let mut app = App::new();
+        app.sel = Some(Sel::Planet("/uninhabited/world".into()));
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let mut fb = Fb::new(100, 30);
+        let l = Lay::new(&fb, false);
+        let client = Client::isolated();
+        handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), 1.0, &mut None);
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("PLANET") && text.contains("BUILDINGS") && text.contains("AGENTS.md"));
+    }
 
     #[test]
     fn b_shows_structures_and_drafts_a_construction_order_for_a_builder() {

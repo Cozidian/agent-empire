@@ -112,11 +112,29 @@ pub fn validate(attachments: &[Attachment]) -> Result<(), String> {
 }
 
 pub fn clipboard(dir: &Path) -> Result<Attachment, String> {
+    save(&clipboard_bytes(true)?, "Clipboard screenshot.png".into(), dir)
+}
+
+pub enum Clipboard {
+    Image(Attachment),
+    Text(String),
+}
+
+/// Prefer an image when the clipboard offers both an image and a text description.
+pub fn clipboard_content(dir: &Path) -> Result<Clipboard, String> {
+    if let Ok(bytes) = clipboard_bytes(true) {
+        return save(&bytes, "Clipboard screenshot.png".into(), dir).map(Clipboard::Image);
+    }
+    let bytes = clipboard_bytes(false)?;
+    String::from_utf8(bytes).map(Clipboard::Text).map_err(|_| "Clipboard text is not UTF-8".into())
+}
+
+fn clipboard_bytes(image: bool) -> Result<Vec<u8>, String> {
     use std::process::{Command, Stdio};
     let (program, args): (&str, &[&str]) = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        ("wl-paste", &["--no-newline", "--type", "image/png"])
+        ("wl-paste", if image { &["--no-newline", "--type", "image/png"] } else { &["--no-newline", "--type", "text"] })
     } else {
-        ("xclip", &["-selection", "clipboard", "-t", "image/png", "-o"])
+        ("xclip", if image { &["-selection", "clipboard", "-t", "image/png", "-o"] } else { &["-selection", "clipboard", "-t", "UTF8_STRING", "-o"] })
     };
     let mut child = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
         .map_err(|_| format!("Install {program} for clipboard screenshots, or drop an image file"))?;
@@ -134,8 +152,9 @@ pub fn clipboard(dir: &Path) -> Result<Attachment, String> {
         }
     };
     let bytes = reader.join().map_err(|_| "Could not read clipboard")?.map_err(|e| e.to_string())?;
-    if !success { return Err("No PNG screenshot on the clipboard; copy an image or drop a file".into()); }
-    save(&bytes, "Clipboard screenshot.png".into(), dir)
+    if !success { return Err(if image { "No PNG screenshot on the clipboard; copy an image or drop a file" } else { "Could not paste clipboard text or image; use terminal paste or drop an image file" }.into()); }
+    if bytes.len() as u64 > MAX_BYTES { return Err("Clipboard content exceeds 20 MiB".into()); }
+    Ok(bytes)
 }
 
 pub fn prompt(text: &str, attachments: &[Attachment]) -> String {

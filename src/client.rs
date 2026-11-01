@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub enum Msg {
     MissionResult(Result<(), String>),
+    ChatSent(u32, Result<(), String>),
     Agents(Vec<AgentView>, Vec<Mission>),
     Down(String),
     Screen(u32, ScreenView),
@@ -51,9 +52,14 @@ pub struct Client {
 impl Client {
     #[cfg(test)]
     pub fn isolated() -> Self {
+        Self::recording().0
+    }
+
+    #[cfg(test)]
+    pub fn recording() -> (Self, Receiver<Cmd>) {
         let (events, rx) = mpsc::channel();
-        let (tx, _) = mpsc::channel();
-        Self { rx, tx, events, watch: Arc::default(), scroll: Arc::default() }
+        let (tx, commands) = mpsc::channel();
+        (Self { rx, tx, events, watch: Arc::default(), scroll: Arc::default() }, commands)
     }
 
     pub fn start() -> Self {
@@ -124,9 +130,17 @@ impl Client {
                     conn = Conn::open().ok();
                 }
                 let Some(c) = conn.as_mut() else {
-                    let _ = mtx.send(if draft { Msg::MissionResult(Err("daemon offline".into())) } else { Msg::Error("daemon offline".into()) });
+                    let message = if let Cmd::Say(id, _) = &cmd { Msg::ChatSent(*id, Err("daemon offline".into())) }
+                        else if draft { Msg::MissionResult(Err("daemon offline".into())) } else { Msg::Error("daemon offline".into()) };
+                    let _ = mtx.send(message);
                     continue;
                 };
+                if let Cmd::Say(id, text) = cmd {
+                    let result = send_chat(&mut |request| c.call(request), id, &text);
+                    if result.is_err() { conn = None; }
+                    let _ = mtx.send(Msg::ChatSent(id, result.map_err(|e| e.to_string())));
+                    continue;
+                }
                 let dock = match &cmd {
                     Cmd::Dock(m) => Some(m.clone()),
                     _ => None,
@@ -135,11 +149,7 @@ impl Client {
                     Cmd::Spawn { kind, cwd } => (Req::Spawn { kind: kind.clone(), cwd: cwd.clone() }, Some((kind, cwd))),
                     Cmd::Kill(id) => (Req::Kill { id }, None),
                     Cmd::Input(id, data) => (Req::Input { id, data }, None),
-                    Cmd::Say(id, text) => {
-                        let _ = c.call(&Req::Input { id, data: format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")) });
-                        thread::sleep(Duration::from_millis(150));
-                        (Req::Input { id, data: "\r".into() }, None)
-                    }
+                    Cmd::Say(..) => unreachable!(),
                     Cmd::Resize(id, cols, rows) => (Req::Resize { id, cols, rows }, None),
                     Cmd::Seen(id) => (Req::Seen { id }, None),
                     Cmd::Answer(id, key) => (Req::Answer { id, key }, None),
@@ -218,5 +228,39 @@ impl Client {
     /// Look this many lines back into the watched agent's history.
     pub fn scroll(&self, lines: usize) {
         self.scroll.store(lines, Relaxed);
+    }
+}
+
+fn send_chat(call: &mut impl FnMut(&Req) -> std::io::Result<Resp>, id: u32, text: &str) -> std::io::Result<()> {
+    let expect_ok = |reply| match reply {
+        Resp::Ok => Ok(()),
+        Resp::Err { msg } => Err(std::io::Error::other(msg)),
+        _ => Err(std::io::Error::other("unexpected chat reply")),
+    };
+    expect_ok(call(&Req::Input { id, data: format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")) })?)?;
+    thread::sleep(Duration::from_millis(150));
+    expect_ok(call(&Req::Input { id, data: "\r".into() })?)
+}
+
+#[cfg(test)]
+mod chat_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn multiline_reply_is_one_bracketed_paste_then_enter() {
+        let mut inputs = Vec::new();
+        send_chat(&mut |r| {
+            if let Req::Input { id, data } = r { inputs.push((*id, data.clone())); }
+            Ok(Resp::Ok)
+        }, 7, "first\nsecond").unwrap();
+        assert_eq!(inputs, [(7, "\x1b[200~first\nsecond\x1b[201~".into()), (7, "\r".into())]);
+    }
+
+    #[test]
+    fn failed_paste_is_reported_and_never_followed_by_enter() {
+        let mut count = 0;
+        let result = send_chat(&mut |_| { count += 1; Err(std::io::Error::other("offline")) }, 7, "reply");
+        assert!(result.is_err());
+        assert_eq!(count, 1);
     }
 }
