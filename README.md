@@ -53,9 +53,16 @@ the galaxy. Ship status colours and development indicators still show the same i
 Zooming far out switches to a **system overview**: one small star per system, quiet connections,
 and world/ship counts with waiting or finished work (including agents on moons). The GitHub
 station becomes a simple diamond with its PR count and failing checks. Labels move or shorten
-to avoid overlapping; ships, rings and effects return when you zoom in. Click a system or its
-label to select it, then press Enter or click it again to zoom in. The outliner still lets you
-select individual worlds and agents at any distance.
+to avoid overlapping. When you have sectors, zoom passes through a **sector map** before full
+planetary detail: softly shaded regions show their names and small member worlds, with ships
+and orbit effects hidden. The title bar says **SECTORS** at this distance. Further zoom brings
+back full planets, ships and effects. With no sectors, the existing two views remain.
+
+Click a system or sector region/name to select it, then press **Enter** or click it again to
+zoom in. Enter on a distant system first visits the sector layer; Enter on a sector zooms into
+its worlds in that system. A sector spanning systems uses the same name and colour in each,
+with a count of its represented systems. The outliner adds selectable sector rows at middle
+zoom and still lets you select individual worlds and agents at any distance.
 
 | key              | action                                                              |
 | ---------------- | ------------------------------------------------------------------- |
@@ -65,6 +72,8 @@ select individual worlds and agents at any distance.
 | `Ctrl-]` / `F12` | leave comms, back to the galaxy                                     |
 | `⇥`              | jump to the next agent that needs you                               |
 | `C`              | **commander**: your attention queue across all star systems         |
+| `A`              | **anomalies**: discoveries, investigations and history across worlds |
+| `V`              | **sectors**: group worlds and inspect their combined activity       |
 | `t`              | **mission**: write a task for the selected world (launch a ship with it, or queue it) |
 | `b`              | **fleet order**: one order to every agent in the selected system or world |
 | `u`              | **moon**: found a git worktree off the selected world, with its own agent |
@@ -210,6 +219,115 @@ Answer questions and approve actions in the agent's comms; closing comms returns
 Items update as agents and PR surveys change. Reading the list alone does not dismiss anything;
 finished work leaves the queue when opened in comms, and questions remain until resolved.
 `Esc` returns to the galaxy.
+
+## Sectors
+
+Press **`V`** to group worlds around a product or initiative, independently of their folder layout.
+For example, create **Orion** and add its runtime, frontend and Gateway repositories. A world can
+belong to several sectors. Its moons follow it automatically, so work on a worktree counts toward
+the parent world's sector.
+
+The sector editor shows groups on the left and worlds on the right. **`n`** creates a named sector;
+**Tab** switches panes, arrows or the wheel select, and **Space** adds or removes the selected world.
+Members are marked **`[+]`**. **`p`** adds an existing folder by path (including `~/…`) if it is not
+charted yet. Adding a worktree path uses its host world. Membership never creates or moves folders,
+launches ships, or sends orders.
+
+| key | action |
+| --- | --- |
+| `n` / `r` | create / rename a sector; Enter saves, Esc cancels |
+| `Tab` / `←→` | switch between sectors and worlds |
+| `↑↓` / `j k` / wheel | select; `Home/End` and `PgUp/PgDn` navigate long lists |
+| `Space` | toggle the selected world's membership in the worlds pane |
+| `p` | add an existing folder by path |
+| `⏎` | focus the selected sector or locate the selected world, depending on pane |
+| `f` | focus the sector on the galaxy |
+| `a` | open anomalies scoped to the sector, including its moons |
+| `x` | dissolve the selected sector after `y` confirmation; other keys cancel |
+| `Esc` | return to the galaxy |
+
+The summary combines the sector's ships (working, waiting and finished), missions under way,
+queued missions and active anomalies. Moons contribute to activity without increasing the parent
+world count; unrelated worlds are excluded. Missing member folders remain listed so their
+membership can be removed.
+
+**`f`** fits the camera around the sector, stopping at the sector layer or farther out for widely
+spread groups. It highlights member worlds; at a distance, their star systems are marked **▱**. A small map banner shows the sector's activity. The rest of the galaxy
+and its alerts remain available. **Esc on the galaxy** clears the sector highlight and selection.
+At middle zoom, **V** opens the editor on the selected sector. Region outlines show group membership,
+not exclusive borders: a world can belong to several sectors. This grouping does not declare
+dependency relationships; labelled hyperlanes remain on the backlog.
+
+Available sector members stay charted even without ships. Remove a dormant world's memberships
+in `V` before forgetting it with `X`. Dissolving a sector removes only the group: folders, agents,
+missions and anomalies remain intact.
+
+Sectors are saved in `$XDG_STATE_HOME/empire/sectors.json` (normally
+`~/.local/state/empire/sectors.json`). Galaxy windows refresh the shared record and use locked,
+atomic updates. A corrupt or unreadable record is preserved and reported in the editor and
+situation log. Sector names are unique ignoring case and contain 1–48 characters.
+
+## Anomalies
+
+Press **`A`** in the galaxy to browse persistent discoveries across worlds. A **⟡ count** beside
+planet and system names marks active findings; a planet's count includes its moons, and the
+zoomed-out system overview counts each finding once. World and system cards also show the count.
+Commander includes open Git, moon and reported findings; failing PR checks retain their existing
+Commander entry.
+
+The first survey sources are **your PRs with failing checks**, **unresolved Git merge conflicts**,
+and **charted worktree moons with no running agent**. An uncrewed moon is an observation, not a
+claim that its work is abandoned. Ordinary dirty files and unpushed commits are not anomalies.
+Surveys run while the galaxy is open; findings and their history survive closing it.
+
+The browser lists each finding's status, source and world. The detail pane includes its full world
+and system paths, evidence, discovery/observation ages, and lifecycle history.
+
+| key | action |
+| --- | --- |
+| `↑↓` / `j k` / wheel | select a finding (`Home/End` jump to first/last) |
+| `v` | cycle active, all, open, investigating, deferred, dismissed and resolved |
+| `f` | cycle all kinds, CI, Git, Moon and Report |
+| `w` / `s` | toggle the selected finding's world family / star system filter |
+| `/` | search title, evidence, location or finding number; Enter/Esc ends editing |
+| `x` | reset filters to all active findings |
+| `PgUp/PgDn` | scroll the selected finding's evidence and history |
+| `⏎` / click selected row | locate its world on the galaxy |
+| `t` | draft a read-only scout investigation; review and edit before sending |
+| `d` / `i` | defer / dismiss |
+| `r` / `o` | mark resolved / reopen |
+| `Esc` | return to the galaxy |
+
+An investigation defaults to a new **scout**, preserving the species' supported read-only launch
+settings. You can choose another destination in the ordinary mission composer. Keep the opening
+`[anomaly #N]` tag to link the submitted mission to its finding. Cancelling the draft changes
+nothing; a submitted mission is linked when the daemon reports it. A finished agent turn is
+recorded in the history and **does not resolve the finding**. Review the evidence before resolving
+it or commissioning a fix through an ordinary mission.
+
+Repeated surveys update the same finding. A confirmed clear Git status, green PR checks, or a ship
+returning to a moon resolves the corresponding observation. Recurrence reopens it; **dismissals
+remain dismissed until you reopen them**. Deferred findings stay out of active counts until
+reopened or a confirmed recovery/recurrence changes them. Missing PRs, unavailable folders,
+offline GitHub and stale evidence do not prove recovery.
+
+Explicit findings can be recorded without starting or contacting the daemon:
+
+```sh
+empire anomaly /path/to/world 'Instructions disagree with the code' \
+  'AGENTS.md says npm; package.json declares pnpm. Needs investigation.' 'scout report'
+```
+
+Quote each argument; the final source label is optional. Reports are labelled **not independently
+verified**. The same world and title update one reported finding. A read-only scout can provide its
+findings in comms for you to record; this command does not bypass its filesystem permissions.
+Reports appear on the next galaxy refresh. Use Enter to chart and locate a reported folder that
+is not on the map yet.
+
+Records live in `$XDG_STATE_HOME/empire/anomalies.json` (normally
+`~/.local/state/empire/anomalies.json`). Updates are locked and atomically replaced, so simultaneous
+reports and galaxy windows preserve each other's changes. An unreadable or corrupt store is left
+untouched and reported in the browser and situation log.
 
 ## Needs and quick actions
 
@@ -366,6 +484,13 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
 - `game.rs`: galaxy model, camera, input, colonize/deploy/decommission flows.
 - `draw.rs`: procedural dithered planets, ships, outliner, situation log, dialogs, comms.
 - `structure.rs`: structures (AI resources) a world has built, and their construction orders.
+- `anomaly.rs`: persistent findings, lifecycle history, filters and explicit reports.
+- `sector.rs`: named groups of worlds; `state.rs`: shared locked, atomic local storage.
 - `survey.rs`: background git survey of every world (status, size, worktrees, PRs via `gh`) and
   Claude/Codex usage.
 - `gfx.rs` / `octant.rs`: the octant renderer from mission-control. `sound.rs`: robot cues.
+
+## Development backlog
+
+[BACKLOG.md](BACKLOG.md) keeps the agreed direction for anomalies, sectors, campaigns, ship refits,
+the chronicle and soundtracks.

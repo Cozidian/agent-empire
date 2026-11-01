@@ -50,6 +50,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     if matches!(app.mode, Mode::Galaxy) {
         card(fb, app, w, l, t);
         transmission(fb, app, l, t);
+        sector_banner(fb, app, l);
     }
     footer(fb, app, w, l, sound);
     if let Some((m, t0)) = &app.toast {
@@ -62,6 +63,8 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     }
     match &app.mode {
         Mode::Commander => commander(fb, app, w, l),
+        Mode::Sectors => sectors(fb, app, w, l, t),
+        Mode::Anomalies { id, typing } => anomalies(fb, app, l, *id, *typing),
         Mode::Trade { sel } => trade_overview(fb, app, w, l, *sel, t),
         Mode::Situation { id, typing } => situation(fb, app, w, l, *id, *typing, t),
         Mode::Colonize(c) => colonize(fb, app, c, l, t),
@@ -82,7 +85,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     if !app.online {
         let m = format!(" ○ daemon offline · {} · reconnecting… ", app.err);
         fb.text(2, 2, &m, v3(1.0, 0.4, 0.3));
-    } else if app.loaded && app.agents.is_empty() && matches!(app.mode, Mode::Galaxy) {
+    } else if app.loaded && w.planets.is_empty() && matches!(app.mode, Mode::Galaxy) {
         let cw = l.cols - l.pw;
         let lines = ["THE GALAXY IS UNCHARTED", "", "press  n  to colonize your first world"];
         for (i, s) in lines.iter().enumerate() {
@@ -393,6 +396,7 @@ fn galaxy_overview(fb: &mut Fb, app: &App, w: &World, l: &Lay) {
         // One small star and a steady status ring, independent of fleet size.
         orb(fb, x, y, 1.8, s.star * 0.8);
         if waiting || done { circle(fb, x, y, 4.5, col * 0.28); }
+        if app.focused_sector().is_some_and(|g| s.planets.iter().any(|&i| app.sector_has(g, &w.planets[i].key))) { ellipse(fb, x, y, 7.0, 5.0, v3(0.3, 0.45, 0.7)); }
         if selected.is_some_and(|picked| picked.key == s.key) { overview_reticle(fb, x, y); }
     }
     if let Some(p) = w.station {
@@ -434,11 +438,14 @@ pub fn overview_labels(app: &App, w: &World, l: &Lay) -> Vec<OverviewLabel> {
         let working = fleet.iter().filter(|a| a.status == Status::Working).count();
         let conflicts = fleet.iter().any(|a| !a.war.is_empty());
         let picked = selected.is_some_and(|picked| picked.key == s.key);
+        let sector = app.focused_sector().is_some_and(|g| s.planets.iter().any(|&i| app.sector_has(g, &w.planets[i].key)));
         let mut lines = vec![
-            (s.name.to_uppercase(), if picked { TEXT } else { s.star * 0.9 }),
+            (format!("{}{}", if sector { "▱ " } else { "" }, s.name.to_uppercase()), if picked { TEXT } else if sector { v3(0.65, 0.8, 1.0) } else { s.star * 0.9 }),
             (format!("{} world{} · {} ship{}", s.planets.len(), if s.planets.len() == 1 { "" } else { "s" }, fleet.len(), if fleet.len() == 1 { "" } else { "s" }), DIM),
         ];
         let mut status = Vec::new();
+        let anomalies = app.anomaly_count(&s.key, true);
+        if anomalies > 0 { status.push(format!("⟡{anomalies} anomalies")); }
         if waiting > 0 { status.push(format!("{waiting} waiting")); }
         if conflicts { status.push("conflict".into()); }
         if finished > 0 { status.push(format!("{finished} finished")); }
@@ -453,6 +460,12 @@ pub fn overview_labels(app: &App, w: &World, l: &Lay) -> Vec<OverviewLabel> {
         if fails > 0 { lines.push((format!("{fails} failing"), ci_color("fail"))); }
         entries.push((app.sel != Some(Sel::GitHub), fails == 0, Sel::GitHub, pos, lines));
     }
+    place_map_labels(app, l, entries)
+}
+
+type MapEntry = (bool, bool, Sel, (f32, f32), Vec<(String, V3)>);
+
+fn place_map_labels(app: &App, l: &Lay, mut entries: Vec<MapEntry>) -> Vec<OverviewLabel> {
     entries.sort_by_key(|e| (e.0, e.1));
     let cw = l.cols - l.pw;
     let overlaps = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3;
@@ -484,7 +497,64 @@ pub fn overview_labels(app: &App, w: &World, l: &Lay) -> Vec<OverviewLabel> {
     labels
 }
 
+fn sector_color(id: u64) -> V3 {
+    let colors = [v3(0.4, 0.8, 0.75), v3(0.73, 0.58, 0.9), v3(0.85, 0.73, 0.4), v3(0.48, 0.65, 0.95), v3(0.85, 0.5, 0.65)];
+    colors[id.wrapping_sub(1) as usize % colors.len()]
+}
+
+/// Sector names lead; world and system labels use the room left around them.
+pub fn sector_labels(app: &App, w: &World, l: &Lay) -> Vec<OverviewLabel> {
+    let mut entries = Vec::new();
+    let regions = app.sector_regions(w);
+    for r in &regions {
+        let Some(g) = app.sectors.sectors.iter().find(|g| g.id == r.id) else { continue };
+        let target = Sel::Sector(r.id, r.system.clone());
+        let across = regions.iter().filter(|p| p.id == r.id).count();
+        let count = format!("{} world{}", r.worlds.len(), if r.worlds.len() == 1 { "" } else { "s" });
+        let detail = if across > 1 { format!("{count} here · {across} systems") } else { count };
+        entries.push((app.sel != Some(target.clone()), false, target, (r.center().0, r.bounds.3), vec![
+            (format!("▱ {}", g.name.to_uppercase()), sector_color(r.id)), (detail, DIM),
+        ]));
+    }
+    for s in &w.systems {
+        entries.push((true, true, Sel::Sys(s.key.clone()), s.wpos, vec![(s.name.to_uppercase(), s.star * 0.65)]));
+    }
+    for p in w.planets.iter().filter(|p| p.host.is_none()) {
+        entries.push((true, true, Sel::Planet(p.key.clone()), p.wpos, vec![(p.name.clone(), DIM)]));
+    }
+    if let Some(pos) = w.station { entries.push((true, true, Sel::GitHub, pos, vec![("GITHUB".into(), DIM)])); }
+    place_map_labels(app, l, entries)
+}
+
+fn galaxy_sectors(fb: &mut Fb, app: &App, w: &World, l: &Lay) {
+    let scr = |p| l.to_screen(&app.cam, p);
+    for r in app.sector_regions(w) {
+        let col = sector_color(r.id);
+        let picked = app.sel == Some(Sel::Sector(r.id, r.system.clone())) || app.sector_focus == Some(r.id);
+        let (a, b) = (scr((r.bounds.0, r.bounds.1)), scr((r.bounds.2, r.bounds.3)));
+        for y in (a.1.floor() as i32).max(l.vy0 as i32)..=(b.1.ceil() as i32).min((l.vy0 + l.vh) as i32 - 1) {
+            for x in (a.0.floor() as i32).max(0)..=(b.0.ceil() as i32).min(l.vw as i32 - 1) {
+                let p = ((x as f32 - l.vw * 0.5) / app.cam.z + app.cam.x, (y as f32 - l.vy0 - l.vh * 0.5) / app.cam.z + app.cam.y);
+                if r.contains(p) { fb.add(x, y, col * if picked { 0.045 } else { 0.025 }); }
+            }
+        }
+        for i in 0..r.hull.len() {
+            let (a, b) = (scr(r.hull[i]), scr(r.hull[(i + 1) % r.hull.len()]));
+            let edge = col * if picked { 0.55 } else { 0.26 };
+            fb.line(a.0, a.1, b.0, b.1, edge, edge);
+        }
+    }
+    galaxy_overview(fb, app, w, l);
+    for p in w.planets.iter().filter(|p| p.host.is_none()) {
+        let (x, y) = scr(p.wpos);
+        orb(fb, x, y, 2.0, planet_color(p) * 0.75);
+        if app.anomaly_count(&p.key, false) > 0 { circle(fb, x, y, 4.0, v3(0.45, 0.32, 0.12)); }
+        if app.sel == Some(Sel::Planet(p.key.clone())) { overview_reticle(fb, x, y); }
+    }
+}
+
 fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
+    if app.sector_map() { galaxy_sectors(fb, app, w, l); return; }
     if app.cam.z < OVERVIEW_ZOOM {
         galaxy_overview(fb, app, w, l);
         return;
@@ -575,6 +645,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         rings(false, fb);
         sphere(fb, px, py, r, p, (lx / ll, ly / ll), t);
         spires(fb, app, p, (px, py), r, t);
+        if app.focused_sector().is_some_and(|s| app.sector_has(s, &p.key)) { ellipse(fb, px, py, r + 7.0, r + 5.0, v3(0.3, 0.45, 0.7)); }
         rings(true, fb);
         let live = || p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none());
         if live().any(|a| a.status == Status::Blocked) {
@@ -625,7 +696,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         Some(Sel::Agent(id)) => app.agent(*id).map(|a| (a.wpos, 6.0 * z.clamp(0.7, 2.2) + 2.0)),
         Some(Sel::Planet(k)) => w.planet(k).map(|p| (p.wpos, (p.r * z).max(2.5) + 6.0)),
         Some(Sel::Sys(k)) => w.systems.iter().find(|s| &s.key == k).map(|s| (s.wpos, (8.0 * z).max(2.2) + 8.0)),
-        None => None,
+        Some(Sel::Sector(_, _)) | None => None,
     };
     if let Some((p, rr)) = target {
         let (x, y) = scr(p);
@@ -856,8 +927,8 @@ fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usiz
 }
 
 fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
-    if app.cam.z < OVERVIEW_ZOOM {
-        for label in overview_labels(app, w, l) {
+    if app.cam.z < OVERVIEW_ZOOM || app.sector_map() {
+        for label in if app.sector_map() { sector_labels(app, w, l) } else { overview_labels(app, w, l) } {
             for (i, (text, col)) in label.lines.iter().enumerate() {
                 fb.text(label.col, label.row + i as i32, text, *col);
             }
@@ -870,7 +941,8 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     let in_view = |c: i32, r: i32| c >= 0 && c < cw && r >= 1 && r < l.rows - 1;
     for s in &w.systems {
         let (sx, sy) = l.to_screen(cam, s.wpos);
-        let name = s.name.to_uppercase();
+        let n = app.anomaly_count(&s.key, true);
+        let name = format!("{}{}", s.name.to_uppercase(), if n > 0 { format!(" ⟡{n}") } else { String::new() });
         let len = name.chars().count() as i32;
         let (c, r) = ((sx / 2.0) as i32 - len / 2, ((sy - (8.0 * z).max(2.2) - 6.0) / 4.0) as i32);
         if in_view(c, r) && in_view(c + len - 1, r) {
@@ -893,12 +965,13 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         }
         let (px, py) = l.to_screen(cam, p.wpos);
         let parts = tally(p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none()), t);
-        let len = p.name.chars().count() as i32 + parts.iter().map(|(s, _)| s.chars().count() as i32 + 1).sum::<i32>();
+        let anomalies = app.anomaly_count(&p.key, false);
+        let name = format!("{}{}{}", if p.host.is_some() { "☾ " } else { "" }, p.name, if anomalies > 0 { format!(" ⟡{anomalies}") } else { String::new() });
+        let len = name.chars().count() as i32 + parts.iter().map(|(s, _)| s.chars().count() as i32 + 1).sum::<i32>();
         let (mut c, r) = ((px / 2.0) as i32 - len / 2, ((py + (p.r * z).max(2.5) + 7.0) / 4.0) as i32);
         if !in_view(c, r) || !in_view(c + len, r) {
             continue;
         }
-        let name = if p.host.is_some() { format!("☾ {}", p.name) } else { p.name.clone() };
         c = seg(fb, c, r, &name, len + 2, if selected { s3(1.0) } else { TEXT * (1.0 - 0.65 * p.fog) }, None);
         for (s, col) in parts {
             c = seg(fb, c + 1, r, &s, 8, col, None);
@@ -940,7 +1013,7 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
 fn top_bar(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     fb.panel(0, 0, l.cols, 1, BAR);
-    let title = " ◆ AGENT EMPIRE ";
+    let title = if app.sector_map() { " ◆ AGENT EMPIRE · SECTORS " } else { " ◆ AGENT EMPIRE " };
     for (k, ch) in title.chars().enumerate() {
         fb.put_bg(k as i32, 0, ch, hsv(0.52 + k as f32 * 0.015 - t * 0.04, 0.45, 1.0), Some(BAR));
     }
@@ -1119,6 +1192,8 @@ fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
         }
         rows.push(("development", row));
     }
+    let groups: Vec<_> = app.sectors.sectors.iter().filter(|s| app.sector_has(s, &p.key)).map(|s| s.name.as_str()).collect();
+    if !groups.is_empty() { rows.push(("sectors", vec![(format!("{} · V", groups.join(", ")), v3(0.65, 0.8, 1.0))])); }
     let built = app.survey.worlds.get(&p.key).map(|g| g.structures.clone()).unwrap_or_default();
     let mut st: Vec<(String, V3)> = built.iter().map(|b| (format!("{} {}{} ", b.kind.glyph(), b.kind.what(), if b.count > 1 { format!(" ×{}", b.count) } else { String::new() }), b.kind.color())).collect();
     st.push((if built.is_empty() { "no structures yet · B build".into() } else { format!("{} plots free · B", KINDS.len() - built.len()) }, DIM));
@@ -1138,6 +1213,8 @@ fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
         rows.push(("context", ctx));
     }
     fleet_row(&mut rows, app, &agents);
+    let anomalies = app.anomaly_count(&p.key, false);
+    if anomalies > 0 { rows.push(("anomalies", vec![(format!("⟡ {anomalies} active · A inspect"), v3(0.8, 0.65, 1.0))])); }
     let needs = app.needs(&p.key);
     for (i, n) in needs.iter().take(4).enumerate() {
         let key = if n.act.is_some() { format!("{} ", needs.iter().take(i + 1).filter(|m| m.act.is_some()).count()) } else { "  ".into() };
@@ -1181,6 +1258,8 @@ fn system_rows(app: &App, w: &World, s: &System, t: f32) -> Rows {
     let planets: Vec<&Planet> = s.planets.iter().map(|&i| &w.planets[i]).collect();
     let agents: Vec<&Agent> = planets.iter().flat_map(|p| p.agents.iter().map(|&i| &app.agents[i])).filter(|a| a.dying.is_none()).collect();
     rows.push(("worlds", vec![(format!("{} colonized", planets.len()), TEXT)]));
+    let anomalies = app.anomaly_count(&s.key, true);
+    if anomalies > 0 { rows.push(("anomalies", vec![(format!("⟡ {anomalies} active · A inspect"), v3(0.8, 0.65, 1.0))])); }
     if let Some(cap) = planets.iter().max_by_key(|p| p.agents.len()) {
         rows.push(("capital", vec![(cap.name.clone(), planet_color(cap))]));
     }
@@ -1283,6 +1362,13 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         && let Some(s) = w.systems.iter().find(|s| &s.key == k)
     {
         (format!("✶ {} SYSTEM", s.name.to_uppercase()), tilde(&s.key), s.star, system_rows(app, w, s, t))
+    } else if let Some(Sel::Sector(id, system)) = &app.sel
+        && let Some(g) = app.sectors.sectors.iter().find(|g| g.id == *id)
+    {
+        let stats = app.sector_stats(g);
+        (format!("▱ {} SECTOR", g.name.to_uppercase()), format!("{} · {} worlds across the galaxy", base_name(system), stats.worlds), sector_color(*id), vec![
+            ("fleet", vec![(stats.activity(), TEXT)]), ("work", vec![(stats.work(), DIM)]), ("browse", vec![("⏎ zoom into these worlds · V manage sectors".into(), TEXT)]),
+        ])
     } else if app.sel == Some(Sel::GitHub) {
         let projects = app.trade_rows(w).iter().filter(|r| r.pr.is_none()).count();
         let rows = vec![
@@ -1377,10 +1463,11 @@ fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
         Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ land · t mission · L missions · D dock · e deploy here · ",
         Some(Sel::Planet(_)) => "⏎ land · r needs · t mission · B build · L missions · b fleet · u moon · e deploy · ",
         Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
+        Some(Sel::Sector(_, _)) => "⏎ zoom into sector · ",
         Some(Sel::GitHub) => "⏎ projects and pull requests · ",
         None => "",
     };
-    let s = format!("{}{music}· {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
+    let s = format!("{}{music}· V sectors · A anomalies · {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1460,6 +1547,9 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 let n = path.chars().count();
                 let shown = if n > room { format!("…{}", path.chars().skip(n + 1 - room).collect::<String>()) } else { path };
                 seg(fb, x, row, &shown, room as i32, DIM * 0.7, Some(bg));
+            }
+            Sel::Sector(id, _) => {
+                if let Some(g) = app.sectors.sectors.iter().find(|g| g.id == *id) { seg(fb, c0 + 1, row, &format!("▱ {}", g.name), inner as i32 - 1, sector_color(*id), Some(bg)); }
             }
             Sel::Planet(key) => {
                 let Some(p) = w.planet(key) else { continue };
@@ -1631,7 +1721,7 @@ fn fleet_order(fb: &mut Fb, app: &App, w: &World, target: &Sel, text: &Line, l: 
     let name = match target {
         Sel::Sys(k) => format!("{} SYSTEM", base_name(k).to_uppercase()),
         Sel::Planet(k) => base_name(k).to_uppercase(),
-        Sel::Agent(_) | Sel::GitHub => String::new(),
+        Sel::Agent(_) | Sel::GitHub | Sel::Sector(_, _) => String::new(),
     };
     frame_box(fb, x, y, bw, h, &format!("◆ FLEET ORDER · {name}"), accent);
     let ships = app.fleet(w, target);
@@ -2237,6 +2327,8 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("ON A PLANET", "↑↓ select · Tab pane · B build · PgUp/Dn read · Esc leave"),
         ("⇥", "next agent that needs you"),
         ("C", "commander: your attention queue across all systems"),
+        ("A", "anomalies: findings, investigations and history across systems"),
+        ("V", "sectors: group worlds, inspect activity and focus the map"),
         ("n", "colonize: launch an agent in a folder (new or existing)"),
         ("e", "deploy another agent to the selected world"),
         ("x", "decommission the selected agent"),
@@ -2249,7 +2341,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("P", "give an agent priority in a border conflict"),
         ("X", "forget a dormant world"),
         ("1-9", "answer the incoming transmission"),
-        ("wasd / drag", "pan        ± / wheel  zoom"),
+        ("wasd / drag", "pan        ± / wheel  systems → sectors → planets"),
         ("z / f", "fit galaxy / focus selection"),
         ("o", "outliner (wheel scrolls)    m  mute alerts    M  mute music"),
         ("q", "leave (agents keep running in the daemon)"),
@@ -2434,6 +2526,7 @@ fn commander(fb: &mut Fb, app: &mut App, world: &World, l: &Lay) {
         }
         let action = match item.target {
             AttentionTarget::Agent(_) => "⏎ comms / answer",
+            AttentionTarget::Anomaly(_) => "⏎ inspect anomaly",
             AttentionTarget::Needs => "⏎ world actions",
             AttentionTarget::Deploy => "⏎ deploy agent",
             AttentionTarget::Pr(_) => "⏎ open PR · t mission",
@@ -2443,6 +2536,150 @@ fn commander(fb: &mut Fb, app: &mut App, world: &World, l: &Lay) {
     } else {
         seg(fb, x + 3, y + h - 2, "Esc back to galaxy", w - 6, DIM, Some(BOX));
     }
+}
+
+// ─────────────────────────────── sectors ───────────────────────────────
+
+fn sector_layout(l: &Lay) -> (i32, i32, i32, i32, i32, usize) {
+    let (x, y, w, h) = centered(l, 120, l.rows - 2);
+    (x, y, w, h, (w / 3).clamp(18, 30), (h - 12).max(1) as usize)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sector_hit(l: &Lay, sectors: usize, worlds: usize, si: usize, wi: usize, col: i32, row: i32) -> Option<(bool, usize)> {
+    let (x, y, w, _, left, room) = sector_layout(l);
+    if col < x + 1 || col >= x + w - 1 || row < y + 6 || row >= y + 6 + room as i32 { return None; }
+    let pane = col >= x + left;
+    let off = (if pane { wi } else { si } + 1).saturating_sub(room);
+    let i = off + (row - y - 6) as usize;
+    (i < if pane { worlds } else { sectors }).then_some((pane, i))
+}
+
+fn sectors(fb: &mut Fb, app: &App, world: &World, l: &Lay, t: f32) {
+    let (x, y, w, h, left, room) = sector_layout(l);
+    let accent = v3(0.65, 0.8, 1.0);
+    let view = &app.sector_view;
+    let chosen = app.selected_sector();
+    let si = chosen.and_then(|s| app.sectors.sectors.iter().position(|v| v.id == s.id)).unwrap_or(0);
+    let worlds = app.sector_worlds(world);
+    let wi = worlds.iter().position(|p| p == &view.world).unwrap_or(0);
+    frame_box(fb, x, y, w, h, "▱ SECTORS", accent);
+    if let Some(s) = chosen {
+        let stats = app.sector_stats(s);
+        seg(fb, x + 2, y + 1, &format!("{} · {} worlds (moons included in activity)", s.name, stats.worlds), w - 4, TEXT, Some(BOX));
+        seg(fb, x + 2, y + 2, &stats.activity(), w - 4, TEXT, Some(BOX));
+        seg(fb, x + 2, y + 3, &stats.work(), w - 4, DIM, Some(BOX));
+    } else {
+        seg(fb, x + 2, y + 1, "Group worlds around a product, wherever their folders live.", w - 4, TEXT, Some(BOX));
+        seg(fb, x + 2, y + 2, "n creates a sector. Then select its worlds and press Space.", w - 4, DIM, Some(BOX));
+    }
+    seg(fb, x + 2, y + 5, if view.worlds { "Sectors" } else { "▸ Sectors" }, left - 3, accent, Some(BOX));
+    seg(fb, x + left + 2, y + 5, if view.worlds { "▸ Worlds · [+] member" } else { "Worlds · [+] member" }, w - left - 4, accent, Some(BOX));
+    for r in y + 5..y + h - 6 { fb.put_bg(x + left, r, '│', DIM * 0.3, Some(BOX)); }
+    let off = (si + 1).saturating_sub(room);
+    for (i, s) in app.sectors.sectors.iter().enumerate().skip(off).take(room) {
+        let r = y + 6 + (i - off) as i32;
+        let bg = if i == si { SELBG } else { BOX };
+        fb.panel(x + 1, r, left - 1, 1, bg);
+        seg(fb, x + 2, r, &s.name, left - 3, if i == si { TEXT } else { DIM }, Some(bg));
+    }
+    let off = (wi + 1).saturating_sub(room);
+    for (i, path) in worlds.iter().enumerate().skip(off).take(room) {
+        let r = y + 6 + (i - off) as i32;
+        let bg = if view.worlds && i == wi { SELBG } else { BOX };
+        let member = chosen.is_some_and(|s| s.contains(path, None));
+        let missing = world.planet(path).is_none();
+        let text = format!("[{}] {}{}", if member { "+" } else { " " }, tilde(path), if missing { " (unavailable)" } else { "" });
+        fb.panel(x + left + 1, r, w - left - 2, 1, bg);
+        seg(fb, x + left + 2, r, &text, w - left - 4, if member { TEXT } else { DIM }, Some(bg));
+    }
+    if worlds.is_empty() { seg(fb, x + left + 2, y + 6, "p adds an existing folder", w - left - 4, DIM, Some(BOX)); }
+    if let Some(path) = worlds.get(wi) { seg(fb, x + 2, y + h - 6, &format!("World: {}", tilde(path)), w - 4, DIM, Some(BOX)); }
+    if let Some(edit) = view.edit {
+        if matches!(edit, SectorEdit::Remove) {
+            let name = chosen.map_or("this sector", |s| s.name.as_str());
+            seg(fb, x + 2, y + h - 5, &format!("Dissolve {name}? y confirms. Folders and agents stay in place."), w - 4, v3(1.0, 0.7, 0.4), Some(BOX));
+        } else {
+            let label = if matches!(edit, SectorEdit::Path) { "Folder: " } else { "Name: " };
+            let end = seg(fb, x + 2, y + h - 5, label, 8, TEXT, Some(BOX));
+            field(fb, end, y + h - 5, (x + w - 2 - end).max(2), &view.text, accent, t);
+        }
+    } else {
+        seg(fb, x + 2, y + h - 5, "Membership changes grouping only. Worlds can belong to several sectors.", w - 4, DIM, Some(BOX));
+    }
+    let error = if app.sector_error.is_empty() { &view.error } else { &app.sector_error };
+    seg(fb, x + 2, y + h - 4, error, w - 4, v3(1.0, 0.65, 0.4), Some(BOX));
+    seg(fb, x + 2, y + h - 3, if matches!(view.edit, Some(SectorEdit::Remove)) { "y dissolve · any other key cancels" } else if view.edit.is_some() { "Enter save · Esc cancel" } else { "n new · r rename · x dissolve · p add folder · f map · a anomalies" }, w - 4, accent, Some(BOX));
+    seg(fb, x + 2, y + h - 2, "Tab pane · ↑↓ / wheel select · Space membership · Enter focus · Esc back", w - 4, DIM, Some(BOX));
+}
+
+fn sector_banner(fb: &mut Fb, app: &App, l: &Lay) {
+    if let Some(s) = app.focused_sector() {
+        let stats = app.sector_stats(s);
+        let width = l.cols - l.pw - 4;
+        seg(fb, 2, 1, &format!("▱ {} · {} worlds · {}", s.name, stats.worlds, stats.activity()), width, v3(0.65, 0.8, 1.0), Some(BOX));
+        seg(fb, 2, 2, &format!("{} · V sectors · Esc clear", stats.work()), width, DIM, Some(BOX));
+    }
+}
+
+// ─────────────────────────────── anomalies ───────────────────────────────
+
+fn anomaly_layout(l: &Lay, sel: usize) -> (i32, i32, i32, i32, usize, usize, usize) {
+    let (x, y, w, h) = centered(l, 120, l.rows - 2);
+    let detail = ((h - 10) / 2).max(1) as usize;
+    let room = (h - detail as i32 - 9).max(1) as usize;
+    (x, y, w, h, room, (sel + 1).saturating_sub(room), detail)
+}
+
+pub fn anomaly_hit(l: &Lay, count: usize, sel: usize, col: i32, row: i32) -> Option<usize> {
+    let (x, y, w, _, room, off, _) = anomaly_layout(l, sel);
+    if col < x + 2 || col >= x + w - 2 || row < y + 5 || row >= y + 5 + room as i32 { return None; }
+    let i = off + (row - y - 5) as usize;
+    (i < count).then_some(i)
+}
+
+fn anomalies(fb: &mut Fb, app: &mut App, l: &Lay, id: u64, typing: bool) {
+    let rows = app.anomaly_rows();
+    let sel = rows.iter().position(|f| f.id == id).unwrap_or(0);
+    let (x, y, w, h, room, off, detail_h) = anomaly_layout(l, sel);
+    let accent = v3(0.8, 0.65, 1.0);
+    frame_box(fb, x, y, w, h, &format!("⟡ ANOMALIES · {} findings", rows.len()), accent);
+    let filter = &app.anomaly_filter;
+    let place = filter.world.as_deref().or(filter.system.as_deref()).map(tilde).unwrap_or_else(|| "all systems".into());
+    let place = filter.sector.as_ref().map_or_else(|| place.clone(), |(name, _)| format!("{name} sector · {place}"));
+    let chips = format!("v {} · f {} · w world / s system: {place}", crate::anomaly::STATES[filter.state], crate::anomaly::KINDS[filter.kind]);
+    seg(fb, x + 2, y + 1, &chips, w - 4, DIM, Some(BOX));
+    let search = if app.anomaly_error.is_empty() { format!("/ Search: {}{}", filter.query, if typing { "▏" } else { "" }) } else { app.anomaly_error.clone() };
+    seg(fb, x + 2, y + 2, &search, w - 4, if typing { TEXT } else { DIM }, Some(BOX));
+    seg(fb, x + 2, y + 3, "Status · source · world · finding", w - 4, DIM, Some(BOX));
+    if rows.is_empty() {
+        seg(fb, x + 2, y + 5, "No matching anomalies. x clears filters; v includes history.", w - 4, TEXT, Some(BOX));
+    }
+    for (i, f) in rows.iter().enumerate().skip(off).take(room) {
+        let r = y + 5 + (i - off) as i32;
+        let bg = if i == sel { SELBG } else { BOX };
+        fb.panel(x + 1, r, w - 2, 1, bg);
+        let text = format!("{} · {} · {} · #{} {}", f.state.label(), f.kind, base_name(&f.world), f.id, f.title);
+        seg(fb, x + 2, r, &text, w - 4, if f.state.active() { TEXT } else { DIM }, Some(bg));
+    }
+    let dy = y + 6 + room as i32;
+    let mut detail = Vec::new();
+    if let Some(f) = rows.get(sel) {
+        let mut lines = vec![format!("#{} {}", f.id, f.title), format!("World: {}", tilde(&f.world)), format!("System: {} · source: {}", tilde(&f.system), f.kind),
+            format!("Discovered {} ago · last observed {} ago", ago((survey::now() - f.first).max(0) as f32), ago((survey::now() - f.last).max(0) as f32))];
+        lines.extend(f.evidence.lines().map(String::from));
+        lines.push("History (newest first):".into());
+        let mut history: Vec<_> = f.history.iter().collect();
+        history.sort_by_key(|e| std::cmp::Reverse(e.at));
+        lines.extend(history.iter().map(|e| format!("{} ago · {}", ago((survey::now() - e.at).max(0) as f32), e.note)));
+        for line in lines { detail.extend(wrap(&line, (w - 4).max(1) as usize)); }
+    }
+    app.anomaly_detail = app.anomaly_detail.min(detail.len().saturating_sub(detail_h));
+    for (i, line) in detail.iter().skip(app.anomaly_detail).take(detail_h).enumerate() {
+        seg(fb, x + 2, dy + i as i32, line, w - 4, TEXT, Some(BOX));
+    }
+    seg(fb, x + 2, y + h - 3, "⏎ locate · t investigate · d defer · i dismiss · r resolve · o reopen", w - 4, accent, Some(BOX));
+    seg(fb, x + 2, y + h - 2, "↑↓ select · PgUp/Dn evidence/history · / search · x reset · Esc galaxy", w - 4, DIM, Some(BOX));
 }
 
 // ─────────────────────────────── situation log ───────────────────────────────

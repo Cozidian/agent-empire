@@ -1,3 +1,4 @@
+mod anomaly;
 mod client;
 mod daemon;
 mod draw;
@@ -7,6 +8,8 @@ mod advisor;
 mod octant;
 mod proto;
 mod role;
+mod sector;
+mod state;
 mod sound;
 mod structure;
 mod screenshots;
@@ -24,11 +27,17 @@ const HELP: &str = "empire — a galaxy of coding agents
   empire upgrade   swap a running daemon for this build, keeping every agent
                    (the galaxy does this by itself when it starts)
   empire stop      shut down the daemon and every agent in it (they won't come back)
-  empire sounds    play every sound cue once";
+  empire sounds    play every sound cue once
+  empire anomaly WORLD TITLE EVIDENCE [SOURCE]
+                   record a finding without starting the daemon";
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("anomaly") => {
+            if args.len() < 4 || args.len() > 5 { return Err(io::Error::other("usage: empire anomaly WORLD TITLE EVIDENCE [SOURCE]")); }
+            anomaly::report(&args[1], &args[2], &args[3], args.get(4).map_or("manual report", String::as_str))
+        }
         Some("daemon") => daemon::run(),
         Some("hook") => {
             daemon::hook(args.get(1).map_or("", String::as_str));
