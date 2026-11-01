@@ -25,11 +25,16 @@ Agreed direction: Empire coordinates projects, discoveries and outcomes. Each ag
 - Verified: 97 tests passed (1 live API test ignored), release build, and an isolated terminal smoke test creating a three-world sector and reopening it.
 - Sector zoom verified: 101 tests passed (1 live API test ignored), release build, and a rendered fixture preview; covers local/cross-system regions, picking and Enter transitions.
 
-## Hyperlanes — next
-- Explicit, labelled relationships between worlds before automatic dependency discovery.
-- Selectable map overlays for dependencies, anomalies, campaigns and eventually release readiness; avoid showing every relationship at once.
+## Hyperlanes — implemented (2026-11-01)
 
-## Campaigns
+- `H` editor: create, edit and remove named, directional relationships between worlds.
+- `h` dependency overlay: curved arrows, clickable labels and connections, endpoint inspection and map focus.
+- Connections can cross sectors and systems; moons use their host when creating a link.
+- Locked, atomic persistence; unavailable endpoints stay recorded and available folders stay charted.
+- Verified: 110 tests passed (1 live API test ignored), release build, rendered map/editor previews, and an isolated terminal test of creation, rename, overlay, restart persistence and removal.
+- Future: automatic discovery, plus optional overlays for anomalies, campaigns and release readiness.
+
+## Campaigns — next
 
 - Shared objective, linked missions, acceptance criteria and handoff evidence across worlds.
 - Begin with manual handoffs; allow one agent to carry an entire campaign.
