@@ -39,6 +39,9 @@ pub enum Cmd {
     Moon { cwd: String, branch: String, kind: String },
     Dock(String),
     Priority(u32),
+    /// Refit a deployed ship with a design's role and outfit, once the player confirmed.
+    Refit { id: u32, role: String, spec: crate::proto::ShipSpec },
+    CancelRefit(u32),
 }
 
 pub struct Client {
@@ -159,6 +162,8 @@ impl Client {
                     Cmd::Moon { cwd, branch, kind } => (Req::Moon { cwd, branch: branch.clone(), kind: kind.clone() }, Some((kind, format!("moon {branch}")))),
                     Cmd::Dock(cwd) => (Req::Dock { cwd }, None),
                     Cmd::Priority(id) => (Req::Priority { id }, None),
+                    Cmd::Refit { id, role, spec } => (Req::Refit { id, role, spec, confirm: true }, None),
+                    Cmd::CancelRefit(id) => (Req::CancelRefit { id }, None),
                 };
                 let reply = c.call(&req);
                 if draft {

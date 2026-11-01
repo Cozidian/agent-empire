@@ -124,7 +124,10 @@ impl Pty {
     }
 
     fn kill(&self) {
-        unsafe { libc::kill(self.pid, libc::SIGHUP) };
+        // pid 0 would hang up our whole process group
+        if self.pid > 0 {
+            unsafe { libc::kill(self.pid, libc::SIGHUP) };
+        }
     }
 }
 
@@ -165,6 +168,8 @@ struct Agent {
     role: Role,
     /// Its own orders and skills, from the design it was launched from.
     spec: ShipSpec,
+    /// A refit ordered for it; `role` and `spec` stay what it's actually running with.
+    refit: Option<RefitState>,
 }
 
 impl Agent {
@@ -389,8 +394,12 @@ impl Agent {
             report: self.report.clone(),
             ask: if self.status == Status::Blocked { self.ask() } else { None },
             war: Vec::new(),
+            spec: self.spec.clone(),
+            refit: self.refit.clone(),
         }
     }
+
+    fn refit_is(&self, state: &str) -> bool { self.refit.as_ref().is_some_and(|r| r.state == state) }
 
     fn screen(&self) -> ScreenView {
         let s = self.parser.screen();
@@ -565,25 +574,47 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         typed: String::new(),
         role: Role::None,
         spec: ShipSpec::default(),
+        refit: None,
         status: Status::Booting,
         since: now,
         exited: None,
     }
 }
 
+/// The program and arguments a ship is launched with: its role's and outfit's flags, the
+/// species' own (resuming `resume`), then the opening prompt.
+fn launch_line(kind: &str, exe: &str, resume: Option<&str>, prompt: Option<&str>, role: Role, spec: &ShipSpec) -> (String, Vec<String>) {
+    let (prog, args) = command(kind, exe, resume);
+    let mut args = [role.launch_args(kind, spec), args].concat();
+    if let Some(p) = prompt {
+        args.push(role.opening(kind, spec, p)); // every species takes an opening prompt as its last argument
+    }
+    (prog, args)
+}
+
 /// Launch an agent in `cwd`, picking up its old session if we have one.
 fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>, role: Role, spec: &ShipSpec) -> anyhow::Result<u32> {
     let id = next_id(hub);
+    spawn_as(hub, id, kind, cwd, resume, prompt, role, spec).map(|_| id)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A stand-in program for the species, so tests never launch a real agent.
+    static STAND_IN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Launch an agent as ship `id` (a new one, or one being relaunched in place).
+#[allow(clippy::too_many_arguments)]
+fn spawn_as(hub: &Shared, id: u32, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>, role: Role, spec: &ShipSpec) -> anyhow::Result<Arc<Mutex<Agent>>> {
     let exe = exe_path().to_string_lossy().into_owned();
     if kind == "grok" {
         install_grok_hooks(&exe);
     }
     let pty = native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })?;
-    let (prog, args) = command(kind, &exe, resume);
-    let mut args = [role.launch_args(kind, spec), args].concat();
-    if let Some(p) = prompt {
-        args.push(role.opening(kind, spec, p)); // every species takes an opening prompt as its last argument
-    }
+    let (prog, args) = launch_line(kind, &exe, resume, prompt, role, spec);
+    #[cfg(test)]
+    let prog = STAND_IN.with(|s| s.borrow().clone()).unwrap_or(prog);
     let mut cmd = CommandBuilder::new(&prog);
     cmd.args(&args);
     cmd.cwd(cwd);
@@ -610,12 +641,11 @@ fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Opti
     agent.role = role;
     agent.spec = spec.clone();
     agent.note_task(prompt.unwrap_or(""));
-    watch(hub, agent)?;
-    Ok(id)
+    Ok(watch(hub, agent)?)
 }
 
 /// Start pumping an agent's output and waiting for it to exit.
-fn watch(hub: &Shared, agent: Agent) -> io::Result<()> {
+fn watch(hub: &Shared, agent: Agent) -> io::Result<Arc<Mutex<Agent>>> {
     let mut reader = agent.writer.master.try_clone()?;
     let pid = agent.writer.pid;
     let agent = Arc::new(Mutex::new(agent));
@@ -642,12 +672,13 @@ fn watch(hub: &Shared, agent: Agent) -> io::Result<()> {
         }
         a.lock().unwrap().exited = Some(Instant::now());
     });
+    let a = agent.clone();
     thread::spawn(move || {
         let mut st = 0;
         unsafe { libc::waitpid(pid, &mut st, 0) };
-        agent.lock().unwrap().exited.get_or_insert(Instant::now());
+        a.lock().unwrap().exited.get_or_insert(Instant::now());
     });
-    Ok(())
+    Ok(agent)
 }
 
 // ───────────────────────── surviving restarts ──────────────────────────
@@ -691,6 +722,8 @@ struct Handoff {
     turns: u32,
     report: Report,
     session: Option<String>,
+    #[serde(default)]
+    refit: Option<RefitState>,
 }
 
 /// Replace this daemon with the binary on disk, keeping every agent: same pid,
@@ -726,6 +759,7 @@ fn upgrade(hub: &Shared) -> io::Result<()> {
             turns: g.turns,
             report: g.report.clone(),
             session: g.session.clone(),
+            refit: g.refit.clone(),
         });
     }
     let file = dirs_state().join("handoff.json");
@@ -759,6 +793,7 @@ fn adopt(hub: &Shared, file: &str) -> anyhow::Result<()> {
         a.spec = h.spec;
         a.report = h.report;
         a.session = h.session;
+        a.refit = resumed(h.refit);
         watch(hub, a)?;
     }
     Ok(())
@@ -775,6 +810,13 @@ struct Saved {
     role: String,
     #[serde(default)]
     spec: ShipSpec,
+    #[serde(default)]
+    refit: Option<RefitState>,
+}
+
+/// A refit cut short by a restart goes back to waiting: the ship comes back as it was.
+fn resumed(refit: Option<RefitState>) -> Option<RefitState> {
+    refit.map(|r| if r.state == "applying" { RefitState { state: "pending".into(), ..r } } else { r })
 }
 
 fn unix_now() -> u64 {
@@ -788,14 +830,19 @@ fn missions_file() -> PathBuf {
 /// Hand queued missions to free agents and follow the ones under way.
 fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
     let agents: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
-    // (id, cwd, status, exited)
+    // (id, cwd, status, exited); a ship standing down for a refit isn't gone
     let roster: Vec<(u32, String, Status, bool)> = agents
         .iter()
         .map(|a| {
             let g = a.lock().unwrap();
-            (g.id, g.cwd.clone(), g.status, g.exited.is_some())
+            (g.id, g.cwd.clone(), g.status, g.exited.is_some() && !g.refit_is("applying"))
         })
         .collect();
+    // ships waiting for or under refit take no new missions until it's done
+    let refitting: HashSet<u32> = agents.iter().filter_map(|a| {
+        let g = a.lock().unwrap();
+        (g.refit_is("pending") || g.refit_is("applying")).then_some(g.id)
+    }).collect();
     let mut h = hub.lock().unwrap();
     let busy: HashSet<u32> = h.missions.iter().filter(|m| matches!(m.state.as_str(), "sent" | "active")).filter_map(|m| m.agent).collect();
     let mut taken = HashSet::new();
@@ -809,7 +856,7 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
                     m.agent = None;
                 }
                 let free = roster.iter().find(|(id, cwd, st, dead)| {
-                    *cwd == m.cwd && !dead && matches!(st, Status::Idle | Status::Done) && !busy.contains(id) && !taken.contains(id) && m.agent.is_none_or(|a| a == *id)
+                    *cwd == m.cwd && !dead && matches!(st, Status::Idle | Status::Done) && !busy.contains(id) && !taken.contains(id) && !refitting.contains(id) && m.agent.is_none_or(|a| a == *id)
                 });
                 if let Some(&(id, ..)) = free
                     && let Some(a) = agents.iter().find(|a| a.lock().unwrap().id == id)
@@ -836,6 +883,19 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
             },
             _ => {}
         }
+    }
+    // a pending refit goes ahead only between turns, with no mission of its own under way
+    for a in &agents {
+        let mut g = a.lock().unwrap();
+        if !g.refit_is("pending") || g.exited.is_some() || !matches!(g.status, Status::Idle | Status::Done) || busy.contains(&g.id) || taken.contains(&g.id) {
+            continue;
+        }
+        let id = g.id;
+        let Some(r) = g.refit.as_mut() else { continue };
+        r.state = "applying".into();
+        let (role, spec) = (Role::parse(&r.role), r.spec.clone());
+        let hub = hub.clone();
+        thread::spawn(move || refit(&hub, id, role, &spec));
     }
     if h.missions != *logged {
         if crate::state::edit(&missions_file(), |saved: &mut Vec<Mission>| *saved = h.missions.clone()).is_ok() { *logged = h.missions.clone(); }
@@ -1040,6 +1100,77 @@ fn order(a: Arc<Mutex<Agent>>, text: String) {
     });
 }
 
+// ──────────────────────────────── refits ───────────────────────────────
+
+/// How long a relaunched ship must stay up to count as refitted.
+const REFIT_GRACE: Duration = Duration::from_millis(if cfg!(test) { 600 } else { 3000 });
+
+/// The session a ship would be refitted on: only a species that resumes a session by id can be
+/// relaunched without losing its work, and only once it has one.
+fn refit_session(kind: &str, session: Option<&str>) -> Result<String, String> {
+    // the species first: one that can't resume will never get a session worth waiting for
+    if !command(kind, "", Some("\0probe")).1.iter().any(|a| a == "\0probe") {
+        return Err(format!("{kind} can't resume a session, so it can't be refitted in place"));
+    }
+    Ok(session.filter(|s| !s.is_empty()).ok_or("no session to resume yet: let it finish a turn first")?.into())
+}
+
+/// Carry out a ship's refit and record how it went.
+fn refit(hub: &Shared, id: u32, role: Role, spec: &ShipSpec) {
+    let (state, note) = match relaunch(hub, id, role, spec) {
+        Ok(note) => ("active", note),
+        Err(e) => e,
+    };
+    if let Some(a) = hub.lock().unwrap().agents.get(&id)
+        && let Some(r) = a.lock().unwrap().refit.as_mut()
+    {
+        r.state = state.into();
+        r.note = note;
+    }
+}
+
+/// Stand a ship down and launch it again as the same ship, on its own session, with a new role
+/// and outfit. The harness does the resuming and keeps its own permissions. If the new launch
+/// fails or dies at once, it's launched again as it was. Err is (failed | unsupported, why).
+fn relaunch(hub: &Shared, id: u32, role: Role, spec: &ShipSpec) -> Result<String, (&'static str, String)> {
+    let old = hub.lock().unwrap().agents.get(&id).cloned().ok_or(("failed", format!("no agent #{id}")))?;
+    let (kind, cwd, session, was, was_spec, task, turns, report, refit) = {
+        let g = old.lock().unwrap();
+        if g.exited.is_some() && !g.refit_is("applying") {
+            return Err(("failed", "it has left".into()));
+        }
+        (g.kind.clone(), g.cwd.clone(), g.session.clone(), g.role, g.spec.clone(), g.task.clone(), g.turns, g.report.clone(), g.refit.clone())
+    };
+    let session = refit_session(&kind, session.as_deref()).map_err(|e| ("unsupported", e))?;
+    old.lock().unwrap().writer.kill();
+    if !(0..50).any(|_| {
+        thread::sleep(Duration::from_millis(100));
+        old.lock().unwrap().exited.is_some()
+    }) {
+        return Err(("failed", "it didn't stand down; still running its old outfit".into()));
+    }
+    // the same ship, picking up where it was
+    let launch = |role: Role, spec: &ShipSpec| -> Result<Arc<Mutex<Agent>>, String> {
+        let a = spawn_as(hub, id, &kind, &cwd, Some(&session), None, role, spec).map_err(|e| e.to_string())?;
+        {
+            let mut g = a.lock().unwrap();
+            g.task = task.clone();
+            g.turns = turns;
+            g.report = report.clone();
+            g.refit = refit.clone();
+        }
+        thread::sleep(REFIT_GRACE);
+        if a.lock().unwrap().exited.is_some() { Err("it shut down right after relaunch".into()) } else { Ok(a) }
+    };
+    match launch(role, spec) {
+        Ok(_) => Ok(format!("resumed session {session}")),
+        Err(e) => match launch(was, &was_spec) {
+            Ok(_) => Err(("failed", format!("{e}; relaunched with its old outfit"))),
+            Err(e2) => Err(("failed", format!("{e}; its old outfit didn't come back either: {e2}"))),
+        },
+    }
+}
+
 // ──────────────────────────────── moons ────────────────────────────────
 
 fn git(dir: &str, args: &[&str]) -> Result<String, String> {
@@ -1124,7 +1255,8 @@ fn save_registry(hub: &Shared, last: &mut Vec<Saved>) {
         .values()
         .filter_map(|a| {
             let g = a.lock().unwrap();
-            g.exited.is_none().then(|| (g.id, Saved { kind: g.kind.clone(), cwd: g.cwd.clone(), session: g.session.clone(), role: g.role.name().into(), spec: g.spec.clone() }))
+            // a ship standing down for a refit is still on the roster
+            (g.exited.is_none() || g.refit_is("applying")).then(|| (g.id, Saved { kind: g.kind.clone(), cwd: g.cwd.clone(), session: g.session.clone(), role: g.role.name().into(), spec: g.spec.clone(), refit: g.refit.clone() }))
         })
         .collect();
     now.sort_by_key(|(id, _)| *id);
@@ -1144,8 +1276,9 @@ fn resurrect(hub: &Shared) {
         if std::path::Path::new(&a.cwd).is_dir() {
             // a claude that never got a prompt has nothing to resume
             let session = a.session.filter(|s| a.kind != "claude" || claude_transcript(s));
-            if let Err(e) = spawn(hub, &a.kind, &a.cwd, session.as_deref(), None, Role::parse(&a.role), &a.spec) {
-                eprintln!("could not bring back {} in {}: {e}", a.kind, a.cwd);
+            match spawn(hub, &a.kind, &a.cwd, session.as_deref(), None, Role::parse(&a.role), &a.spec) {
+                Ok(id) => if let Some(g) = hub.lock().unwrap().agents.get(&id) { g.lock().unwrap().refit = resumed(a.refit) },
+                Err(e) => eprintln!("could not bring back {} in {}: {e}", a.kind, a.cwd),
             }
         }
     }
@@ -1454,6 +1587,49 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                 Resp::Ok
             }
             Err(msg) => Resp::Err { msg },
+        },
+        Req::Refit { id, role, spec, confirm } => match get(id) {
+            Some(a) => {
+                let mut g = a.lock().unwrap();
+                let role = Role::parse(&role);
+                if g.exited.is_some() {
+                    return Resp::Err { msg: format!("agent #{id} has left") };
+                }
+                if g.refit_is("applying") {
+                    return Resp::Err { msg: "it's being refitted right now".into() };
+                }
+                if role == g.role && spec == g.spec {
+                    return Resp::Err { msg: "it already carries that outfit".into() };
+                }
+                // a claude that never got a prompt has nothing to resume
+                let can = refit_session(&g.kind, g.session.as_deref()).and_then(|s| {
+                    if g.kind == "claude" && !claude_transcript(&s) { Err("no conversation to resume yet: let it finish a turn first".into()) } else { Ok(s) }
+                });
+                match (can, confirm) {
+                    (Ok(_), false) => Resp::Ok,
+                    (Err(msg), false) => Resp::Err { msg },
+                    (Ok(_), true) => {
+                        g.refit = Some(RefitState { role: role.name().into(), spec, state: "pending".into(), note: String::new() });
+                        Resp::Ok
+                    }
+                    (Err(msg), true) => {
+                        g.refit = Some(RefitState { role: role.name().into(), spec, state: "unsupported".into(), note: msg.clone() });
+                        Resp::Err { msg }
+                    }
+                }
+            }
+            None => missing(id),
+        },
+        Req::CancelRefit { id } => match get(id) {
+            Some(a) => {
+                let mut g = a.lock().unwrap();
+                if g.refit_is("applying") {
+                    return Resp::Err { msg: "the refit is already under way".into() };
+                }
+                g.refit = None;
+                Resp::Ok
+            }
+            None => missing(id),
         },
         Req::Scrub { id } => {
             hub.lock().unwrap().missions.retain(|m| m.id != id);
@@ -2077,7 +2253,7 @@ mod outfit_tests {
         let old: Saved = serde_json::from_str(r#"{"kind":"codex","cwd":"/w","session":null,"role":"scout"}"#).unwrap();
         assert_eq!(old.spec, ShipSpec::default());
         let spec = ShipSpec { orders: "Keep diffs small.".into(), skills: vec!["release".into()], design: "Frigate".into() };
-        let saved = Saved { kind: "claude".into(), cwd: "/w".into(), session: Some("s".into()), role: "builder".into(), spec: spec.clone() };
+        let saved = Saved { kind: "claude".into(), cwd: "/w".into(), session: Some("s".into()), role: "builder".into(), spec: spec.clone(), refit: None };
         assert!(serde_json::from_str::<Saved>(&serde_json::to_string(&saved).unwrap()).unwrap() == saved);
         let hand = r#"{"id":1,"kind":"claude","cwd":"/w","fd":3,"pid":9,"rows":24,"cols":80,"screen":"","title":"","status":"idle","age":1.0,"turns":0,"report":{},"session":null}"#;
         let h: Handoff = serde_json::from_str(hand).unwrap();
@@ -2121,5 +2297,221 @@ mod campaign_moon_tests {
         assert!(!campaign_free(&a, "claude", "/moon", Role::Builder, &HashSet::new()));
         assert!(!campaign_free(&a, "codex", "/moon", Role::Builder, &HashSet::from([1])));
         a.status = Status::Blocked; assert!(!campaign_free(&a, "codex", "/moon", Role::Builder, &HashSet::new()));
+    }
+}
+
+#[cfg(test)]
+mod refit_tests {
+    use super::*;
+
+    /// A ship on the hub with no real process behind it.
+    fn ship(hub: &Shared, id: u32, kind: &str, session: Option<&str>, status: Status) -> Arc<Mutex<Agent>> {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let mut a = new_agent(id, kind, "/world", Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80);
+        a.session = session.map(String::from);
+        a.status = status;
+        a.role = Role::Builder;
+        let a = Arc::new(Mutex::new(a));
+        hub.lock().unwrap().agents.insert(id, a.clone());
+        a
+    }
+
+    fn outfit() -> ShipSpec { ShipSpec { orders: "Review before you build.".into(), skills: vec!["audit".into()], design: "Warden".into() } }
+
+    fn state(a: &Arc<Mutex<Agent>>) -> Option<String> { a.lock().unwrap().refit.as_ref().map(|r| r.state.clone()) }
+
+    fn refit_req(id: u32, confirm: bool) -> Req { Req::Refit { id, role: "inspector".into(), spec: outfit(), confirm } }
+
+    #[test]
+    fn records_without_a_refit_still_load_and_an_interrupted_one_waits_again() {
+        let old: Saved = serde_json::from_str(r#"{"kind":"codex","cwd":"/w","session":"s","role":"builder"}"#).unwrap();
+        assert!(old.refit.is_none());
+        let hand = r#"{"id":1,"kind":"claude","cwd":"/w","fd":3,"pid":9,"rows":24,"cols":80,"screen":"","title":"","status":"idle","age":1.0,"turns":0,"report":{},"session":"s"}"#;
+        assert!(serde_json::from_str::<Handoff>(hand).unwrap().refit.is_none());
+        let r = RefitState { role: "inspector".into(), spec: outfit(), state: "applying".into(), note: String::new() };
+        let saved = Saved { refit: Some(r.clone()), ..old };
+        let back: Saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(back == saved);
+        let mut v: serde_json::Value = serde_json::from_str(hand).unwrap();
+        v["refit"] = serde_json::to_value(&r).unwrap();
+        assert_eq!(serde_json::from_value::<Handoff>(v).unwrap().refit, Some(r.clone()));
+        // a restart mid-refit brings the ship back as it was, the refit still waiting
+        assert_eq!(resumed(Some(r.clone())).unwrap().state, "pending");
+        let active = RefitState { state: "active".into(), ..r };
+        assert_eq!(resumed(Some(active.clone())), Some(active));
+    }
+
+    #[test]
+    fn a_refit_is_checked_then_queued_only_when_confirmed() {
+        let hub = Shared::default();
+        let a = ship(&hub, 1, "codex", Some("s"), Status::Idle);
+        assert!(matches!(handle(&hub, refit_req(1, false)), Resp::Ok));
+        assert_eq!(state(&a), None, "a check changes nothing");
+        assert!(matches!(handle(&hub, refit_req(1, true)), Resp::Ok));
+        assert_eq!(state(&a), Some("pending".into()));
+        // still what it was launched with until the refit is applied
+        assert_eq!(a.lock().unwrap().role, Role::Builder);
+        assert_eq!(a.lock().unwrap().view(Instant::now()).refit.unwrap().spec, outfit());
+        // the same outfit again is no refit
+        let same = Req::Refit { id: 1, role: "builder".into(), spec: ShipSpec::default(), confirm: true };
+        assert!(matches!(handle(&hub, same), Resp::Err { .. }));
+        assert!(matches!(handle(&hub, Req::CancelRefit { id: 1 }), Resp::Ok));
+        assert_eq!(state(&a), None);
+        a.lock().unwrap().refit = Some(RefitState { state: "applying".into(), ..Default::default() });
+        assert!(matches!(handle(&hub, Req::CancelRefit { id: 1 }), Resp::Err { .. }));
+        assert!(matches!(handle(&hub, refit_req(1, true)), Resp::Err { .. }));
+    }
+
+    #[test]
+    fn a_ship_that_cant_resume_is_unsupported() {
+        let hub = Shared::default();
+        let fresh = ship(&hub, 1, "codex", None, Status::Idle);
+        let cursor = ship(&hub, 2, "cursor", Some("s"), Status::Idle);
+        assert!(matches!(handle(&hub, refit_req(1, false)), Resp::Err { .. }));
+        assert_eq!(state(&fresh), None);
+        assert!(matches!(handle(&hub, refit_req(1, true)), Resp::Err { .. }));
+        assert_eq!(state(&fresh), Some("unsupported".into()));
+        assert!(matches!(handle(&hub, refit_req(2, true)), Resp::Err { msg } if msg.contains("can't resume")));
+        assert_eq!(state(&cursor), Some("unsupported".into()));
+        assert!(refit_session("shell", Some("s")).is_err());
+        // a species that can't resume says so, rather than asking to wait for a session it'll never get
+        assert!(refit_session("shell", None).is_err_and(|e| e.contains("can't resume")));
+        for kind in ["claude", "codex", "grok"] {
+            assert_eq!(refit_session(kind, Some("s")).as_deref(), Ok("s"));
+        }
+    }
+
+    #[test]
+    fn a_busy_ship_stays_pending_and_takes_no_new_missions() {
+        let hub = Shared::default();
+        let pending = || Some(RefitState { role: "inspector".into(), spec: outfit(), state: "pending".into(), note: String::new() });
+        let working = ship(&hub, 1, "codex", Some("s1"), Status::Working);
+        let on_mission = ship(&hub, 2, "codex", Some("s2"), Status::Idle);
+        working.lock().unwrap().refit = pending();
+        on_mission.lock().unwrap().refit = pending();
+        let sent = Mission { id: 1, cwd: "/world".into(), text: "keep going".into(), state: "sent".into(), agent: Some(2), ..Mission::default() };
+        let queued = Mission { id: 2, cwd: "/world".into(), text: "next".into(), state: "queued".into(), ..Mission::default() };
+        hub.lock().unwrap().missions = vec![sent, queued];
+        // already logged, so nothing is written to the real state dir
+        let mut logged = hub.lock().unwrap().missions.clone();
+        for _ in 0..3 {
+            dispatch(&hub, &mut logged);
+        }
+        assert_eq!(state(&working), Some("pending".into()));
+        assert_eq!(state(&on_mission), Some("pending".into()));
+        assert_eq!(hub.lock().unwrap().missions[1].state, "queued");
+        assert_eq!(working.lock().unwrap().role, Role::Builder);
+    }
+
+    #[test]
+    fn a_free_ship_starts_its_refit_and_one_that_lost_its_session_is_unsupported() {
+        let hub = Shared::default();
+        // no session: the relaunch stops before touching any process
+        let a = ship(&hub, 1, "codex", None, Status::Done);
+        a.lock().unwrap().refit = Some(RefitState { role: "inspector".into(), spec: outfit(), state: "pending".into(), note: String::new() });
+        let queued = Mission { id: 1, cwd: "/world".into(), text: "next".into(), state: "queued".into(), agent: Some(1), ..Mission::default() };
+        hub.lock().unwrap().missions = vec![queued];
+        let mut logged = hub.lock().unwrap().missions.clone();
+        dispatch(&hub, &mut logged);
+        assert_ne!(state(&a), Some("pending".into()));
+        assert_eq!(hub.lock().unwrap().missions[0].state, "queued", "the refit goes first");
+        let t = Instant::now();
+        while state(&a).as_deref() != Some("unsupported") && t.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(state(&a), Some("unsupported".into()));
+        assert_eq!(a.lock().unwrap().role, Role::Builder);
+    }
+
+    #[test]
+    fn relaunch_lines_resume_the_same_session_with_the_new_outfit() {
+        let spec = outfit();
+        let (prog, args) = launch_line("claude", "/bin/empire", Some("sess-1"), None, Role::Scout, &spec);
+        assert_eq!(prog, "claude");
+        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].clone());
+        assert_eq!(at("--resume").as_deref(), Some("sess-1"));
+        assert_eq!(at("--permission-mode").as_deref(), Some("plan"));
+        assert!(at("--append-system-prompt").unwrap().contains("Review before you build.") && at("--append-system-prompt").unwrap().contains("audit"));
+        let (_, codex) = launch_line("codex", "/bin/empire", Some("sess-2"), None, Role::Builder, &spec);
+        assert!(codex.windows(2).any(|w| w == ["resume", "sess-2"]));
+        assert!(codex.iter().any(|a| a.starts_with("developer_instructions=") && a.contains("Review before you build.")));
+        let (_, grok) = launch_line("grok", "/bin/empire", Some("sess-3"), None, Role::Inspector, &spec);
+        assert!(grok.windows(2).any(|w| w == ["--resume", "sess-3"]));
+        assert!(grok.windows(2).any(|w| w[0] == "--rules" && w[1].contains("You are an inspector")));
+        for a in [args, codex, grok].concat() {
+            assert!(!["--trust", "--yolo", "--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox"].contains(&a.as_str()));
+        }
+    }
+
+    /// A disposable stand-in for claude: logs its arguments, refuses to start as a scout.
+    fn stand_in(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("launches.log");
+        let script = dir.join("fake-claude");
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\necho ---- >> '{}'\nfor a in \"$@\"; do [ \"$a\" = --permission-mode ] && exit 3; done\nexec sleep 30\n", log.display(), log.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        STAND_IN.with(|s| *s.borrow_mut() = Some(script.to_string_lossy().into_owned()));
+        log
+    }
+
+    #[test]
+    fn a_refit_relaunches_the_same_ship_on_its_session_and_restores_it_on_failure() {
+        let dir = std::env::temp_dir().join(format!("empire-refit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = stand_in(&dir);
+        let hub = Shared::default();
+        let cwd = dir.to_string_lossy().into_owned();
+        let first = spawn_as(&hub, 7, "claude", &cwd, Some("sess-1"), None, Role::Builder, &ShipSpec::default()).unwrap();
+        let old_pid = first.lock().unwrap().writer.pid;
+        // let the first launch get going before it's stood down
+        let t = Instant::now();
+        while !std::fs::read_to_string(&log).unwrap_or_default().contains("----") && t.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        {
+            let mut g = first.lock().unwrap();
+            g.task = "Chart the hyperlanes".into();
+            g.turns = 4;
+            g.refit = Some(RefitState { role: "inspector".into(), spec: outfit(), state: "applying".into(), note: String::new() });
+        }
+        refit(&hub, 7, Role::Inspector, &outfit());
+        let now = hub.lock().unwrap().agents.get(&7).cloned().unwrap();
+        {
+            let g = now.lock().unwrap();
+            assert_eq!(g.id, 7);
+            assert_ne!(g.writer.pid, old_pid);
+            assert!(g.exited.is_none());
+            assert_eq!(g.role, Role::Inspector);
+            assert_eq!(g.spec, outfit());
+            assert_eq!(g.session.as_deref(), Some("sess-1"));
+            assert_eq!((g.task.as_str(), g.turns), ("Chart the hyperlanes", 4));
+            assert_eq!(g.refit.as_ref().map(|r| r.state.as_str()), Some("active"));
+        }
+        assert!(first.lock().unwrap().exited.is_some(), "the old harness stood down");
+        let launches = std::fs::read_to_string(&log).unwrap();
+        let second: Vec<&str> = launches.split("----\n").nth(1).unwrap().lines().collect();
+        assert!(second.windows(2).any(|w| w == ["--resume", "sess-1"]));
+        assert!(second.iter().any(|a| a.contains("You are an inspector")));
+        assert!(launches.contains("Review before you build."));
+
+        // the stand-in won't start as a scout: the ship comes back as it was
+        now.lock().unwrap().refit = Some(RefitState { role: "scout".into(), spec: ShipSpec::default(), state: "applying".into(), note: String::new() });
+        refit(&hub, 7, Role::Scout, &ShipSpec::default());
+        let back = hub.lock().unwrap().agents.get(&7).cloned().unwrap();
+        {
+            let g = back.lock().unwrap();
+            assert!(g.exited.is_none());
+            assert_eq!(g.role, Role::Inspector);
+            assert_eq!(g.spec, outfit());
+            let r = g.refit.as_ref().unwrap();
+            assert_eq!(r.state, "failed");
+            assert!(r.note.contains("old outfit"), "{}", r.note);
+        }
+        let all = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(all.matches("----").count(), 4);
+        assert!(all.split("----\n").all(|l| l.trim().is_empty() || l.contains("sess-1")));
+        back.lock().unwrap().writer.kill();
+        STAND_IN.with(|s| *s.borrow_mut() = None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -73,6 +73,20 @@ pub enum Req {
     Scrub { id: u32 },
     /// Exec the binary on disk in place of the running daemon, keeping every agent.
     Upgrade,
+    /// Refit a deployed ship with a new role and outfit. Without `confirm` it's only a check
+    /// (can this ship be refitted?); with it the refit is queued and applied when the ship is
+    /// next free, by resuming its own session under the new launch flags.
+    Refit {
+        id: u32,
+        #[serde(default)]
+        role: String,
+        #[serde(default)]
+        spec: ShipSpec,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Call off a pending refit, or dismiss a finished one's notice.
+    CancelRefit { id: u32 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -105,6 +119,27 @@ pub struct AgentView {
     /// The design it was launched from, by name ("" for none).
     #[serde(default)]
     pub design: String,
+    /// Its own orders and skills as it's running now (beyond its role).
+    #[serde(default)]
+    pub spec: ShipSpec,
+    /// A refit ordered for it, and how it went; `role`/`design`/`spec` stay what's actually aboard.
+    #[serde(default)]
+    pub refit: Option<RefitState>,
+}
+
+/// A refit ordered for a deployed ship: the outfit it's to get, and where that stands.
+/// `state` is pending (waiting for the ship to be free) | applying (relaunching on its session)
+/// | active (aboard) | failed (old outfit restored) | unsupported (its species can't resume).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct RefitState {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub spec: ShipSpec,
+    pub state: String,
+    /// Why it failed or isn't supported, or what happened.
+    #[serde(default)]
+    pub note: String,
 }
 
 /// A ship's outfit beyond its role: standing orders and skills to lean on, and the name of
@@ -301,5 +336,28 @@ mod attachment_tests {
         let restored: Mission = serde_json::from_str(&serde_json::to_string(&mission).unwrap()).unwrap();
         assert_eq!(restored, mission);
         assert!(crate::screenshots::prompt(&restored.text, &restored.attachments).contains("/saved/123.png"));
+    }
+}
+
+#[cfg(test)]
+mod refit_tests {
+    use super::*;
+
+    #[test]
+    fn agent_views_without_a_refit_still_parse() {
+        let old: AgentView = serde_json::from_str(r#"{"id":1,"kind":"claude","cwd":"/w","title":"","status":"idle","age":0.5}"#).unwrap();
+        assert!(old.refit.is_none());
+        let mut v = old.clone();
+        v.refit = Some(RefitState { role: "scout".into(), spec: ShipSpec { orders: "Look only.".into(), skills: vec!["audit".into()], design: "Probe".into() }, state: "pending".into(), note: String::new() });
+        let back: AgentView = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back.refit, v.refit);
+    }
+
+    #[test]
+    fn refit_requests_default_to_a_dry_run() {
+        let r: Req = serde_json::from_str(r#"{"op":"refit","id":3,"role":"builder"}"#).unwrap();
+        assert!(matches!(r, Req::Refit { id: 3, confirm: false, ref role, ref spec } if role == "builder" && *spec == ShipSpec::default()));
+        let r: Req = serde_json::from_str(r#"{"op":"cancel_refit","id":3}"#).unwrap();
+        assert!(matches!(r, Req::CancelRefit { id: 3 }));
     }
 }

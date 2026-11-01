@@ -48,7 +48,7 @@ Agreed direction: Empire coordinates projects, discoveries and outcomes. Each ag
 - Automatic flow verified: 138 tests passed (1 live API test ignored), release build, rendered layouts, and isolated disposable-ship tests covering plan approval, automatic moons, questions, pause, cold restart, explicit retry, hot upgrade and final review.
 - Verified: 120 tests passed (1 live API test ignored), release build, rendered layouts, and an isolated terminal test through review, acceptance, a queued handoff, and daemon restart with campaign metadata preserved.
 
-## Ship designs and refits — designs implemented (2026-11-01), refits next
+## Ship designs and refits — designs and refits implemented (2026-11-01)
 
 - Save reusable species, role, standing instructions, skills and workflow configurations.
 - Apply designs to deployed ships as refits; show pending versus effective equipment.
@@ -56,7 +56,8 @@ Agreed direction: Empire coordinates projects, discoveries and outcomes. Each ag
 - Distinguish planet-wide resources from equipment assigned to one ship.
 - Delivered: `Y` shipyard (rename, scrap), `Ctrl+D` design and `Ctrl+R` refit in the mission composer, `designs.json`; ships keep their own copy of orders and skills through upgrades and restarts.
 - Skills are named in a ship's orders, not installed; each skill is marked ✓/✗ by whether the chosen species finds it. Codex takes orders as `developer_instructions`.
-- Not yet: refitting ships already deployed, and workflow configurations.
+- Delivered (refits): `r` on a ship card previews a design's changes to role, orders, skills (✓/✗ per species) and scout read-only access. `⏎` then `y` confirms and `c` cancels. The daemon applies it when the ship is idle with no mission under way, relaunching the same ship on its own session through the harness's resume (`claude --resume`, `codex resume`, `grok --resume`). The card shows the outfit that's aboard apart from the refit state: pending, applying, active, failed (old outfit relaunched), unsupported. The state is per ship and is saved in `agents.json` and the upgrade handoff.
+- Not yet: workflow configurations; a dry-run check of the session from the preview (today only the species is checked before confirming, and the daemon reports a missing session as unsupported).
 - Verified: 130 tests passed (1 live API test ignored), and an isolated daemon test of a design launch, crash restart and hot upgrade, with the Codex instructions checked by `codex debug prompt-input`.
 
 ## Empire chronicle
