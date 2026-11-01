@@ -2473,7 +2473,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("A", "anomalies: findings, investigations and history across systems"),
         ("V", "sectors: group worlds, inspect activity and focus the map"),
         ("H / h", "hyperlanes: name connections / toggle dependency overlay"),
-        ("O", "campaigns: o talk to ship, d history, objectives and reviewed outcomes"),
+        ("O", "campaigns: goals, approved plans, automatic missions on moons"),
         ("Y", "shipyard: saved ship designs (^D picks one in a mission, ^R refits)"),
         ("n", "colonize: launch an agent in a folder (new or existing)"),
         ("e", "deploy another agent to the selected world"),
@@ -3144,20 +3144,42 @@ fn campaigns(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32) {
     let edit = view.edit;
     let c = app.selected_campaign();
     let s = app.campaign_stage();
+    let automatic = c.is_some_and(|c| c.flight.is_some());
+    let archived = c.is_some_and(|c| c.archived);
     frame_box(fb, x, y, width, h, "⚑ CAMPAIGNS", CAMPAIGN);
+    if matches!(edit, Some(CampaignEdit::Delete(_))) {
+        seg(fb, x + 3, y + 1, "Delete archived campaign?", width - 6, TEXT, Some(BOX));
+        for (i, line) in wrap(&view.text.s, (width - 6).max(1) as usize).iter().take((h - 12).max(1) as usize).enumerate() {
+            seg(fb, x + 3, y + 3 + i as i32, line, width - 6, CAMPAIGN, Some(BOX));
+        }
+        seg(fb, x + 3, y + h - 8, "Permanently removes its stages, history and saved evidence.", width - 6, TEXT, Some(BOX));
+        seg(fb, x + 3, y + h - 7, "Ships, missions, repository files and moons are kept.", width - 6, DIM, Some(BOX));
+        seg(fb, x + 3, y + h - 5, &view.error, width - 6, v3(1.0, 0.5, 0.4), Some(BOX));
+        seg(fb, x + 3, y + h - 3, "y delete · Esc cancel", width - 6, CAMPAIGN, Some(BOX));
+        return;
+    }
     let heading = match edit {
-        Some(CampaignEdit::Objective) => "Objective · what should this campaign achieve? (1 / 2)",
-        Some(CampaignEdit::Criteria) => "Acceptance criteria · how will you know it is ready? (2 / 2)",
+        Some(CampaignEdit::Objective) => "Goal · what should this campaign achieve?",
+        Some(CampaignEdit::Criteria) => "Acceptance criteria · optional; Enter skips",
+        Some(CampaignEdit::Scope) => "Scope · repository roots, one per line · campaign work gets its own moons",
+        Some(CampaignEdit::Limits) => "No-go zones · optional instructions: what must stay untouched?",
+        Some(CampaignEdit::Species) => "Planning ship species · Enter launches planning on moons from committed HEAD",
+        Some(CampaignEdit::Approve) => "Approve this plan and run its stages on campaign moons? y start · Esc cancel",
+        Some(CampaignEdit::Reject) => "Reject plan · explain what the planning ship should change",
+        Some(CampaignEdit::Cancel) => "Cancel future dispatch? Current ships and moon changes stay. y confirm · Esc back",
+        Some(CampaignEdit::Retry) => "Retry interrupted work on its existing moon? Inspect it first. y retry · Esc back",
+        Some(CampaignEdit::StageRole) => "Stage role · scout, builder or inspector",
+        Some(CampaignEdit::StageEvidence) => "Stage evidence · what must the ship demonstrate?",
         Some(CampaignEdit::World) => "Stage · choose its world or worktree moon",
         Some(CampaignEdit::Task) => "Stage · describe the task; this only plans it",
         Some(CampaignEdit::Handoff) => "Handoff · findings, changes, evidence, and unresolved questions",
         Some(CampaignEdit::Verify) => "Verification · record what you checked, its results and evidence",
         Some(CampaignEdit::Link) => "Link an existing mission to this stage (no order is sent)",
         Some(CampaignEdit::Complete) => "Accept this campaign against its objective and criteria? y confirm · other keys cancel",
-        None => "Plan missions, talk to ships, and review their results",
+        None | Some(CampaignEdit::Delete(_)) => "Plan missions, talk to ships, and review their results",
     };
     seg(fb, x + 2, y + 1, heading, width - 4, TEXT, Some(BOX));
-    let typing = edit.is_some() && !matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link | CampaignEdit::Complete));
+    let typing = edit.is_some() && !matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link | CampaignEdit::Complete | CampaignEdit::Approve | CampaignEdit::Cancel | CampaignEdit::Retry));
     if typing {
         area(fb, (x + 3, y + 3, width - 6, (h - 9).max(1)), &view.text, CAMPAIGN, t);
     } else {
@@ -3186,7 +3208,7 @@ fn campaigns(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32) {
                 let bg = if i == ci { SELBG } else { BOX };
                 let mark = if c.archived { "·" } else if c.completed.is_some() { "✓" } else { "⚑" };
                 fb.panel(x + 1, y + 4 + (i - off) as i32, left - 1, 1, bg);
-                seg(fb, x + 2, y + 4 + (i - off) as i32, &format!("{mark} {}", c.objective), left - 3, if c.archived { DIM } else { TEXT }, Some(bg));
+                seg(fb, x + 2, y + 4 + (i - off) as i32, &format!("{mark} {}", c.objective.lines().next().unwrap_or_default()), left - 3, if c.archived { DIM } else { TEXT }, Some(bg));
             }
             if let Some(c) = c {
                 let si = s.and_then(|s| c.stages.iter().position(|p| p.id == s.id)).unwrap_or(0);
@@ -3199,14 +3221,40 @@ fn campaigns(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32) {
                     let col = if waiting { v3(1.0, 0.7, 0.4) } else if s.accepted.is_some() { v3(0.5, 0.85, 0.65) } else { TEXT };
                     seg(fb, x + left + 2, y + 4 + (i - off) as i32, &format!("{}. {status} · {}", i + 1, clip(&s.task, 80)), width - left - 4, col, Some(bg));
                 }
-                if c.stages.is_empty() { seg(fb, x + left + 2, y + 4, "s plans the first stage", width - left - 4, DIM, Some(BOX)); }
+                if c.stages.is_empty() { seg(fb, x + left + 2, y + 4, if c.flight.is_some() { "Planning ship will propose the stages" } else { "s plans the first stage" }, width - left - 4, DIM, Some(BOX)); }
             } else { seg(fb, x + 2, y + 4, "n begins a campaign", left - 3, DIM, Some(BOX)); }
         }
         let mut detail = Vec::new();
         let warm = v3(1.0, 0.7, 0.4);
         if let Some(c) = c {
+            if let Some(f) = &c.flight {
+                let next = match f.phase.as_str() {
+                    "planning" => "Planning on campaign moons · o open planning ship",
+                    "proposed" => "Plan ready · a approve & run · t edit stage · r request revision",
+                    "running" => "Running approved plan · o open ship · p pause dispatch",
+                    "paused" => "Dispatch paused; current ship keeps working · p resume",
+                    "review" => "Ready for your review · inspect evidence and moons, then c accept",
+                    "accepted" => "Campaign accepted · moons remain available for docking",
+                    "cancelled" => "Dispatch cancelled · ships and moons preserved",
+                    _ => "Campaign needs attention",
+                };
+                detail.push((next.into(), CAMPAIGN));
+                if !f.error.is_empty() { detail.push((f.error.clone(), warm)); }
+                if !f.summary.is_empty() { detail.push((f.summary.clone(), TEXT)); }
+                if let Some(a) = app.campaign_current_ship() {
+                    detail.push((format!("{} #{} · {} · o open ship", a.kind, a.id, a.status.label()), warm));
+                    if let Some(q) = &a.ask { detail.push((q.question.clone(), TEXT)); }
+                }
+                if let Some(j) = c.flight_job() {
+                    if j.state == "awaiting_report" { detail.push(("Awaiting an explicit report · o opens the ship to inspect or answer".into(), warm)); }
+                    if let Some(r) = c.stages.iter().find(|s| s.job.as_ref().is_some_and(|p| p.token == j.token)).and_then(|s| s.outcome.as_ref()) {
+                        if !r.question.is_empty() { detail.push((format!("Question: {} · o to answer", r.question), warm)); }
+                    }
+                }
+                detail.push((String::new(), DIM));
+            }
             if let Some(s) = s {
-                if let Some(a) = app.campaign_ship(s) {
+                if c.flight.is_none() && let Some(a) = app.campaign_ship(s) {
                     let waiting = a.status == Status::Blocked;
                     detail.push((if waiting { format!("Waiting for your input · {} #{} · o open ship", a.kind, a.id) }
                         else { format!("{} #{} · {} · o open ship", a.kind, a.id, a.status.label()) }, if waiting { warm } else { CAMPAIGN }));
@@ -3218,7 +3266,12 @@ fn campaigns(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32) {
                 detail.push((format!("Stage {i} · {}", s.status()), CAMPAIGN));
                 detail.push((tilde(&s.world), DIM));
                 detail.push((s.task.clone(), TEXT));
-                if s.missions.is_empty() { detail.push(("m draft a mission · l link existing work".into(), warm)); }
+                if c.flight.is_some() {
+                    detail.push((format!("Role: {} · Expected evidence: {}", s.role, s.expected), DIM));
+                    if let Some(r) = &s.outcome && !r.question.is_empty() { detail.push((format!("Question: {} · o opens the ship", r.question), warm)); }
+                    if let Some(j) = &s.job && j.state == "awaiting_report" { detail.push(("Ship finished a turn without a result report · o to inspect or answer".into(), warm)); }
+                }
+                if c.flight.is_none() && s.missions.is_empty() { detail.push(("m draft a mission · l link existing work".into(), warm)); }
                 for linked in &s.missions {
                     let m = &linked.mission;
                     detail.push((format!("Mission #{} · {} · ship {}{}", m.id, m.state, m.agent.map_or("—".into(), |id| id.to_string()),
@@ -3230,14 +3283,21 @@ fn campaigns(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32) {
             detail.push((c.objective.clone(), TEXT));
             detail.push((String::new(), DIM));
             detail.push(("Acceptance criteria".into(), CAMPAIGN));
-            detail.push((c.criteria.clone(), TEXT));
+            detail.push((if c.criteria.is_empty() { "Not specified; the plan may propose criteria".into() } else { c.criteria.clone() }, TEXT));
+            if let Some(f) = &c.flight {
+                detail.push((String::new(), DIM)); detail.push(("Scope and no-go zones".into(), CAMPAIGN));
+                detail.push((f.worlds.iter().map(|p| tilde(p)).collect::<Vec<_>>().join("\n"), TEXT));
+                detail.push((if f.limits.is_empty() { "No additional restrictions specified".into() } else { f.limits.clone() }, TEXT));
+                detail.push(("Scope restrictions are instructions; native harness permissions still apply.".into(), DIM));
+                for moon in &f.moons { detail.push((format!("Moon: {} · {}", tilde(&moon.path), moon.branch), DIM)); }
+            }
             if let Some(s) = s {
                 detail.push((String::new(), DIM));
-                detail.push(("Handoff · h edit".into(), CAMPAIGN));
-                detail.push((if s.handoff.is_empty() { "No handoff yet. Record findings and decisions after reviewing the ship's work.".into() } else { s.handoff.clone() },
+                detail.push((if c.flight.is_some() { "Handoff from ship" } else { "Handoff · h edit" }.into(), CAMPAIGN));
+                detail.push((if s.handoff.is_empty() { if c.flight.is_some() { "The ship will report its findings here.".into() } else { "No handoff yet. Record findings and decisions after reviewing the ship's work.".into() } } else { s.handoff.clone() },
                     if s.handoff.is_empty() { DIM } else { TEXT }));
                 detail.push((String::new(), DIM));
-                detail.push(("Verification · v record evidence · a accept stage".into(), CAMPAIGN));
+                detail.push((if c.flight.is_some() { "Evidence reported by ship · final acceptance is yours" } else { "Verification · v record evidence · a accept stage" }.into(), CAMPAIGN));
                 detail.push((if s.verification.is_empty() { "Not verified. A finished agent turn still needs your review.".into() } else { s.verification.clone() },
                     if s.verification.is_empty() { DIM } else { TEXT }));
                 if view.details {
@@ -3272,8 +3332,12 @@ fn campaigns(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32) {
     seg(fb, x + 2, y + h - 5, error, width - 4, v3(1.0, 0.5, 0.4), Some(BOX));
     let controls = if typing { "Enter save/next · Shift+Enter or Ctrl+J newline · ↑↓ cursor · Esc cancel" }
         else if matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link)) { "↑↓ / wheel choose · Home/End · Enter select · Esc cancel" }
-        else { "n new · e objective · s stage · t edit stage · m draft · l link mission" };
+        else if archived { "Del delete archived campaign · x restore · n goal · N manual" }
+        else if automatic { "n goal · a approve · t edit stage · s add · Del remove · r revise" }
+        else { "n goal · N manual · e objective · s stage · t edit · m draft · l link" };
     seg(fb, x + 2, y + h - 3, controls, width - 4, CAMPAIGN, Some(BOX));
-    if !typing { seg(fb, x + 2, y + h - 2, "h handoff · v verify · a accept stage · r reopen · c finish · x archive", width - 4, CAMPAIGN, Some(BOX)); }
+    if !typing { seg(fb, x + 2, y + h - 2, if archived { "Deleting the campaign keeps its ships, missions and moons." }
+        else if automatic { "o open ship · p pause/resume/retry · c accept · x cancel/archive" }
+        else { "h handoff · v verify · a accept stage · r reopen · c finish · x archive" }, width - 4, CAMPAIGN, Some(BOX)); }
     seg(fb, x + 2, y + h - 4, "o open ship · d history · Enter log · Tab pane · PgUp/Dn · Esc back", width - 4, DIM, Some(BOX));
 }

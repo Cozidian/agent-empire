@@ -37,12 +37,15 @@ Agreed direction: Empire coordinates projects, discoveries and outcomes. Each ag
 ## Campaigns — implemented (2026-11-01)
 
 - Shared objective, linked missions, acceptance criteria and handoff evidence across worlds.
-- Begin with manual handoffs; allow one agent to carry an entire campaign.
+- Goal-first campaigns: optional criteria/no-go zones, a planning ship, editable proposed stages and explicit plan approval.
 - Optional scout → accepted plan → builder on a moon → inspector → reviewed docking sequence.
-- Automate only chosen transitions later; do not add a competing agent reasoning loop.
+- Approved stages dispatch sequentially on dedicated campaign moons; native harnesses own reasoning and execution.
 - Distinguish reported-finished, verified and accepted outcomes before automatic progression.
 - Delivered: `O` campaign view, objective/criteria and stage planning, existing mission linking, contextual mission drafts, persistent snapshots, handoff notes and explicit verification/acceptance.
-- Reopening or changing evidence invalidates affected reviews while preserving their history; campaigns never launch the next stage automatically.
+- Ships report structured findings/evidence; questions and failures hold handoffs. Pause/cancel preserve work, final acceptance and docking stay explicit.
+- Existing manual campaigns retain their controls and review history; new manual campaigns use `N`.
+- Future: parallel independent stages, richer criteria checks, and additional permission enforcement for no-go zones.
+- Automatic flow verified: 138 tests passed (1 live API test ignored), release build, rendered layouts, and isolated disposable-ship tests covering plan approval, automatic moons, questions, pause, cold restart, explicit retry, hot upgrade and final review.
 - Verified: 120 tests passed (1 live API test ignored), release build, rendered layouts, and an isolated terminal test through review, acceptance, a queued handoff, and daemon restart with campaign metadata preserved.
 
 ## Ship designs and refits — designs implemented (2026-11-01), refits next

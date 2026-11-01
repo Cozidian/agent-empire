@@ -10,6 +10,7 @@ use std::time::Duration;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Req {
     Ping,
+    CampaignReport { token: String, report: crate::expedition::Report },
     List,
     /// The agent list, for onlookers (status bars) that shouldn't count as a galaxy being open.
     Peek,
@@ -153,6 +154,7 @@ pub struct Mission {
     pub fleet: Option<u32>,
     #[serde(default)]
     pub campaign: Option<CampaignRef>,
+    #[serde(default)] pub campaign_job: String,
 }
 
 /// A question read off an agent's screen, answerable from the galaxy.
