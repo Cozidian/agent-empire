@@ -1,6 +1,7 @@
 mod anomaly;
 mod client;
 mod campaign;
+mod expedition;
 mod daemon;
 mod design;
 mod draw;
@@ -31,12 +32,14 @@ const HELP: &str = "empire — a galaxy of coding agents
                    (the galaxy does this by itself when it starts)
   empire stop      shut down the daemon and every agent in it (they won't come back)
   empire sounds    play every sound cue once
+  empire campaign-report RECEIPT   submit a campaign JSON report on stdin
   empire anomaly WORLD TITLE EVIDENCE [SOURCE]
                    record a finding without starting the daemon";
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("campaign-report") => expedition::report_cli(&args[1..]),
         Some("anomaly") => {
             if args.len() < 4 || args.len() > 5 { return Err(io::Error::other("usage: empire anomaly WORLD TITLE EVIDENCE [SOURCE]")); }
             anomaly::report(&args[1], &args[2], &args[3], args.get(4).map_or("manual report", String::as_str))

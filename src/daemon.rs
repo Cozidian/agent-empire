@@ -800,6 +800,7 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
     let busy: HashSet<u32> = h.missions.iter().filter(|m| matches!(m.state.as_str(), "sent" | "active")).filter_map(|m| m.agent).collect();
     let mut taken = HashSet::new();
     for m in h.missions.iter_mut() {
+        if !m.campaign_job.is_empty() { continue; } // campaign receipts, not terminal status, control these missions
         let me = m.agent.and_then(|id| roster.iter().find(|r| r.0 == id));
         match m.state.as_str() {
             "queued" => {
@@ -837,9 +838,188 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
         }
     }
     if h.missions != *logged {
-        let _ = std::fs::create_dir_all(dirs_state());
-        let _ = std::fs::write(missions_file(), serde_json::to_string(&h.missions).unwrap_or_default());
-        *logged = h.missions.clone();
+        if crate::state::edit(&missions_file(), |saved: &mut Vec<Mission>| *saved = h.missions.clone()).is_ok() { *logged = h.missions.clone(); }
+    }
+}
+
+/// Found a dedicated campaign worktree; never adopt an unrelated directory or branch.
+fn campaign_moon(world: &str, branch: &str, root: &std::path::Path) -> Result<crate::expedition::Moon, String> {
+    let top = git(world, &["rev-parse", "--show-toplevel"])?;
+    let canonical = |p: &str| std::fs::canonicalize(p).map_err(|e| e.to_string());
+    if canonical(world)? != canonical(&top)? { return Err(format!("Use the repository root as the scope: {top}")); }
+    let h = top.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    let path = root.join(format!("campaign-{:016x}", h)).join(branch.replace('/', "-"));
+    let p = path.to_string_lossy().into_owned();
+    if path.exists() {
+        if !path.join(".git").is_file() { return Err("Campaign moon path is occupied by an unrelated directory".into()); }
+        let common = |cwd: &str| git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| canonical(&p));
+        if common(&p)? != common(world)? || git(&p, &["symbolic-ref", "--short", "HEAD"])? != branch {
+            return Err("Campaign moon no longer belongs to its recorded repository and branch".into());
+        }
+    } else {
+        if git(world, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_ok() { return Err("Campaign branch already exists without its recorded moon; inspect it before retrying".into()); }
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        git(world, &["worktree", "add", "-b", branch, &p, "HEAD"])?;
+    }
+    Ok(crate::expedition::Moon { world: world.into(), path: p, branch: branch.into() })
+}
+
+fn persist_missions(hub: &Shared) -> Result<(), String> {
+    let h = hub.lock().unwrap();
+    crate::state::edit(&missions_file(), |saved: &mut Vec<Mission>| *saved = h.missions.clone()).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Only compatible ships already on the campaign moon can be reused.
+fn campaign_free(a: &Agent, kind: &str, cwd: &str, role: Role, busy: &HashSet<u32>) -> bool {
+    a.kind == kind && a.cwd == cwd && a.role == role && a.spec.is_bare() && a.exited.is_none()
+        && matches!(a.status, Status::Idle | Status::Done) && !busy.contains(&a.id)
+}
+
+/// Worktree checkout can be slow; prepare it outside the campaign lock so the galaxy can pause/cancel.
+fn prepare_campaign_moons(c: &crate::campaign::Campaign) -> Result<Vec<crate::expedition::Moon>, String> {
+    let f = c.flight.as_ref().ok_or("Missing campaign flight")?;
+    let branch = format!("empire/campaign-{}-{}", c.id, f.nonce);
+    let mut moons = Vec::new();
+    for world in &f.worlds {
+        let old = f.moons.iter().find(|m| &m.world == world);
+        if old.is_some_and(|m| !std::path::Path::new(&m.path).is_dir()) { return Err("A recorded campaign moon is missing; inspect it before continuing".into()); }
+        let moon = campaign_moon(world, &branch, &moons_dir())?;
+        if old.is_some_and(|m| *m != moon) { return Err("Campaign moon identity changed".into()); }
+        moons.push(moon);
+    }
+    Ok(moons)
+}
+
+fn start_campaign_job(hub: &Shared, c: &mut crate::campaign::Campaign, stage: u64, token: &str) -> Result<(), String> {
+    if !["planning", "running"].contains(&c.flight_status()) || c.archived { return Ok(()); }
+    let job = c.flight_job_mut(token).ok_or("Campaign reservation was replaced")?.clone();
+    if job.state != "reserved" { return Ok(()); }
+    // A persisted receipt means dispatch may already have happened. Never send it twice after a crash.
+    if let Some(m) = hub.lock().unwrap().missions.iter().find(|m| m.campaign_job == token).cloned() {
+        let j = c.flight_job_mut(token).unwrap(); j.mission = Some(m.id); j.ship = m.agent; j.state = "sent".into();
+        return Err("Dispatch was interrupted; inspect the linked ship before retrying this stage".into());
+    }
+    let f = c.flight.as_mut().unwrap();
+    for world in &f.worlds {
+        let m = f.moons.iter().find(|m| &m.world == world).ok_or("Campaign moons are not ready")?;
+        if !std::path::Path::new(&m.path).join(".git").is_file() || git(&m.path, &["symbolic-ref", "--short", "HEAD"])? != m.branch {
+            return Err("Campaign moon changed after preparation; inspect it before retrying".into());
+        }
+    }
+    let cwd = f.moons.iter().find(|m| m.world == job.world).ok_or("Stage is outside the campaign's moons")?.path.clone();
+    let kind = f.kind.clone(); let role = Role::parse(&job.role);
+    let prompt = crate::expedition::brief(c, stage, &job, &exe_path().to_string_lossy());
+    let crew: Vec<_> = hub.lock().unwrap().agents.values().cloned().collect();
+    let busy: HashSet<_> = hub.lock().unwrap().missions.iter().filter(|m| m.state != "done" && m.state != "cancelled").filter_map(|m| m.agent).collect();
+    let free = crew.iter().find(|a| campaign_free(&a.lock().unwrap(), &kind, &cwd, role, &busy)).cloned();
+    let id = {
+        let mut h = hub.lock().unwrap();
+        let id = h.missions.iter().map(|m| m.id).max().unwrap_or(0).checked_add(1).ok_or("No mission ids left")?;
+        h.missions.push(Mission { id, cwd: cwd.clone(), text: prompt.clone(), state: "sent".into(), at: unix_now(),
+            campaign: Some(CampaignRef { campaign: c.id, stage }), campaign_job: token.into(), ..Default::default() }); id
+    };
+    if let Err(e) = persist_missions(hub) { hub.lock().unwrap().missions.retain(|m| m.id != id); return Err(e); }
+    let ship = if let Some(a) = free {
+        let id = { let mut g = a.lock().unwrap(); g.note_task(&prompt); g.id };
+        order(a, prompt); Ok(id)
+    } else { spawn(hub, &kind, &cwd, None, Some(&prompt), role, &ShipSpec::default()).map_err(|e| e.to_string()) };
+    let j = c.flight_job_mut(token).unwrap(); j.world = cwd; j.mission = Some(id);
+    match ship {
+        Ok(ship) => {
+            j.ship = Some(ship); j.state = "sent".into();
+            hub.lock().unwrap().missions.iter_mut().find(|m| m.id == id).unwrap().agent = Some(ship);
+            persist_missions(hub)?;
+            c.history.push(crate::campaign::Note { at: unix_now(), kind: "mission dispatched".into(), text: format!("Stage {stage} · ship {ship} · mission {id} on its campaign moon") });
+            Ok(())
+        }
+        Err(e) => { j.state = "interrupted".into(); Err(format!("Could not launch {}: {e}. Work is preserved; p retries after inspection", kind)) }
+    }
+}
+
+/// Runs independently of galaxy windows. Report receipts and reservations prevent accidental advancement or duplicate sends.
+fn campaign_tick(hub: &Shared) {
+    let path = crate::campaign::path(); if !path.exists() { return; }
+    let agents: Vec<_> = hub.lock().unwrap().agents.values().cloned().collect();
+    let roster: Vec<_> = agents.iter().map(|a| { let g = a.lock().unwrap(); (g.id, g.cwd.clone(), g.status, g.exited.is_some()) }).collect();
+    let missions = hub.lock().unwrap().missions.clone();
+    let mut pending = Vec::new();
+    let saved = crate::campaign::edit(&path, |b| {
+        b.refresh(&missions, unix_now());
+        for c in &mut b.campaigns {
+            if c.flight.is_none() || c.archived { continue; }
+            let complete_tokens: Vec<_> = c.flight.as_ref().unwrap().planner.iter().chain(c.stages.iter().filter_map(|s| s.job.as_ref()))
+                .filter(|j| j.state == "complete").map(|j| j.token.clone()).collect();
+            for token in complete_tokens {
+                if let Some(m) = hub.lock().unwrap().missions.iter_mut().find(|m| m.campaign_job == token) { m.state = "done".into(); m.done_at.get_or_insert(unix_now()); }
+            }
+            let jobs = c.flight.as_mut().unwrap().planner.iter_mut().chain(c.stages.iter_mut().filter_map(|s| s.job.as_mut()));
+            for j in jobs {
+                if j.state == "reserved" || j.state == "complete" { continue; }
+                let live = j.ship.and_then(|id| roster.iter().find(|r| r.0 == id && r.1 == j.world && !r.3));
+                if live.is_none() {
+                    let candidates: Vec<_> = agents.iter().filter_map(|a| { let a = a.lock().unwrap();
+                        (a.cwd == j.world && a.role.name() == j.role && a.exited.is_none() && (a.task.is_empty() || a.task.contains(&j.token))).then_some(a.id) }).collect();
+                    if candidates.len() == 1 {
+                        j.ship = Some(candidates[0]);
+                        if let Some(m) = hub.lock().unwrap().missions.iter_mut().find(|m| m.campaign_job == j.token) { m.agent = j.ship; }
+                    }
+                }
+                if j.state == "sent" && j.ship.is_some_and(|id| roster.iter().any(|r| r.0 == id && r.1 == j.world && !r.3 && matches!(r.2, Status::Done | Status::Idle))) {
+                    j.state = "awaiting_report".into();
+                }
+            }
+            let f = c.flight.as_mut().unwrap();
+            if f.retry {
+                f.retry = false;
+                if let Some(j) = c.flight_job().cloned() {
+                    let live = roster.iter().any(|r| r.1 == j.world && !r.3);
+                    if live {
+                        c.flight.as_mut().unwrap().error = "The previous ship is still present; o opens it. Resolve its question or explicitly decommission it before retrying".into();
+                    } else {
+                        if let Some(m) = hub.lock().unwrap().missions.iter_mut().find(|m| m.campaign_job == j.token) { m.state = "cancelled".into(); }
+                        if c.flight.as_ref().unwrap().planner.as_ref().is_some_and(|p| p.token == j.token) { c.flight.as_mut().unwrap().planner = None; }
+                        else if let Some(s) = c.stages.iter_mut().find(|s| s.job.as_ref().is_some_and(|p| p.token == j.token)) { s.job = None; s.outcome = None; }
+                        c.flight.as_mut().unwrap().error.clear();
+                        c.history.push(crate::campaign::Note { at: unix_now(), kind: "retry requested".into(), text: "Previous receipt retired; existing moon changes are kept".into() });
+                    }
+                } else { c.flight.as_mut().unwrap().error.clear(); }
+            }
+            // Do not let two stages work on the same moon while the reporting ship is still running.
+            let jobs = c.flight.as_ref().unwrap().planner.iter().chain(c.stages.iter().filter_map(|s| s.job.as_ref()));
+            let mut active = false;
+            for j in jobs {
+                if let Some((_, _, status, false)) = j.ship.and_then(|id| roster.iter().find(|r| r.0 == id && r.1 == j.world)) {
+                    if !matches!(status, Status::Done | Status::Idle) { active = true; }
+                } else if j.state != "complete" && j.state != "reserved" {
+                    c.flight.as_mut().unwrap().error = "The campaign ship is unavailable. Inspect its moon, then p to retry; no mission was resent".into(); break;
+                }
+            }
+            if active { continue; }
+            if let Err(e) = crate::expedition::reserve(c) { c.flight.as_mut().unwrap().error = e; }
+            if c.flight.as_ref().unwrap().error.is_empty() && ["planning", "running"].contains(&c.flight_status()) {
+                if let Some(j) = c.flight_job().filter(|j| j.state == "reserved") {
+                    let stage = c.stages.iter().find(|s| s.job.as_ref().is_some_and(|p| p.token == j.token)).map_or(0, |s| s.id);
+                    pending.push((c.id, stage, j.token.clone()));
+                }
+            }
+        }
+    });
+    let saved = match saved { Ok(b) => b, Err(e) => { eprintln!("campaign state unavailable: {e}"); return; } };
+    for (id, stage, token) in pending {
+        let Some(snapshot) = saved.campaigns.iter().find(|c| c.id == id) else { continue };
+        let moons = prepare_campaign_moons(snapshot);
+        // Recheck approval after worktree preparation and before launching or ordering any ship.
+        if let Err(e) = crate::campaign::edit(&path, |b| {
+            if let Ok(c) = b.campaign_mut(id) {
+                match moons {
+                    Ok(moons) => {
+                        c.flight.as_mut().unwrap().moons = moons;
+                        if let Err(e) = start_campaign_job(hub, c, stage, &token) { c.flight.as_mut().unwrap().error = e; }
+                    }
+                    Err(e) => c.flight.as_mut().unwrap().error = e,
+                }
+            }
+        }) { eprintln!("campaign dispatch could not be saved: {e}"); }
     }
 }
 
@@ -1228,7 +1408,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             if let Err(msg) = crate::screenshots::validate(&attachments) { return Resp::Err { msg }; }
             let id = hub.lock().unwrap().missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
             let prompt = crate::screenshots::prompt(&text, &attachments);
-            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: to.filter(|_| !launch), at: unix_now(), done_at: None, fleet: None, campaign };
+            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: to.filter(|_| !launch), at: unix_now(), done_at: None, fleet: None, campaign, campaign_job: String::new() };
             if launch {
                 match spawn(hub, &kind, &cwd, None, Some(&prompt), Role::parse(&role), &spec) {
                     Ok(aid) => {
@@ -1257,7 +1437,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                     g.note_task(&text);
                     g.cwd.clone()
                 };
-                h.missions.push(Mission { id: next, cwd, text: text.clone(), attachments: Vec::new(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet), campaign: None });
+                h.missions.push(Mission { id: next, cwd, text: text.clone(), attachments: Vec::new(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet), campaign: None, campaign_job: String::new() });
                 next += 1;
                 sent += 1;
                 order(a, text.clone());
@@ -1433,6 +1613,21 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             }
             None => missing(id),
         },
+        Req::CampaignReport { token, report } => {
+            let mut result = Ok(());
+            match crate::campaign::edit(&crate::campaign::path(), |b| result = b.flight_report(&token, report, unix_now())) {
+                Ok(book) => match result { Ok(()) => {
+                    let complete = book.campaigns.iter().any(|c| c.flight.as_ref().is_some_and(|f| f.planner.as_ref().is_some_and(|j| j.token == token && j.state == "complete"))
+                        || c.stages.iter().any(|s| s.job.as_ref().is_some_and(|j| j.token == token && j.state == "complete")));
+                    if complete {
+                        if let Some(m) = hub.lock().unwrap().missions.iter_mut().find(|m| m.campaign_job == token) { m.state = "done".into(); m.done_at = Some(unix_now()); }
+                        if let Err(msg) = persist_missions(hub) { return Resp::Err { msg }; }
+                    }
+                    Resp::Ok
+                }, Err(msg) => Resp::Err { msg } },
+                Err(e) => Resp::Err { msg: e.to_string() },
+            }
+        }
         Req::Shutdown => {
             // a deliberate stop: nobody comes back next time
             let _ = std::fs::remove_file(registry_file());
@@ -1479,6 +1674,7 @@ pub fn run() -> io::Result<()> {
         // agent ids don't survive a restart; anything under way goes back in the queue
         for m in ms.iter_mut().filter(|m| m.state != "done") {
             if std::env::var_os("EMPIRE_HANDOFF").is_none() {
+                if !m.campaign_job.is_empty() { m.agent = None; continue; }
                 m.state = "queued".into();
                 m.agent = None;
             }
@@ -1516,6 +1712,7 @@ pub fn run() -> io::Result<()> {
                 save_registry(&h, &mut saved);
             }
             dispatch(&h, &mut logged);
+            if tick % 5 == 0 { campaign_tick(&h); }
             let now = Instant::now();
             let list: Vec<(u32, Arc<Mutex<Agent>>)> = h.lock().unwrap().agents.iter().map(|(k, v)| (*k, v.clone())).collect();
             let mut dead = Vec::new();
@@ -1888,5 +2085,41 @@ mod outfit_tests {
         let mut v: serde_json::Value = serde_json::from_str(hand).unwrap();
         v["spec"] = serde_json::to_value(&spec).unwrap();
         assert_eq!(serde_json::from_value::<Handoff>(v).unwrap().spec, spec);
+    }
+}
+
+#[cfg(test)]
+mod campaign_moon_tests {
+    use super::*;
+    #[test]
+    fn campaign_moons_reuse_their_branch_and_preserve_source_and_uncommitted_work() {
+        let root = std::env::temp_dir().join(format!("empire-campaign-moon-{}", crate::expedition::nonce().unwrap()));
+        let world = root.join("source"); std::fs::create_dir_all(&world).unwrap(); let w = world.to_str().unwrap();
+        git(w, &["init", "-b", "main"]).unwrap(); git(w, &["config", "user.name", "Test"]).unwrap(); git(w, &["config", "user.email", "test@example.invalid"]).unwrap();
+        std::fs::write(world.join("base"), "committed").unwrap(); git(w, &["add", "."]).unwrap(); git(w, &["commit", "-m", "Initial"]).unwrap();
+        std::fs::write(world.join("base"), "source dirty").unwrap();
+        let m = campaign_moon(w, "empire/campaign-test", &root.join("moons")).unwrap();
+        assert_eq!(std::fs::read_to_string(std::path::Path::new(&m.path).join("base")).unwrap(), "committed");
+        std::fs::write(std::path::Path::new(&m.path).join("stage-work"), "pending work").unwrap();
+        assert_eq!(campaign_moon(w, "empire/campaign-test", &root.join("moons")).unwrap(), m);
+        assert_eq!(std::fs::read_to_string(world.join("base")).unwrap(), "source dirty");
+        assert!(!world.join("stage-work").exists());
+        assert_eq!(std::fs::read_to_string(std::path::Path::new(&m.path).join("stage-work")).unwrap(), "pending work");
+        assert_eq!(git(w, &["branch", "--show-current"]).unwrap(), "main");
+        assert!(campaign_moon(root.to_str().unwrap(), "empire/no-git", &root.join("moons")).is_err());
+        git(&m.path, &["checkout", "-b", "unrelated"]).unwrap();
+        assert!(campaign_moon(w, "empire/campaign-test", &root.join("moons")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn campaign_reuse_requires_matching_moon_role_and_idle_ship() {
+        let writer = Pty { master: File::options().read(true).write(true).open("/dev/null").unwrap(), pid: 0 };
+        let mut a = new_agent(1, "codex", "/moon", writer, 40, 120); a.status = Status::Done; a.role = Role::Builder;
+        assert!(campaign_free(&a, "codex", "/moon", Role::Builder, &HashSet::new()));
+        assert!(!campaign_free(&a, "codex", "/source", Role::Builder, &HashSet::new()));
+        assert!(!campaign_free(&a, "codex", "/moon", Role::Scout, &HashSet::new()));
+        assert!(!campaign_free(&a, "claude", "/moon", Role::Builder, &HashSet::new()));
+        assert!(!campaign_free(&a, "codex", "/moon", Role::Builder, &HashSet::from([1])));
+        a.status = Status::Blocked; assert!(!campaign_free(&a, "codex", "/moon", Role::Builder, &HashSet::new()));
     }
 }

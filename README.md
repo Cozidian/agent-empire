@@ -241,77 +241,93 @@ and `c` opens comms with the agent.
 
 ## Campaigns
 
-Press **`O`** to give missions a shared purpose, such as “Ship Kiplat authentication.” A campaign
-keeps an objective, acceptance criteria, ordered stages, linked missions, handoff notes and review
-history. It stays available after ships leave or missions are removed from the daemon's log.
+Press **`O`**, then **`n`**, to give the fleet a goal. Describe the goal, optionally add acceptance
+criteria, choose repository roots (one per line), optionally add no-go zones, and choose a ship
+species. The last **Enter** sends a planning ship; **Esc** before that discards the draft.
+Supported campaign species are Claude, Codex, Grok and Cursor when installed.
 
-Start with **`n`**, enter the objective, then the acceptance criteria. **`s`** plans a stage: choose
-its world or worktree moon and describe the task. Plan as many stages as useful; only a stage
-whose predecessors have been accepted can receive a campaign mission or an accepted outcome.
-A sequence might be scout → accepted plan → builder on a moon → inspector → reviewed docking.
-It is optional: one ship can carry the whole campaign, and a stage can link several missions.
+Empire creates a **dedicated worktree moon per scoped repository**, starting from its committed
+HEAD. Uncommitted source-checkout changes are not copied. Planning and execution take place on
+these moons; every stage for a repository shares its campaign moon, including uncommitted work
+from preceding stages. Non-git folders, repositories without a commit, and missing or mismatched
+moons stop dispatch with an explanation. Existing moon work is never reset or deleted.
 
-**`m`** opens the existing mission composer with the objective, criteria, current task, and
-accepted handoffs and verification notes from preceding stages. You can edit the draft, attach
-screenshots, choose a ship, or choose a species and role for a new one. It defaults to queueing;
-nothing is sent until you submit the composer. **Esc** cancels and returns to the campaign.
-New campaign missions link back to their stage through saved metadata. **`l`** links an existing
-mission explicitly, including work on another world or moon, without sending a new order.
-The selected stage and its linked ship appear first, followed by the objective, criteria, handoff
-and verification. **`d`** expands or collapses saved mission prompts and history.
+The planning ship investigates and submits proposed sequential stages with a task, world, role
+and expected evidence. It may propose acceptance criteria if you left them blank. Review the
+plan, edit stages with **`t`**, add one with **`s`**, or remove the selected stage with **Delete**.
+**`r`** rejects the plan with feedback and asks for a revised proposal. **`a`**, then **`y`**,
+approves the displayed plan and starts execution. A changed plan requires fresh approval.
 
-**`o`** opens the stage's linked ship, prioritizing one waiting for input; **Esc** returns to the
-same campaign. Agent questions and replies stay in the ship's native terminal. When a waiting
-state and question are detected, the campaign shows them above the stage; questions written as
-ordinary agent output may require opening the ship to read them. A live linked ship remains
-accessible after its mission reports finished. **Enter** opens the stage world's mission log.
+Approved stages run **one at a time**, independently of whether a galaxy window is open. Empire
+reuses a free ship on the campaign moon when its species and role match and it has no additional
+standing orders or skills; otherwise it launches a suitable ship there. It does not relocate
+ships from source checkouts or interrupt busy ships. A new stage receives the goal, criteria,
+no-go zones, moon paths and previous ships' findings and evidence.
 
-The review sequence is deliberately manual:
+A finished terminal turn **does not complete a stage**. Ships submit explicit structured reports;
+blocked/failed reports retain their question and evidence and hold the handoff. A successful
+report needs evidence, and the next stage waits until the reporting ship has stopped working.
+Reports are attributed to ships, not labelled as player verification. Final completion waits at
+**ready for review**; inspect the evidence and moons, then **`c`**, **`y`** to accept the outcome.
+Merging, pushing, deployment and docking remain separate actions.
 
-1. A finished agent turn means **reported finished**. It does not establish correctness.
-2. **`h`** records findings, changes, evidence and unresolved questions for the handoff.
-3. **`v`** records what you checked and the results, marking the stage **verified by the player**.
-   Linked missions still queued or under way must finish first.
-4. **`a`** accepts that stage. It makes the next stage available; it does not launch it.
-5. Once every stage is accepted, **`c`**, then **`y`**, accepts the campaign against its objective
-   and criteria. No test result or agent status completes a campaign automatically.
+**`o`** opens the selected stage's ship (or the planning ship while planning/reviewing the plan).
+**Esc** in chat returns to the campaign; **F12** or **Ctrl+]** returns from its full terminal.
+Detected questions and reported blockers appear in the campaign view. Questions written as
+ordinary terminal output may require opening the ship. Answer in its native session; its result
+report will carry the decision forward. **`d`** expands saved prompts and history.
 
-| key in campaigns | action |
-| ---------------- | ------ |
-| `Tab` / `Shift+Tab` | switch between campaigns and stages |
-| `↑↓` / `j k` / wheel / click | select; `Home/End` reach the first/last item |
-| `PgUp/Dn` / wheel over details | scroll the selected campaign |
-| `o` | open the linked ship (waiting ship first); `Esc` returns to the campaign |
-| `d` | show or hide history and saved mission prompts |
-| `n` / `e` | create a campaign / edit its objective and criteria |
-| `s` / `t` | add a stage / edit its world and task |
-| `m` / `l` | draft a mission / link an existing mission |
-| `h` / `v` / `a` | record a handoff / record verification / accept the stage |
-| `r` | reopen the selected stage and subsequent reviews |
-| `c` | complete the campaign after `y` confirmation |
-| `x` | archive or restore the campaign; missions and agents keep running |
+**`p`** pauses/resumes future dispatch while the current ship keeps working. **`x`**, **`y`**
+cancels future dispatch without killing ships or removing moons. After cancellation or final
+acceptance, `x` archives/restores the campaign. Interrupted dispatch never
+blindly resends a mission. Inspect the linked ship and moon; **`p`**, **`y`** requests a retry
+when dispatch has failed and no previous ship remains on that moon. Retrying keeps the work and
+issues a new report receipt. A present ship should be opened and helped, not duplicated.
+
+To remove an **archived campaign** from the list, select it and press **Delete**, then **y**.
+**Esc** cancels. Deletion permanently removes that campaign's stages, saved evidence and
+history; ships, missions, repository files and worktree moons remain. This works for both
+manual and automatic campaigns. Active campaigns must be archived first.
+
+No-go zones are instructions supplied to every ship; they are **not filesystem access controls**.
+Native harness permissions still apply, including scouts' read-only modes where supported.
+A harness may ask permission for its local reporting command. Empire never bypasses those
+permissions or turns terminal questions into successful outcomes.
+
+| key in automatic campaigns | action |
+| -------------------------- | ------ |
+| `n` | new scoped goal and planning ship |
+| `a`, then `y` | approve the proposed plan and run it |
+| `t` / `s` / `Delete` | edit / add / remove a proposed stage |
+| `r` | reject the proposal with revision feedback |
+| `o` | open the planning or stage ship |
+| `p` | pause/resume dispatch; confirm a retry after an interrupted launch |
+| `c`, then `y` | accept the final reported outcome |
+| `x`, then `y` | cancel future dispatch; preserve ships and moons (`x` archives/restores once finished) |
+| `Delete`, then `y` on an archived campaign | permanently delete its campaign record from the list |
+| `d` | expand/collapse history and saved mission prompts |
+| `Tab`, `↑↓`, `j k`, wheel/click | select campaigns or stages |
+| `PgUp/Dn`, wheel over details | scroll the selected campaign |
 | `Enter` / `Esc` | open the stage world's mission log / return to the galaxy |
 
+Existing **manual campaigns** keep their behavior. **`N`** creates another manual campaign:
+`s`/`t` plan/edit stages, `m` drafts a mission, `l` links existing work, `h` records the handoff,
+`v` records player verification, and `a` accepts the stage. `e` edits the objective/criteria,
+`r` reopens reviews, `x` archives/restores, and `c`, `y` accepts the campaign. Manual campaigns
+never advance automatically. Start a new scoped goal to use automatic planning; existing work
+and review history are retained.
+
 Text fields support pasted paragraphs and **Shift+Enter**, **Alt+Enter**, or **Ctrl+J** for a
-newline. **Enter** saves or advances; **Esc** discards the edit. Objectives are single lines of
-up to 120 characters; criteria, tasks and review notes allow up to 8,000 characters each.
+newline. **Enter** saves/advances and **Esc** cancels. Goals and manual notes allow up to 8,000
+characters. Changing manual objectives, stages or evidence reopens affected reviews. Missing
+missions retain their snapshots; missing folders never imply success.
 
-Changing the objective or criteria reopens all reviews. Editing a stage, linking new mission
-evidence, or explicitly reopening a stage clears its acceptance and subsequent reviews; previous
-verification and handoff notes remain in history. If the campaign changes while its mission
-composer is open, submission asks you to cancel and reopen it with fresh context.
-
-Missing missions retain their saved prompt, world, agent, times and last observed status, and
-are labelled as snapshots. Their absence does not mean success: you can record a manual review
-using evidence you still have. Missing folders keep their stages but cannot receive a new draft.
-Unarchived campaigns keep available stage worlds charted; archive them with `x` before forgetting
-those dormant worlds with `X` on the galaxy.
-
-Campaigns are saved in `$XDG_STATE_HOME/empire/campaigns.json` (normally
-`~/.local/state/empire/campaigns.json`). Galaxy windows share locked, atomic updates; unreadable
-records are preserved and save failures keep the edit open. Campaigns prepare prompts and record
-outcomes; Claude, Codex and the other harnesses keep their own reasoning, tools, context management
-and execution. Empire does not start the next stage, merge a branch, or dock a moon automatically.
+Campaign state and receipts live in `$XDG_STATE_HOME/empire/campaigns.json` (normally
+`~/.local/state/empire/campaigns.json`) with locked atomic updates. Moons live beneath
+`$XDG_DATA_HOME/empire/moons` (normally `~/.local/share/empire/moons`). Ships submit JSON via
+`empire campaign-report RECEIPT` on stdin; their mission contains the exact command and schema.
+Receipts are specific to an attempt; superseded and completed receipts cannot be reused. Late
+reports after cancellation are retained without dispatching more work. Claude, Codex and other native harnesses retain their reasoning, tools and context management.
 
 ## Commander
 
@@ -641,7 +657,8 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
 - `draw.rs`: procedural dithered planets, ships, outliner, situation log, dialogs, comms.
 - `structure.rs`: structures (AI resources) a world has built, and their construction orders.
 - `anomaly.rs`: persistent findings, lifecycle history, filters and explicit reports.
-- `campaign.rs`: objectives, ordered stages, mission snapshots and manual review history.
+- `campaign.rs`: objectives, ordered stages, snapshots and manual reviews.
+- `expedition.rs`: proposed plans, approval, automatic handoffs and report receipts; `daemon.rs` dispatches on campaign moons.
 - `hyperlane.rs`: named, directional relationships between worlds.
 - `design.rs`: saved ship designs, and which skill folders each species reads.
 - `sector.rs`: named groups of worlds; `state.rs`: shared locked, atomic local storage.

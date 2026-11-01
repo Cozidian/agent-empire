@@ -14,10 +14,16 @@ pub struct Stage {
     pub id: u64, pub world: String, pub task: String,
     pub missions: Vec<Linked>, pub handoff: String, pub verification: String,
     pub accepted: Option<u64>, pub history: Vec<Note>,
+    #[serde(default)] pub role: String,
+    #[serde(default)] pub expected: String,
+    #[serde(default)] pub job: Option<crate::expedition::Job>,
+    #[serde(default)] pub outcome: Option<crate::expedition::Outcome>,
 }
 
 impl Stage {
     pub fn status(&self) -> &'static str {
+        if let Some(r) = &self.outcome { return match r.status.as_str() { "complete" => "completed by ship", "blocked" => "needs input", _ => "needs attention" }; }
+        if let Some(j) = &self.job { return if j.state == "reserved" { "preparing moon" } else { "under way" }; }
         if self.accepted.is_some() { "accepted" }
         else if !self.verification.is_empty() { "verified" }
         else if self.missions.is_empty() { "planned" }
@@ -32,10 +38,12 @@ pub struct Campaign {
     pub id: u64, pub objective: String, pub criteria: String, pub stages: Vec<Stage>,
     pub completed: Option<u64>, pub archived: bool, pub history: Vec<Note>,
     next_stage: u64,
+    #[serde(default)] pub flight: Option<crate::expedition::Flight>,
 }
 
 impl Campaign {
     pub fn ready(&self, stage: u64) -> Result<usize, String> {
+        if self.flight.is_some() { return Err("This campaign runs its approved plan automatically".into()); }
         if self.archived || self.completed.is_some() { return Err("Reopen this campaign before continuing".into()); }
         let i = self.stages.iter().position(|s| s.id == stage).ok_or("This stage is no longer available")?;
         if self.stages[..i].iter().any(|s| s.accepted.is_none()) { return Err("Accept the earlier stages before this handoff".into()); }
@@ -52,23 +60,24 @@ pub struct Book {
 }
 
 impl Book {
-    fn campaign_mut(&mut self, id: u64) -> Result<&mut Campaign, String> {
+    pub(crate) fn campaign_mut(&mut self, id: u64) -> Result<&mut Campaign, String> {
         self.campaigns.iter_mut().find(|c| c.id == id).ok_or_else(|| "This campaign is no longer available".into())
     }
 
     pub fn create(&mut self, objective: &str, criteria: &str, at: u64) -> Result<u64, String> {
-        let objective = checked(objective, 120, false)?;
-        let criteria = checked(criteria, 8000, true)?;
+        let objective = checked(objective, 8000, true)?;
+        let criteria = optional_criteria(criteria)?;
         let id = self.next.max(self.campaigns.iter().map(|c| c.id).max().unwrap_or(0)).checked_add(1).ok_or("No campaign ids left")?;
         self.next = id;
-        self.campaigns.push(Campaign { id, objective, criteria, stages: vec![], completed: None, archived: false, next_stage: 0,
-            history: vec![note(at, "created", "Campaign created; all handoffs are manual")] });
+        self.campaigns.push(Campaign { id, objective, criteria, stages: vec![], completed: None, archived: false, next_stage: 0, flight: None,
+            history: vec![note(at, "created", "Campaign created")] });
         Ok(id)
     }
 
     pub fn update(&mut self, id: u64, objective: &str, criteria: &str, at: u64) -> Result<(), String> {
-        let (objective, criteria) = (checked(objective, 120, false)?, checked(criteria, 8000, true)?);
+        let (objective, criteria) = (checked(objective, 8000, true)?, optional_criteria(criteria)?);
         let c = self.campaign_mut(id)?;
+        if c.flight.is_some() { return Err("Create a new scoped goal to change an automatic campaign; its existing work is kept".into()); }
         if c.archived { return Err("Restore this campaign before editing it".into()); }
         if c.objective != objective || c.criteria != criteria {
             c.history.push(note(at, "previous objective", &format!("{}\nAcceptance criteria:\n{}", c.objective, c.criteria)));
@@ -82,10 +91,11 @@ impl Book {
         if !std::path::Path::new(world).is_absolute() || world.chars().any(char::is_control) { return Err("Choose an absolute world path".into()); }
         let task = checked(task, 8000, true)?;
         let c = self.campaign_mut(id)?;
+        if c.flight.is_some() { return Err("Edit the proposed plan before approval".into()); }
         if c.archived || c.completed.is_some() { return Err("Reopen this campaign before adding a stage".into()); }
         let stage = c.next_stage.max(c.stages.iter().map(|s| s.id).max().unwrap_or(0)).checked_add(1).ok_or("No stage ids left")?;
         c.next_stage = stage;
-        c.stages.push(Stage { id: stage, world: world.into(), task, missions: vec![], handoff: String::new(), verification: String::new(), accepted: None,
+        c.stages.push(Stage { id: stage, world: world.into(), task, role: String::new(), expected: String::new(), job: None, outcome: None, missions: vec![], handoff: String::new(), verification: String::new(), accepted: None,
             history: vec![note(at, "planned", "Stage planned; no mission sent")] });
         Ok(stage)
     }
@@ -94,6 +104,7 @@ impl Book {
         if !std::path::Path::new(world).is_absolute() || world.chars().any(char::is_control) { return Err("Choose an absolute world path".into()); }
         let task = checked(task, 8000, true)?;
         let c = self.campaign_mut(id)?;
+        if c.flight.is_some() { return Err("Edit the proposed plan before approval".into()); }
         if c.archived { return Err("Restore the campaign before editing its stages".into()); }
         let i = c.stages.iter().position(|s| s.id == stage).ok_or("This stage is no longer available")?;
         if c.stages[i].world != world || c.stages[i].task != task {
@@ -149,6 +160,11 @@ impl Book {
     pub fn complete(&mut self, id: u64, at: u64) -> Result<(), String> {
         let c = self.campaign_mut(id)?;
         if c.archived { return Err("Restore the campaign first".into()); }
+        if c.flight.is_some() {
+            if c.flight_status() != "review" { return Err("Wait for every stage's explicit result and final review".into()); }
+            c.completed = Some(at); c.flight.as_mut().unwrap().phase = "accepted".into();
+            c.history.push(note(at, "campaign accepted", "Player accepted the reported evidence; moons remain available for docking")); return Ok(());
+        }
         if c.stages.is_empty() || c.stages.iter().any(|s| s.accepted.is_none()) { return Err("Accept every stage before completing the campaign".into()); }
         c.completed = Some(at); c.history.push(note(at, "campaign accepted", "Player reviewed the objective and acceptance criteria"));
         Ok(())
@@ -156,6 +172,7 @@ impl Book {
 
     pub fn reopen(&mut self, id: u64, stage: u64, at: u64) -> Result<(), String> {
         let c = self.campaign_mut(id)?;
+        if c.flight.is_some() { return Err("Automatic stage results are kept; start a follow-up campaign for further work".into()); }
         let i = c.stages.iter().position(|s| s.id == stage).ok_or("Choose a stage to reopen")?;
         c.archived = false;
         invalidate(c, i, at, "Player reopened this stage and subsequent handoffs");
@@ -165,6 +182,16 @@ impl Book {
     pub fn archive(&mut self, id: u64, at: u64) -> Result<(), String> {
         let c = self.campaign_mut(id)?; c.archived = !c.archived;
         c.history.push(note(at, if c.archived { "archived" } else { "restored" }, "Missions and agents are unchanged"));
+        Ok(())
+    }
+
+    /// Forget an archived campaign's records, leaving its missions, ships and moons alone.
+    pub fn delete(&mut self, id: u64) -> Result<(), String> {
+        let i = self.campaigns.iter().position(|c| c.id == id).ok_or("This campaign is no longer available")?;
+        if !self.campaigns[i].archived { return Err("Archive this campaign before deleting it".into()); }
+        // old books may have no counter; never reuse an id still named by a mission receipt
+        self.next = self.next.max(self.campaigns.iter().map(|c| c.id).max().unwrap_or(0));
+        self.campaigns.remove(i);
         Ok(())
     }
 
@@ -189,7 +216,7 @@ impl Book {
                     }
                 }
             }
-            if let Some(i) = changed { invalidate(c, i, at, "Mission evidence changed; review affected handoffs again"); }
+            if c.flight.is_none() && let Some(i) = changed { invalidate(c, i, at, "Mission evidence changed; review affected handoffs again"); }
         }
     }
 
@@ -206,6 +233,8 @@ impl Book {
         Ok(text)
     }
 }
+
+fn optional_criteria(s: &str) -> Result<String, String> { if s.trim().is_empty() { Ok(String::new()) } else { checked(s, 8000, true) } }
 
 fn checked(text: &str, max: usize, multiline: bool) -> Result<String, String> {
     if text.chars().any(|c| c.is_control() && !(multiline && c == '\n')) { return Err("Use plain text without control characters".into()); }
@@ -235,6 +264,24 @@ pub fn edit(path: &std::path::Path, change: impl FnOnce(&mut Book)) -> std::io::
 mod tests {
     use super::*;
     fn done() -> Mission { Mission { id: 7, cwd: "/world".into(), text: "Inspect auth".into(), state: "done".into(), at: 10, ..Default::default() } }
+
+    #[test]
+    fn archived_deletion_persists_and_old_missions_cannot_restore_it_or_reuse_its_id() {
+        let dir = std::env::temp_dir().join(format!("empire-campaign-delete-{}", std::process::id()));
+        let path = dir.join("campaigns.json");
+        let (mut book, id, stage) = reviewed();
+        let before = book.clone();
+        assert!(book.delete(id).is_err()); assert_eq!(book, before);
+        book.archive(id, 14).unwrap();
+        book.next = 0; // legacy books did not always store the next id
+        edit(&path, |b| *b = book).unwrap();
+        edit(&path, |b| b.delete(id).unwrap()).unwrap();
+        let b = edit(&path, |b| b.refresh(&[Mission { campaign: Some(CampaignRef { campaign: id, stage }), ..done() }], 15)).unwrap();
+        assert!(b.campaigns.is_empty());
+        let b = edit(&path, |b| { assert!(b.create("Another goal", "", 16).unwrap() > id); }).unwrap();
+        assert_eq!(b.campaigns.len(), 1); assert!(b.campaigns[0].stages.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn finishing_a_mission_does_not_verify_accept_or_advance_the_campaign() {

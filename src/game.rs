@@ -488,12 +488,13 @@ pub struct LaneView {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum CampaignEdit { Objective, Criteria, World, Task, Handoff, Verify, Link, Complete }
+pub enum CampaignEdit { Objective, Criteria, World, Task, Handoff, Verify, Link, Complete, Scope, Limits, Species, Approve, Reject, Cancel, Retry, StageRole, StageEvidence, Delete(u64) }
 
 #[derive(Default)]
 pub struct CampaignView {
     pub id: u64, pub stage: u64, pub stages: bool, pub edit: Option<CampaignEdit>, pub new: bool, pub stage_edit: bool,
     pub objective: String, pub world: String, pub text: Line, pub mission: usize, pub scroll: usize, pub error: String, pub details: bool,
+    pub automatic: bool, pub criteria: String, pub scope: String, pub limits: String, pub task: String, pub role: String, pub approval: String,
 }
 
 struct CampaignDraft { link: crate::proto::CampaignRef, context: String }
@@ -1488,6 +1489,9 @@ impl App {
         }
         for key in self.campaigns.campaigns.iter().filter(|c| !c.archived).flat_map(|c| c.stages.iter().map(|s| &s.world)) {
             if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
+        }
+        for f in self.campaigns.campaigns.iter().filter(|c| !c.archived).filter_map(|c| c.flight.as_ref()) {
+            for key in f.worlds.iter().chain(f.moons.iter().map(|m| &m.path)) { if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); } }
         }
         // worktrees are moons of the world they were split from (which shows up even if empty)
         let host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
@@ -2562,15 +2566,28 @@ impl App {
         self.campaigns.campaigns.iter().find(|c| c.id == self.campaign_view.id).or(self.campaigns.campaigns.first())
     }
     pub fn campaign_stage(&self) -> Option<&crate::campaign::Stage> {
-        self.selected_campaign().and_then(|c| c.stages.iter().find(|s| s.id == self.campaign_view.stage).or(c.stages.first()))
+        self.selected_campaign().and_then(|c| c.stages.iter().find(|s| s.id == self.campaign_view.stage)
+            .or_else(|| if c.flight.is_some() { c.stages.iter().find(|s| !s.outcome.as_ref().is_some_and(|r| r.status == "complete")).or(c.stages.last()) } else { c.stages.first() }))
     }
     /// The stage's waiting ship first, then its most recent live mission's ship.
     pub fn campaign_ship(&self, stage: &crate::campaign::Stage) -> Option<&Agent> {
+        if let Some(j) = &stage.job && let Some(a) = j.ship.and_then(|id| self.agent(id)).filter(|a| a.cwd == j.world && a.dying.is_none() && a.status != Status::Exited) { return Some(a); }
         stage.missions.iter().rev().filter(|l| l.available).filter_map(|l| {
             self.agent(l.mission.agent?).filter(|a| a.cwd == l.mission.cwd && a.dying.is_none() && a.status != Status::Exited)
         }).min_by_key(|a| if a.status == Status::Blocked { 0 } else { 1 })
     }
+    pub fn campaign_current_ship(&self) -> Option<&Agent> {
+        let c = self.selected_campaign()?;
+        if let Some(j) = c.flight.as_ref().filter(|f| matches!(f.phase.as_str(), "planning" | "proposed")).and_then(|f| f.planner.as_ref()) {
+            return j.ship.and_then(|id| self.agent(id)).filter(|a| a.cwd == j.world && a.dying.is_none() && a.status != Status::Exited);
+        }
+        if c.flight.is_some() && let Some(j) = c.flight_job() {
+            return j.ship.and_then(|id| self.agent(id)).filter(|a| a.cwd == j.world && a.dying.is_none() && a.status != Status::Exited);
+        }
+        self.campaign_stage().and_then(|s| self.campaign_ship(s))
+    }
     pub fn campaign_worlds(&self, w: &World) -> Vec<String> {
+        if let Some(f) = self.selected_campaign().and_then(|c| c.flight.as_ref()) { return f.worlds.clone(); }
         let mut paths: std::collections::BTreeSet<_> = w.planets.iter().map(|p| p.key.clone()).collect();
         if let Some(c) = self.selected_campaign() { paths.extend(c.stages.iter().map(|s| s.world.clone())); }
         paths.into_iter().collect()
@@ -2614,7 +2631,7 @@ impl App {
     }
     fn campaign_edit(&mut self, edit: CampaignEdit) {
         let value = match edit {
-            CampaignEdit::Objective => self.selected_campaign().map(|c| c.objective.clone()).unwrap_or_default(),
+            CampaignEdit::Objective | CampaignEdit::Delete(_) => self.selected_campaign().map(|c| c.objective.clone()).unwrap_or_default(),
             CampaignEdit::Task if self.campaign_view.stage_edit => self.campaign_stage().map(|s| s.task.clone()).unwrap_or_default(),
             CampaignEdit::Handoff => self.campaign_stage().map(|s| s.handoff.clone()).unwrap_or_default(),
             CampaignEdit::Verify => self.campaign_stage().map(|s| s.verification.clone()).unwrap_or_default(),
@@ -2628,25 +2645,74 @@ impl App {
         let (edit, text, at) = (view.edit, view.text.s.clone(), survey::now().max(0) as u64);
         let result = match edit {
             Some(CampaignEdit::Objective) => {
-                if text.trim().is_empty() || text.trim().chars().count() > 120 || text.chars().any(char::is_control) {
-                    self.campaign_view.error = "Use a single-line objective of 1–120 characters".into(); return;
+                if text.trim().is_empty() || text.trim().chars().count() > 8000 || text.chars().any(|c| c.is_control() && c != '\n') {
+                    self.campaign_view.error = "Describe a goal in 1–8000 characters".into(); return;
                 }
                 self.campaign_view.objective = text;
                 let criteria = if self.campaign_view.new { String::new() } else { self.selected_campaign().map_or(String::new(), |c| c.criteria.clone()) };
                 self.campaign_view.text.set(criteria); self.campaign_view.edit = Some(CampaignEdit::Criteria); return;
             }
             Some(CampaignEdit::Criteria) => {
+                if self.campaign_view.automatic {
+                    self.campaign_view.criteria = text;
+                    self.campaign_view.edit = Some(CampaignEdit::Scope);
+                    self.campaign_view.text.set(self.campaign_view.scope.clone()); return;
+                }
                 let objective = self.campaign_view.objective.clone(); let new = self.campaign_view.new;
                 self.sync_campaigns(|b| if new { b.create(&objective, &text, at) } else { b.update(id, &objective, &text, at).map(|_| id) })
             }
+            Some(CampaignEdit::Scope) => {
+                let mut paths = Vec::new();
+                for line in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                    let p = if let Some(tail) = line.strip_prefix("~/") { home().join(tail) } else { PathBuf::from(line) };
+                    match std::fs::canonicalize(&p) {
+                        Ok(p) if p.is_dir() => { let p = p.to_string_lossy().into_owned(); if !paths.contains(&p) { paths.push(p); } }
+                        _ => { self.campaign_view.error = format!("Repository folder unavailable: {line}"); return; }
+                    }
+                }
+                if paths.is_empty() || paths.len() > 12 { self.campaign_view.error = "Choose 1–12 repository roots, one per line".into(); return; }
+                self.campaign_view.scope = paths.join("\n"); self.campaign_edit(CampaignEdit::Limits); return;
+            }
+            Some(CampaignEdit::Limits) => {
+                self.campaign_view.limits = text; self.campaign_edit(CampaignEdit::Species);
+                self.campaign_view.text.set(self.kinds.first().cloned().unwrap_or_else(|| "claude".into())); return;
+            }
+            Some(CampaignEdit::Species) => {
+                let view = &self.campaign_view;
+                let (goal, criteria, scope, limits, kind) = (view.objective.clone(), view.criteria.clone(), view.scope.clone(), view.limits.clone(), text.trim().to_string());
+                self.sync_campaigns(|b| {
+                    let mut next = b.clone(); let id = next.create(&goal, &criteria, at)?;
+                    next.automate(id, scope.lines().map(String::from).collect(), limits, kind, at)?;
+                    *b = next; Ok(id)
+                })
+            }
+            Some(CampaignEdit::Reject) => self.sync_campaigns(|b| b.reject_plan(id, text, at).map(|_| id)),
             Some(CampaignEdit::World) => {
                 if self.campaign_view.world.is_empty() || !self.campaign_worlds(w).contains(&self.campaign_view.world) { self.campaign_view.error = "Choose a charted world".into(); return; }
                 self.campaign_edit(CampaignEdit::Task); return;
             }
             Some(CampaignEdit::Task) => {
+                if self.selected_campaign().is_some_and(|c| c.flight.is_some()) {
+                    self.campaign_view.task = text;
+                    let role = if self.campaign_view.stage_edit { self.campaign_stage().map_or("builder".into(), |s| s.role.clone()) } else { "builder".into() };
+                    self.campaign_edit(CampaignEdit::StageRole); self.campaign_view.text.set(role); return;
+                }
                 let world = self.campaign_view.world.clone();
                 let editing = self.campaign_view.stage_edit;
                 self.sync_campaigns(|b| if editing { b.update_stage(id, stage, &world, &text, at).map(|_| stage) } else { b.add_stage(id, &world, &text, at) })
+            }
+            Some(CampaignEdit::StageRole) => {
+                if !["scout", "builder", "inspector"].contains(&text.trim()) { self.campaign_view.error = "Choose scout, builder or inspector".into(); return; }
+                self.campaign_view.role = text.trim().into();
+                let expected = if self.campaign_view.stage_edit { self.campaign_stage().map_or(String::new(), |s| s.expected.clone()) } else { String::new() };
+                self.campaign_edit(CampaignEdit::StageEvidence); self.campaign_view.text.set(expected); return;
+            }
+            Some(CampaignEdit::StageEvidence) => {
+                let mut plan = self.selected_campaign().unwrap().proposed_plan();
+                let step = crate::expedition::Step { world: self.campaign_view.world.clone(), task: self.campaign_view.task.clone(), role: self.campaign_view.role.clone(), evidence: text };
+                if self.campaign_view.stage_edit { if let Some(i) = self.selected_campaign().unwrap().stages.iter().position(|s| s.id == stage) { plan.stages[i] = step; } }
+                else { plan.stages.push(step); }
+                self.sync_campaigns(|b| b.propose(id, plan, at).map(|_| id))
             }
             Some(CampaignEdit::Handoff) => self.sync_campaigns(|b| b.handoff(id, stage, &text, at).map(|_| stage)),
             Some(CampaignEdit::Verify) => self.sync_campaigns(|b| b.verify(id, stage, &text, at).map(|_| stage)),
@@ -2658,7 +2724,7 @@ impl App {
         };
         match result {
             Ok(key) => {
-                if edit == Some(CampaignEdit::Criteria) { self.campaign_view.id = key; self.campaign_view.stages = true; }
+                if matches!(edit, Some(CampaignEdit::Criteria | CampaignEdit::Species)) { self.campaign_view.id = key; self.campaign_view.stages = true; }
                 if edit == Some(CampaignEdit::Task) { self.campaign_view.stage = key; self.campaign_view.stages = true; }
                 self.campaign_view.edit = None; self.campaign_view.error.clear(); self.campaign_view.scroll = 0;
             }
@@ -2677,10 +2743,41 @@ fn campaign_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event
     }
     let (id, stage) = (app.selected_campaign().map_or(0, |c| c.id), app.campaign_stage().map_or(0, |s| s.id));
     let at = survey::now().max(0) as u64;
-    if edit == Some(CampaignEdit::Complete) {
+    if let Some(CampaignEdit::Delete(target)) = edit {
         if let Event::Key(k) = ev {
             if matches!(k.code, KeyCode::Char('y' | 'Y')) {
-                match app.sync_campaigns(|b| b.complete(id, at).map(|_| id)) {
+                match app.sync_campaigns(|b| {
+                    let pos = b.campaigns.iter().position(|c| c.id == target).unwrap_or(0);
+                    b.delete(target)?;
+                    Ok(b.campaigns.get(pos.min(b.campaigns.len().saturating_sub(1))).map_or(0, |c| c.id))
+                }) {
+                    Ok(next) => {
+                        app.campaign_view.id = next; app.campaign_view.stage = 0; app.campaign_view.stages = false;
+                        app.campaign_view.scroll = 0; app.campaign_view.details = false;
+                        app.campaign_view.edit = None; app.campaign_view.error.clear();
+                    }
+                    Err(e) => app.campaign_view.error = e,
+                }
+            } else { app.campaign_view.edit = None; }
+        }
+        return;
+    }
+    if matches!(edit, Some(CampaignEdit::Complete | CampaignEdit::Approve | CampaignEdit::Cancel | CampaignEdit::Retry)) {
+        if let Event::Key(k) = ev {
+            if matches!(k.code, KeyCode::Char('y' | 'Y')) {
+                let approval = app.campaign_view.approval.clone();
+                match app.sync_campaigns(|b| {
+                    match edit {
+                        Some(CampaignEdit::Approve) => {
+                            let c = b.campaigns.iter().find(|c| c.id == id).ok_or("Campaign unavailable")?;
+                            if serde_json::to_string(&c.proposed_plan()).unwrap_or_default() != approval { return Err("The proposed plan changed; review it again before approval".into()); }
+                            b.approve_plan(id, at)
+                        }
+                        Some(CampaignEdit::Cancel) => b.cancel_flight(id, at),
+                        Some(CampaignEdit::Retry) => b.pause_flight(id, at),
+                        _ => b.complete(id, at),
+                    }.map(|_| id)
+                }) {
                     Ok(_) => { app.campaign_view.edit = None; app.campaign_view.error.clear(); }
                     Err(e) => app.campaign_view.error = e,
                 }
@@ -2700,6 +2797,37 @@ fn campaign_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event
             _ => {}
         }
         return;
+    }
+    if !picking && app.selected_campaign().is_some_and(|c| c.archived)
+        && let Event::Key(k) = ev && k.code == KeyCode::Delete {
+        app.campaign_edit(CampaignEdit::Delete(id)); return;
+    }
+    if !picking && app.selected_campaign().is_some_and(|c| c.flight.is_some()) && let Event::Key(k) = ev {
+        let phase = app.selected_campaign().unwrap().flight_status().to_string();
+        match k.code {
+            KeyCode::Char('a') => {
+                app.campaign_view.approval = serde_json::to_string(&app.selected_campaign().unwrap().proposed_plan()).unwrap_or_default();
+                if phase == "proposed" { app.campaign_edit(CampaignEdit::Approve); }
+                else { app.campaign_view.error = "Approve a proposed plan; stage handoffs are automatic".into(); } return;
+            }
+            KeyCode::Char('r') => { if phase == "proposed" { app.campaign_edit(CampaignEdit::Reject); } else { app.campaign_view.error = "Reject a proposed plan before it starts".into(); } return; }
+            KeyCode::Char('p') => {
+                if app.selected_campaign().unwrap().flight.as_ref().is_some_and(|f| !f.error.is_empty()) { app.campaign_edit(CampaignEdit::Retry); }
+                else { app.campaign_view.error = app.sync_campaigns(|b| b.pause_flight(id, at).map(|_| id)).err().unwrap_or_default(); } return;
+            }
+            KeyCode::Char('x') => {
+                if matches!(phase.as_str(), "accepted" | "cancelled") { app.campaign_view.error = app.sync_campaigns(|b| b.archive(id, at).map(|_| id)).err().unwrap_or_default(); }
+                else { app.campaign_edit(CampaignEdit::Cancel); } return;
+            }
+            KeyCode::Char('e' | 'h' | 'v' | 'l' | 'm') => { app.campaign_view.error = "The approved plan handles missions and evidence; o opens its ship".into(); return; }
+            KeyCode::Char('s' | 't') if phase != "proposed" => { app.campaign_view.error = "Edit stages while the plan awaits approval".into(); return; }
+            KeyCode::Delete if phase == "proposed" => {
+                let c = app.selected_campaign().unwrap(); let mut plan = c.proposed_plan();
+                if let Some(i) = c.stages.iter().position(|s| s.id == stage) { plan.stages.remove(i); }
+                app.campaign_view.error = app.sync_campaigns(|b| b.propose(id, plan, at).map(|_| id)).err().unwrap_or_default(); return;
+            }
+            _ => {}
+        }
     }
     let worlds = app.campaign_worlds(w);
     let ids: Vec<_> = app.campaigns.campaigns.iter().map(|c| c.id).collect();
@@ -2721,8 +2849,12 @@ fn campaign_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event
             KeyCode::PageDown => { app.campaign_view.scroll = app.campaign_view.scroll.saturating_add(8); return; }
             KeyCode::Enter if picking => { app.campaign_save(w); return; }
             KeyCode::Tab | KeyCode::BackTab if !picking => { app.campaign_view.stages = !app.campaign_view.stages; return; }
-            KeyCode::Char('n') if !picking => { app.campaign_view.new = true; app.campaign_edit(CampaignEdit::Objective); app.campaign_view.text.set(String::new()); return; }
-            KeyCode::Char('e') if !picking && id != 0 => { app.campaign_view.new = false; app.campaign_edit(CampaignEdit::Objective); return; }
+            KeyCode::Char('n' | 'N') if !picking => {
+                app.campaign_view.automatic = k.code == KeyCode::Char('n'); app.campaign_view.new = true; app.campaign_view.stage = 0;
+                app.campaign_view.scope = app.sel_planet().and_then(|p| app.moon_host(&p).or(Some(p))).or_else(|| worlds.first().cloned()).unwrap_or_default();
+                app.campaign_edit(CampaignEdit::Objective); app.campaign_view.text.set(String::new()); return;
+            }
+            KeyCode::Char('e') if !picking && id != 0 => { app.campaign_view.automatic = false; app.campaign_view.new = false; app.campaign_edit(CampaignEdit::Objective); return; }
             KeyCode::Char('s') if !picking && id != 0 => {
                 app.campaign_view.stage_edit = false;
                 app.campaign_edit(CampaignEdit::World);
@@ -2738,7 +2870,7 @@ fn campaign_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event
             KeyCode::Char('m') if !picking => { app.campaign_draft(w); return; }
             KeyCode::Char('d') if !picking => { app.campaign_view.details = !app.campaign_view.details; app.campaign_view.scroll = 0; return; }
             KeyCode::Char('o') if !picking => {
-                if let Some(id) = app.campaign_stage().and_then(|s| app.campaign_ship(s)).map(|a| a.id) {
+                if let Some(id) = app.campaign_current_ship().map(|a| a.id) {
                     app.campaign_return = true;
                     app.open_comms(id, client, l);
                 } else { app.campaign_view.error = "No live ship linked to this stage; m drafts a mission, Enter opens its log".into(); }
@@ -6475,6 +6607,75 @@ mod hyperlane_tests {
 mod campaign_tests {
     use super::*;
 
+    #[test]
+    fn archived_automatic_campaign_deletes_and_selects_its_neighbor() {
+        let (mut app, w, l) = fixture(); let (client, commands) = Client::recording(); app.mode = Mode::Campaigns;
+        let id = app.campaigns.create("Old automatic goal", "", 1).unwrap();
+        app.campaigns.automate(id, vec!["/world/app".into()], String::new(), "codex".into(), 2).unwrap();
+        app.campaigns.cancel_flight(id, 3).unwrap(); app.campaigns.archive(id, 4).unwrap();
+        let next = app.campaigns.create("Keep this goal", "", 5).unwrap();
+        key(&mut app, &w, &l, &client, KeyCode::Delete); key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert_eq!(app.campaigns.campaigns.len(), 1); assert_eq!(app.campaign_view.id, next);
+        assert!(!app.campaign_view.stages); assert_eq!(app.campaign_view.scroll, 0);
+        assert_eq!(app.selected_campaign().unwrap().objective, "Keep this goal");
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn archived_deletion_rechecks_disk_and_never_deletes_a_fallback_selection() {
+        let (mut app, w, l) = fixture(); let client = Client::isolated(); app.mode = Mode::Campaigns;
+        let dir = std::env::temp_dir().join(format!("empire-campaign-delete-race-{}", std::process::id()));
+        let path = dir.join("campaigns.json"); app.campaign_path = Some(path.clone());
+        app.sync_campaigns(|b| {
+            let id = b.create("Old goal", "", 1)?; b.archive(id, 2)?;
+            let other = b.create("Keep this archived goal", "", 3)?; b.archive(other, 4)?; Ok(id)
+        }).unwrap();
+        key(&mut app, &w, &l, &client, KeyCode::Delete);
+        crate::campaign::edit(&path, |b| b.archive(1, 5).unwrap()).unwrap(); // another window restored it
+        key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert_eq!(app.campaigns.campaigns.len(), 2); assert!(app.campaign_view.error.contains("Archive"));
+        key(&mut app, &w, &l, &client, KeyCode::Esc);
+        app.sync_campaigns(|b| b.archive(1, 6).map(|_| 1)).unwrap();
+        key(&mut app, &w, &l, &client, KeyCode::Delete);
+        crate::campaign::edit(&path, |b| b.delete(1).unwrap()).unwrap();
+        app.sync_campaigns(|_| Ok(0)).unwrap(); // the visible list has already refreshed
+        key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert_eq!(app.campaigns.campaigns.len(), 1); assert_eq!(app.campaigns.campaigns[0].id, 2);
+        assert!(app.campaign_view.error.contains("no longer available"));
+        key(&mut app, &w, &l, &client, KeyCode::Esc);
+        key(&mut app, &w, &l, &client, KeyCode::Delete);
+        std::fs::write(&path, "broken").unwrap();
+        key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert_eq!(app.campaigns.campaigns.len(), 1); assert!(app.campaign_view.error.contains("could not be saved or loaded"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn archived_campaign_delete_requires_confirmation_and_keeps_missions_and_ships() {
+        let (mut app, w, l) = fixture(); let (client, commands) = Client::recording(); plan(&mut app, &w, &l, &client);
+        app.missions.push(Mission { id: 41, cwd: "/world/app".into(), campaign: Some(crate::proto::CampaignRef { campaign: 1, stage: 1 }), ..Default::default() });
+        key(&mut app, &w, &l, &client, KeyCode::Delete);
+        key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert_eq!(app.campaigns.campaigns.len(), 1, "Active campaigns cannot be deleted");
+        key(&mut app, &w, &l, &client, KeyCode::Char('x'));
+        key(&mut app, &w, &l, &client, KeyCode::Delete);
+        assert_eq!(app.campaigns.campaigns.len(), 1);
+        let mut fb = Fb::new(120, 42); draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("Delete archived campaign") && text.contains("Ship authentication") && text.contains("y delete"));
+        key(&mut app, &w, &l, &client, KeyCode::Esc);
+        assert_eq!(app.campaigns.campaigns.len(), 1);
+        key(&mut app, &w, &l, &client, KeyCode::Delete);
+        key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert!(app.campaigns.campaigns.is_empty());
+        assert_eq!(app.missions.len(), 1); assert_eq!(app.agents.len(), 2);
+        assert!(commands.try_recv().is_err());
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(!text.contains("Ship authentication") && text.contains("n begins a campaign"));
+    }
+
     fn fixture() -> (App, World, Lay) {
         let mut app = App::new(); app.loaded = true; app.online = true; app.kinds = vec!["codex".into()];
         let mut a = ship_card_tests::ship(1, false); a.cwd = "/world/app".into(); app.agents.push(a);
@@ -6492,11 +6693,56 @@ mod campaign_tests {
     }
     fn plan(app: &mut App, w: &World, l: &Lay, client: &Client) {
         key(app, w, l, client, KeyCode::Char('O'));
-        key(app, w, l, client, KeyCode::Char('n'));
+        key(app, w, l, client, KeyCode::Char('N'));
         paste(app, w, l, client, "Ship authentication"); key(app, w, l, client, KeyCode::Enter);
         paste(app, w, l, client, "Anonymous access is rejected\nExisting sessions still work"); key(app, w, l, client, KeyCode::Enter);
         key(app, w, l, client, KeyCode::Char('s')); key(app, w, l, client, KeyCode::Enter);
         paste(app, w, l, client, "Scout auth routes and propose a plan"); key(app, w, l, client, KeyCode::Enter);
+    }
+
+    #[test]
+    fn campaign_questions_follow_active_ship_while_inspecting_an_earlier_stage() {
+        let (mut app, w, l) = fixture(); let client = Client::isolated(); app.mode = Mode::Campaigns;
+        let id = app.campaigns.create("Goal", "", 1).unwrap();
+        app.campaigns.automate(id, vec!["/world/app".into()], String::new(), "codex".into(), 2).unwrap();
+        let step = crate::expedition::Step { world: "/world/app".into(), task: "Inspect".into(), role: "inspector".into(), evidence: "Tests".into() };
+        app.campaigns.propose(id, crate::expedition::Plan { summary: "Two steps".into(), criteria: String::new(), stages: vec![step.clone(), step] }, 3).unwrap();
+        app.campaigns.approve_plan(id, 4).unwrap();
+        app.campaigns.campaigns[0].stages[0].outcome = Some(crate::expedition::Outcome { status: "complete".into(), summary: "Built".into(), evidence: "Tests".into(), question: String::new() });
+        app.campaigns.campaigns[0].stages[1].job = Some(crate::expedition::Job { token: "active".into(), world: "/moons/auth".into(), role: "inspector".into(), task: "Inspect".into(), mission: None, ship: Some(2), state: "waiting".into() });
+        app.campaigns.campaigns[0].stages[1].outcome = Some(crate::expedition::Outcome { status: "blocked".into(), summary: "Need a choice".into(), evidence: String::new(), question: "Which integration target?".into() });
+        app.campaign_view.stage = 1;
+        let mut fb = Fb::new(120,42); draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect(); assert!(text.contains("Which integration target?"));
+        key(&mut app, &w, &l, &client, KeyCode::Char('o')); assert!(matches!(app.mode, Mode::Chat { id: 2, .. }));
+        key(&mut app, &w, &l, &client, KeyCode::Esc); assert!(matches!(app.mode, Mode::Campaigns)); assert_eq!(app.campaign_view.stage, 1);
+    }
+
+    #[test]
+    fn automatic_campaign_intake_and_plan_approval_need_no_manual_missions() {
+        let (mut app, w, l) = fixture(); let (client, commands) = Client::recording();
+        let dir = std::env::temp_dir().join(format!("empire-campaign-scope-{}", std::process::id())); std::fs::create_dir_all(&dir).unwrap();
+        key(&mut app, &w, &l, &client, KeyCode::Char('O')); key(&mut app, &w, &l, &client, KeyCode::Char('n'));
+        paste(&mut app, &w, &l, &client, "Build a feature\nKeep the existing API compatible"); key(&mut app, &w, &l, &client, KeyCode::Enter);
+        key(&mut app, &w, &l, &client, KeyCode::Enter); // optional criteria
+        app.campaign_view.text.set(dir.to_string_lossy().into()); key(&mut app, &w, &l, &client, KeyCode::Enter);
+        key(&mut app, &w, &l, &client, KeyCode::Enter); // optional no-go zones
+        assert!(app.campaigns.campaigns.is_empty()); // cancelling before final submission creates nothing
+        key(&mut app, &w, &l, &client, KeyCode::Enter);
+        assert_eq!(app.selected_campaign().unwrap().flight_status(), "planning"); assert!(commands.try_recv().is_err());
+        let plan = crate::expedition::Plan { summary: "Do one thing".into(), criteria: "Test it".into(), stages: vec![crate::expedition::Step {
+            world: dir.to_string_lossy().into(), task: "Implement".into(), role: "builder".into(), evidence: "Tests pass".into() }] };
+        app.campaigns.propose(1, plan.clone(), 5).unwrap();
+        key(&mut app, &w, &l, &client, KeyCode::Char('a'));
+        let mut changed = plan; changed.stages[0].task = "Revised implementation".into(); app.campaigns.propose(1, changed, 6).unwrap();
+        key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert_eq!(app.selected_campaign().unwrap().flight_status(), "proposed"); assert!(app.campaign_view.error.contains("changed"));
+        key(&mut app, &w, &l, &client, KeyCode::Esc); key(&mut app, &w, &l, &client, KeyCode::Char('a')); key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert_eq!(app.selected_campaign().unwrap().flight_status(), "running");
+        key(&mut app, &w, &l, &client, KeyCode::Char('p')); assert_eq!(app.selected_campaign().unwrap().flight_status(), "paused");
+        key(&mut app, &w, &l, &client, KeyCode::Char('x')); key(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert_eq!(app.selected_campaign().unwrap().flight_status(), "cancelled"); assert!(commands.try_recv().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -6622,7 +6868,7 @@ mod campaign_tests {
             let mut fb = Fb::new(cols, rows); let l = Lay::new(&fb, false);
             draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
             let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
-            assert!(text.contains("CAMPAIGNS") && text.contains("h handoff") && text.contains("n new"));
+            assert!(text.contains("CAMPAIGNS") && text.contains("h handoff") && text.contains("n goal"));
             app.campaign_view.scroll = usize::MAX;
             draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
             let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
