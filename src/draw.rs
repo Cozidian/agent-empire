@@ -66,6 +66,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Commander => commander(fb, app, w, l),
         Mode::Sectors => sectors(fb, app, w, l, t),
         Mode::Hyperlanes => hyperlanes(fb, app, w, l, t),
+        Mode::Campaigns => campaigns(fb, app, w, l, t),
         Mode::Anomalies { id, typing } => anomalies(fb, app, l, *id, *typing),
         Mode::Trade { sel } => trade_overview(fb, app, w, l, *sel, t),
         Mode::Situation { id, typing } => situation(fb, app, w, l, *id, *typing, t),
@@ -74,7 +75,9 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Confirm { id } => confirm(fb, app, *id, l),
         Mode::Ship { id, sel } => ship_card(fb, app, *id, *sel, l, t),
         Mode::Help => help(fb, l),
-        Mode::Brief { planet, text, kind, launch, role, to, attachments, sending } => brief(fb, app, planet, text, *kind, (*launch, *role, *to), attachments, *sending, l, t),
+        Mode::Brief { planet, text, kind, launch, role, to, attachments, sending, ship } => brief(fb, app, planet, text, *kind, (*launch, *role, *to), attachments, *sending, ship, l, t),
+        Mode::Refit(v) => refit(fb, app, v, l, t),
+        Mode::Shipyard(v) => shipyard(fb, app, v, l, t),
         Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
         Mode::Moon { planet, branch, kind } => moon(fb, app, planet, branch, *kind, l, t),
         Mode::Actions { planet, sel } => actions(fb, app, planet, *sel, l),
@@ -1483,7 +1486,7 @@ fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
         Some(Sel::GitHub) => "⏎ projects and pull requests · ",
         None => "",
     };
-    let s = format!("{}{music}· H links · h overlay · V sectors · A anomalies · {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
+    let s = format!("{}{music}· O campaigns · H links · h overlay · V sectors · A anomalies · {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -2088,9 +2091,9 @@ fn brief_box(l: &Lay, text: &Line, images: usize, ships: usize) -> ((i32, i32, i
     let w = 80.min(l.cols - 2);
     let n = ships as i32;
     // the text grows to eight lines, then scrolls
-    let lines = (layout(&text.s, w - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 21 - n).max(1));
-    let visible = images.min((l.rows - 18 - n - lines).max(1) as usize);
-    let (x, y, w, h) = centered(l, w, 16 + n + lines + visible as i32);
+    let lines = (layout(&text.s, w - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 23 - n).max(1));
+    let visible = images.min((l.rows - 20 - n - lines).max(1) as usize);
+    let (x, y, w, h) = centered(l, w, 18 + n + lines + visible as i32);
     ((x, y, w, h), lines, visible, y + lines + 6 + visible as i32)
 }
 
@@ -2111,6 +2114,10 @@ pub enum BriefHit {
     Ship(usize),
     Queue,
     Role(usize),
+    /// The design row: the next design.
+    Design,
+    /// The new ship's orders and skills: refit them.
+    Refit,
 }
 
 pub fn brief_hit(l: &Lay, text: &Line, images: usize, ships: usize, c: i32, r: i32) -> Option<BriefHit> {
@@ -2121,8 +2128,10 @@ pub fn brief_hit(l: &Lay, text: &Line, images: usize, ships: usize, c: i32, r: i
     match (r - row) as usize {
         0 | 2 => Some(BriefHit::Launch),
         1 => role_spans(x).into_iter().find(|&(_, a, b)| c >= a && c < b).map(|(i, ..)| BriefHit::Role(i)).or(Some(BriefHit::Launch)),
-        k if (3..3 + ships).contains(&k) => Some(BriefHit::Ship(k - 3)),
-        k if k == 3 + ships => Some(BriefHit::Queue),
+        3 => Some(BriefHit::Design),
+        4 => Some(BriefHit::Refit),
+        k if (5..5 + ships).contains(&k) => Some(BriefHit::Ship(k - 5)),
+        k if k == 5 + ships => Some(BriefHit::Queue),
         _ => None,
     }
 }
@@ -2151,7 +2160,7 @@ fn jev_line(fb: &mut Fb, app: &App, (x, y, w): (i32, i32, i32), t: f32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, (launch, role, to): (bool, usize, Option<u32>), attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
+fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, (launch, role, to): (bool, usize, Option<u32>), attachments: &[crate::screenshots::Attachment], sending: bool, ship: &Outfit, l: &Lay, t: f32) {
     let ships = brief_ships(&app.agents, planet);
     let ((x, y, w, h), lines, visible, r) = brief_box(l, text, attachments.len(), ships.len());
     let accent = v3(1.0, 0.85, 0.4);
@@ -2193,11 +2202,12 @@ fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, (launch
         _ => picked.about().to_string(),
     };
     seg(fb, x + 13, r + 2, &clip(&about, (w - 16) as usize), w - 16, if launch { picked.color() * 0.8 } else { DIM * 0.6 }, Some(BOX));
+    outfit_rows(fb, app, planet, kind_name, ship, (x, r + 3, w), launch);
     // give it to one ship here: it takes it when it's next free
     let suggested = app.jev.pick.as_ref().and_then(|p| p.ship);
     for (i, &id) in ships.iter().enumerate() {
         let Some(a) = app.agent(id) else { continue };
-        let row = r + 3 + i as i32;
+        let row = r + 5 + i as i32;
         let me = !launch && to == Some(id);
         let mut c = seg(fb, x + 3, row, if me { "● " } else { "○ " }, 2, accent, Some(BOX));
         c = seg(fb, c, row, "give it to ", 11, if me { TEXT } else { DIM }, Some(BOX));
@@ -2216,14 +2226,129 @@ fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, (launch
         seg(fb, x + w - 7, r, "✦", 1, v3(0.75, 0.65, 1.0), Some(BOX));
     }
     // queue: the first free agent here takes it
-    let q = r + 3 + ships.len() as i32;
+    let q = r + 5 + ships.len() as i32;
     let xx = seg(fb, x + 3, q, if queue { "● " } else { "○ " }, 2, accent, Some(BOX));
     let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it for the first free one of the {crew} here") };
     seg(fb, xx, q, &note, w - 8, later, Some(BOX));
     seg(fb, x + w - 5, r, "⇥", 1, DIM * 0.8, Some(BOX));
     seg(fb, x + w - 5, q, "⇥", 1, DIM * 0.8, Some(BOX));
     seg(fb, x + 3, y + h - 4, "Drop image · Ctrl+V clipboard · Ctrl+O attach path · Ctrl+X remove last", w - 6, DIM, Some(BOX));
-    let hint = if sending { "Sending mission…" } else { "⏎ give orders · Alt+⏎ new line · ⇥ launch/queue · ⇧⇥ role · ↑↓ species · esc" };
+    let hint = if sending { "Sending mission…" } else { "⏎ give orders · Alt+⏎ new line · ⇥ launch/queue · ⇧⇥ role · ↑↓ species · ^D design · ^R refit · esc" };
+    seg(fb, x + 3, y + h - 2, hint, w - 6, DIM, Some(BOX));
+}
+
+/// The composer's design row, and the new ship's own orders and skills under it: each skill
+/// marked ✓ if the chosen species can find it from this world, ✗ if it can't.
+fn outfit_rows(fb: &mut Fb, app: &App, planet: &str, kind: &str, ship: &Outfit, (x, r, w): (i32, i32, i32), launch: bool) {
+    let dim = |c: V3| if launch { c } else { DIM * 0.6 };
+    seg(fb, x + 7, r, "design", 6, dim(DIM), Some(BOX));
+    let name = match ship.design.map(|id| app.designs.get(id)) {
+        None => "none".to_string(),
+        Some(Some(d)) => d.name.clone(),
+        Some(None) => "scrapped".to_string(),
+    };
+    seg(fb, x + 15, r, &clip(&name, (w - 26) as usize), w - 26, dim(if ship.design.is_some() { DESIGN } else { DIM }), Some(BOX));
+    seg(fb, x + w - 7, r, "^D", 2, DIM * 0.8, Some(BOX));
+    seg(fb, x + w - 7, r + 1, "^R", 2, DIM * 0.8, Some(BOX));
+    let room = w - 24;
+    if ship.orders.is_empty() && ship.skills.is_empty() {
+        seg(fb, x + 15, r + 1, "no orders or skills of its own", room, DIM * 0.6, Some(BOX));
+        return;
+    }
+    let mut c = x + 15;
+    if !ship.orders.is_empty() {
+        let first = ship.orders.lines().next().unwrap_or("");
+        let more = if ship.orders.lines().count() > 1 { " …" } else { "" };
+        let skills_w = if ship.skills.is_empty() { 0 } else { room / 2 };
+        c = seg(fb, c, r + 1, &clip(&format!("“{first}{more}”"), (room - skills_w) as usize), room - skills_w, dim(TEXT * 0.85), Some(BOX)) + 1;
+    }
+    let home = &app.skill_home;
+    for s in &ship.skills {
+        let ok = crate::design::reachable(kind, s, std::path::Path::new(planet), home);
+        let cell = format!("{}{s}", if ok { "✓" } else { "✗" });
+        let n = cell.chars().count() as i32;
+        if c + n > x + 15 + room { seg(fb, c, r + 1, "…", 1, DIM, Some(BOX)); break; }
+        c = seg(fb, c, r + 1, &cell, n, dim(if ok { v3(0.5, 0.9, 0.6) } else { RED_SKILL }), Some(BOX)) + 1;
+    }
+}
+
+const DESIGN: V3 = v3(0.55, 0.85, 1.0);
+const RED_SKILL: V3 = v3(1.0, 0.45, 0.4);
+
+/// The refit dialog: the new ship's standing orders, and the skills to give it.
+fn refit(fb: &mut Fb, app: &App, v: &RefitView, l: &Lay, t: f32) {
+    let (planet, kind) = match &*v.brief { Mode::Brief { planet, kind, .. } => (planet.as_str(), app.kinds.get(*kind).map_or("", String::as_str)), _ => ("", "") };
+    let rows = (v.skills.len().max(1) as i32).min(l.rows - 16).max(1);
+    let (x, y, w, h) = centered(l, 76.min(l.cols - 2), 15 + rows);
+    frame_box(fb, x, y, w, h, &format!("⚙ REFIT · new {kind} ship"), DESIGN);
+    seg(fb, x + 3, y + 2, "Standing orders, for its whole life (on top of its role)", w - 6, DIM, Some(BOX));
+    let focus = |me: bool| if me { DESIGN } else { DIM };
+    seg(fb, x + 3, y + 3, "› ", 2, focus(v.sel == 0), Some(BOX));
+    area(fb, (x + 5, y + 3, w - 8, 4), &v.orders, DESIGN, if v.sel == 0 { t } else { 0.5 }); // 0.5: a phase with no cursor
+    seg(fb, x + 3, y + 8, &format!("Skills · ✓ {kind} finds it here · ✗ it can't (it still launches)"), w - 6, DIM, Some(BOX));
+    if v.skills.is_empty() {
+        seg(fb, x + 5, y + 9, "no skills in this world or your skill folders", w - 8, DIM * 0.6, Some(BOX));
+    }
+    let off = v.sel.saturating_sub(1).saturating_sub(rows as usize - 1);
+    let home = &app.skill_home;
+    for (i, s) in v.skills.iter().enumerate().skip(off).take(rows as usize) {
+        let row = y + 9 + (i - off) as i32;
+        let me = v.sel == i + 1;
+        let bg = if me { SELBG } else { BOX };
+        if me { fb.panel(x + 1, row, w - 2, 1, bg); }
+        let on = v.picked.contains(s);
+        let ok = crate::design::reachable(kind, s, std::path::Path::new(planet), home);
+        let c = seg(fb, x + 5, row, if on { "[x] " } else { "[ ] " }, 4, if on { DESIGN } else { DIM }, Some(bg));
+        let c = seg(fb, c, row, if ok { "✓ " } else { "✗ " }, 2, if ok { v3(0.5, 0.9, 0.6) } else { RED_SKILL }, Some(bg));
+        seg(fb, c, row, &clip(s, (x + w - 3 - c) as usize), x + w - 3 - c, if on { TEXT } else { DIM }, Some(bg));
+    }
+    let foot = y + h - 4;
+    if let Some(name) = &v.naming {
+        let c = seg(fb, x + 3, foot, "save as design: ", 16, DESIGN, Some(BOX));
+        area(fb, (c, foot, x + w - 3 - c, 1), name, DESIGN, t);
+    } else if !v.error.is_empty() {
+        seg(fb, x + 3, foot, &clip(&v.error, (w - 6) as usize), w - 6, RED_SKILL, Some(BOX));
+    }
+    if !v.error.is_empty() && v.naming.is_some() {
+        seg(fb, x + 3, foot + 1, &clip(&v.error, (w - 6) as usize), w - 6, RED_SKILL, Some(BOX));
+    }
+    let hint = if v.naming.is_some() { "⏎ save (a design of the same name is updated) · esc back" } else { "⏎ done · ⇥ orders/skills · ␣ toggle skill · ^S save as design · esc discard" };
+    seg(fb, x + 3, y + h - 2, hint, w - 6, DIM, Some(BOX));
+}
+
+/// The shipyard: saved designs, renamed or scrapped.
+fn shipyard(fb: &mut Fb, app: &App, v: &YardView, l: &Lay, t: f32) {
+    let list = &app.designs.designs;
+    let rows = (list.len() as i32 * 2).max(3).min(l.rows - 12).max(2);
+    let (x, y, w, h) = centered(l, 84.min(l.cols - 2), 9 + rows);
+    frame_box(fb, x, y, w, h, &format!("⚓ SHIPYARD · {} design{}", list.len(), if list.len() == 1 { "" } else { "s" }), DESIGN);
+    if list.is_empty() {
+        seg(fb, x + 3, y + 2, "No designs yet. In a mission composer, ^R refits the new ship and ^S saves it here.", w - 6, DIM, Some(BOX));
+    }
+    let per = (rows / 2).max(1) as usize;
+    let sel = v.sel.min(list.len().saturating_sub(1));
+    let off = sel.saturating_sub(per - 1);
+    for (i, d) in list.iter().enumerate().skip(off).take(per) {
+        let row = y + 2 + 2 * (i - off) as i32;
+        let me = i == sel;
+        let bg = if me { SELBG } else { BOX };
+        if me { fb.panel(x + 1, row, w - 2, 2, bg); }
+        let role = Role::parse(&d.role);
+        let name = match &v.rename { Some(_) if me => String::new(), _ => d.name.clone() };
+        let mut c = seg(fb, x + 3, row, &clip(&name, 32), 32, DESIGN, Some(bg)) + 1;
+        if let (Some(line), true) = (&v.rename, me) { area(fb, (x + 3, row, 32, 1), line, DESIGN, t); c = x + 36; }
+        c = seg(fb, c, row, &format!("{} ", d.kind), 10, kind_color(&d.kind), Some(bg));
+        if role != Role::None { c = seg(fb, c, row, &format!("{} ", role.name()), 10, role.color(), Some(bg)); }
+        if !d.skills.is_empty() { seg(fb, c, row, &clip(&format!("skills: {}", d.skills.join(", ")), (x + w - 3 - c).max(0) as usize), x + w - 3 - c, DIM, Some(bg)); }
+        let orders = if d.orders.is_empty() { "no orders of its own".to_string() } else { d.orders.replace('\n', " · ") };
+        seg(fb, x + 5, row + 1, &clip(&orders, (w - 8) as usize), w - 8, if d.orders.is_empty() { DIM * 0.6 } else { TEXT * 0.8 }, Some(bg));
+    }
+    if v.remove && let Some(d) = list.get(sel) {
+        seg(fb, x + 3, y + h - 4, &clip(&format!("Scrap {}? Ships already launched from it keep their outfit. y / n", d.name), (w - 6) as usize), w - 6, RED_SKILL, Some(BOX));
+    } else if !v.error.is_empty() {
+        seg(fb, x + 3, y + h - 4, &clip(&v.error, (w - 6) as usize), w - 6, RED_SKILL, Some(BOX));
+    }
+    let hint = if v.rename.is_some() { "⏎ rename · esc cancel" } else { "↑↓ select · r rename · x scrap · esc close · pick a design in a mission composer with ^D" };
     seg(fb, x + 3, y + h - 2, hint, w - 6, DIM, Some(BOX));
 }
 
@@ -2291,7 +2416,8 @@ fn ship_card(fb: &mut Fb, app: &App, id: u32, sel: usize, l: &Lay, t: f32) {
     let (x, y, w, h) = ship_box(app, id, l);
     let accent = kind_color(&a.kind);
     let role = if a.role == Role::None { String::new() } else { format!(" {}", a.role.name().to_uppercase()) };
-    frame_box(fb, x, y, w, h, &format!("◆ {}{role} · {}", a.kind.to_uppercase(), base_name(&a.cwd).to_uppercase()), accent);
+    let design = if a.design.is_empty() { String::new() } else { format!(" · {} design", a.design) };
+    frame_box(fb, x, y, w, h, &format!("◆ {}{role} · {}{design}", a.kind.to_uppercase(), base_name(&a.cwd).to_uppercase()), accent);
     let iw = w - 6;
     let c = seg(fb, x + 3, y + 2, &format!("{} {}", a.status.glyph(t), a.status.label()), iw, a.status.color(), Some(BOX));
     seg(fb, c, y + 2, &format!(" · {} · {} turns", ago(t - a.since), a.turns), x + w - 3 - c, DIM, Some(BOX));
@@ -2347,6 +2473,8 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("A", "anomalies: findings, investigations and history across systems"),
         ("V", "sectors: group worlds, inspect activity and focus the map"),
         ("H / h", "hyperlanes: name connections / toggle dependency overlay"),
+        ("O", "campaigns: o talk to ship, d history, objectives and reviewed outcomes"),
+        ("Y", "shipyard: saved ship designs (^D picks one in a mission, ^R refits)"),
         ("n", "colonize: launch an agent in a folder (new or existing)"),
         ("e", "deploy another agent to the selected world"),
         ("x", "decommission the selected agent"),
@@ -2979,4 +3107,173 @@ fn hyperlanes(fb: &mut Fb, app: &App, world: &World, l: &Lay, t: f32) {
     let nav = if step.is_some() { "Unsaved draft · Esc keeps the existing connections" }
         else { "↑↓ / wheel · PgUp/Dn · Home/End · 1 source · 2 destination · Esc back" };
     seg(fb, x + 2, y + h - 2, nav, w - 4, DIM, Some(BOX));
+}
+
+// ─────────────────────────────── campaigns ───────────────────────────────
+
+const CAMPAIGN: V3 = v3(0.85, 0.72, 0.45);
+
+pub fn campaign_layout(app: &App, l: &Lay) -> (i32, i32, i32, i32, i32, usize) {
+    let (x, y, w, h) = centered(l, 126, l.rows - 2);
+    let capacity = ((h - 13) / 3).clamp(2, 8) as usize;
+    let count = app.campaigns.campaigns.len().max(app.selected_campaign().map_or(0, |c| c.stages.len())).max(1);
+    let room = if matches!(app.campaign_view.edit, Some(CampaignEdit::World | CampaignEdit::Link)) { capacity } else { capacity.min(count) };
+    (x, y, w, h, (w / 3).max(18), room)
+}
+
+pub fn campaign_hit(app: &App, w: &World, l: &Lay, col: i32, row: i32) -> Option<(bool, usize)> {
+    let (x, y, width, _, left, room) = campaign_layout(app, l);
+    if col < x + 2 || col >= x + width - 2 || row < y + 4 || row >= y + 4 + room as i32 { return None; }
+    let right = col >= x + left;
+    let (at, count) = match app.campaign_view.edit {
+        Some(CampaignEdit::World) => { let worlds = app.campaign_worlds(w); (worlds.iter().position(|p| p == &app.campaign_view.world).unwrap_or(0), worlds.len()) }
+        Some(CampaignEdit::Link) => (app.campaign_view.mission, app.campaign_missions().len()),
+        _ if right => {
+            let c = app.selected_campaign()?;
+            (c.stages.iter().position(|s| Some(s.id) == app.campaign_stage().map(|s| s.id)).unwrap_or(0), c.stages.len())
+        }
+        _ => (app.campaigns.campaigns.iter().position(|c| Some(c.id) == app.selected_campaign().map(|c| c.id)).unwrap_or(0), app.campaigns.campaigns.len()),
+    };
+    let index = (at + 1).saturating_sub(room) + (row - y - 4) as usize;
+    (index < count).then_some((right, index))
+}
+
+fn campaigns(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32) {
+    let (x, y, width, h, left, room) = campaign_layout(app, l);
+    let view = &app.campaign_view;
+    let edit = view.edit;
+    let c = app.selected_campaign();
+    let s = app.campaign_stage();
+    frame_box(fb, x, y, width, h, "⚑ CAMPAIGNS", CAMPAIGN);
+    let heading = match edit {
+        Some(CampaignEdit::Objective) => "Objective · what should this campaign achieve? (1 / 2)",
+        Some(CampaignEdit::Criteria) => "Acceptance criteria · how will you know it is ready? (2 / 2)",
+        Some(CampaignEdit::World) => "Stage · choose its world or worktree moon",
+        Some(CampaignEdit::Task) => "Stage · describe the task; this only plans it",
+        Some(CampaignEdit::Handoff) => "Handoff · findings, changes, evidence, and unresolved questions",
+        Some(CampaignEdit::Verify) => "Verification · record what you checked, its results and evidence",
+        Some(CampaignEdit::Link) => "Link an existing mission to this stage (no order is sent)",
+        Some(CampaignEdit::Complete) => "Accept this campaign against its objective and criteria? y confirm · other keys cancel",
+        None => "Plan missions, talk to ships, and review their results",
+    };
+    seg(fb, x + 2, y + 1, heading, width - 4, TEXT, Some(BOX));
+    let typing = edit.is_some() && !matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link | CampaignEdit::Complete));
+    if typing {
+        area(fb, (x + 3, y + 3, width - 6, (h - 9).max(1)), &view.text, CAMPAIGN, t);
+    } else {
+        let picking = matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link));
+        if picking {
+            let (rows, at): (Vec<String>, usize) = if edit == Some(CampaignEdit::World) {
+                let worlds = app.campaign_worlds(w);
+                let at = worlds.iter().position(|p| p == &view.world).unwrap_or(0);
+                (worlds.iter().map(|p| format!("{}{}", tilde(p), if w.planet(p).is_none() { " (unavailable)" } else { "" })).collect(), at)
+            } else {
+                (app.campaign_missions().iter().map(|m| format!("#{} · {} · {} · {}", m.id, m.state, tilde(&m.cwd), clip(&m.text, 60))).collect(), view.mission)
+            };
+            let off = (at + 1).saturating_sub(room);
+            for (i, row) in rows.iter().enumerate().skip(off).take(room) {
+                let bg = if i == at { SELBG } else { BOX };
+                fb.panel(x + 1, y + 4 + (i - off) as i32, width - 2, 1, bg);
+                seg(fb, x + 2, y + 4 + (i - off) as i32, row, width - 4, TEXT, Some(bg));
+            }
+            if rows.is_empty() { seg(fb, x + 2, y + 4, "Nothing available yet; Esc returns to the campaign.", width - 4, DIM, Some(BOX)); }
+        } else {
+            seg(fb, x + 2, y + 3, if view.stages { "Campaigns" } else { "▸ Campaigns" }, left - 3, CAMPAIGN, Some(BOX));
+            seg(fb, x + left + 2, y + 3, if view.stages { "▸ Stages · in handoff order" } else { "Stages · in handoff order" }, width - left - 4, CAMPAIGN, Some(BOX));
+            let ci = c.and_then(|c| app.campaigns.campaigns.iter().position(|p| p.id == c.id)).unwrap_or(0);
+            let off = (ci + 1).saturating_sub(room);
+            for (i, c) in app.campaigns.campaigns.iter().enumerate().skip(off).take(room) {
+                let bg = if i == ci { SELBG } else { BOX };
+                let mark = if c.archived { "·" } else if c.completed.is_some() { "✓" } else { "⚑" };
+                fb.panel(x + 1, y + 4 + (i - off) as i32, left - 1, 1, bg);
+                seg(fb, x + 2, y + 4 + (i - off) as i32, &format!("{mark} {}", c.objective), left - 3, if c.archived { DIM } else { TEXT }, Some(bg));
+            }
+            if let Some(c) = c {
+                let si = s.and_then(|s| c.stages.iter().position(|p| p.id == s.id)).unwrap_or(0);
+                let off = (si + 1).saturating_sub(room);
+                for (i, s) in c.stages.iter().enumerate().skip(off).take(room) {
+                    let bg = if i == si { SELBG } else { BOX };
+                    fb.panel(x + left + 1, y + 4 + (i - off) as i32, width - left - 2, 1, bg);
+                    let waiting = app.campaign_ship(s).is_some_and(|a| a.status == Status::Blocked);
+                    let status = if waiting { "needs input" } else { s.status() };
+                    let col = if waiting { v3(1.0, 0.7, 0.4) } else if s.accepted.is_some() { v3(0.5, 0.85, 0.65) } else { TEXT };
+                    seg(fb, x + left + 2, y + 4 + (i - off) as i32, &format!("{}. {status} · {}", i + 1, clip(&s.task, 80)), width - left - 4, col, Some(bg));
+                }
+                if c.stages.is_empty() { seg(fb, x + left + 2, y + 4, "s plans the first stage", width - left - 4, DIM, Some(BOX)); }
+            } else { seg(fb, x + 2, y + 4, "n begins a campaign", left - 3, DIM, Some(BOX)); }
+        }
+        let mut detail = Vec::new();
+        let warm = v3(1.0, 0.7, 0.4);
+        if let Some(c) = c {
+            if let Some(s) = s {
+                if let Some(a) = app.campaign_ship(s) {
+                    let waiting = a.status == Status::Blocked;
+                    detail.push((if waiting { format!("Waiting for your input · {} #{} · o open ship", a.kind, a.id) }
+                        else { format!("{} #{} · {} · o open ship", a.kind, a.id, a.status.label()) }, if waiting { warm } else { CAMPAIGN }));
+                    if waiting && let Some(q) = &a.ask { detail.push((q.question.clone(), TEXT)); }
+                    detail.push(("Questions and replies stay in the ship's terminal. Esc returns here.".into(), DIM));
+                    detail.push((String::new(), DIM));
+                }
+                let i = c.stages.iter().position(|p| p.id == s.id).unwrap_or(0) + 1;
+                detail.push((format!("Stage {i} · {}", s.status()), CAMPAIGN));
+                detail.push((tilde(&s.world), DIM));
+                detail.push((s.task.clone(), TEXT));
+                if s.missions.is_empty() { detail.push(("m draft a mission · l link existing work".into(), warm)); }
+                for linked in &s.missions {
+                    let m = &linked.mission;
+                    detail.push((format!("Mission #{} · {} · ship {}{}", m.id, m.state, m.agent.map_or("—".into(), |id| id.to_string()),
+                        if linked.available { "" } else { " · saved snapshot; unavailable" }), DIM));
+                }
+                detail.push((String::new(), DIM));
+            }
+            detail.push((format!("Objective · {}", if c.archived { "archived" } else if c.completed.is_some() { "accepted" } else { "active" }), CAMPAIGN));
+            detail.push((c.objective.clone(), TEXT));
+            detail.push((String::new(), DIM));
+            detail.push(("Acceptance criteria".into(), CAMPAIGN));
+            detail.push((c.criteria.clone(), TEXT));
+            if let Some(s) = s {
+                detail.push((String::new(), DIM));
+                detail.push(("Handoff · h edit".into(), CAMPAIGN));
+                detail.push((if s.handoff.is_empty() { "No handoff yet. Record findings and decisions after reviewing the ship's work.".into() } else { s.handoff.clone() },
+                    if s.handoff.is_empty() { DIM } else { TEXT }));
+                detail.push((String::new(), DIM));
+                detail.push(("Verification · v record evidence · a accept stage".into(), CAMPAIGN));
+                detail.push((if s.verification.is_empty() { "Not verified. A finished agent turn still needs your review.".into() } else { s.verification.clone() },
+                    if s.verification.is_empty() { DIM } else { TEXT }));
+                if view.details {
+                    detail.push((String::new(), DIM));
+                    detail.push(("Stage history (newest first)".into(), CAMPAIGN));
+                    detail.extend(s.history.iter().rev().map(|n| (format!("{} ago · {}: {}", ago((survey::now().max(0) as u64).saturating_sub(n.at) as f32), n.kind, n.text), DIM)));
+                    for m in &s.missions {
+                        detail.push((String::new(), DIM));
+                        detail.push((format!("Saved mission #{} · {}", m.mission.id, tilde(&m.mission.cwd)), CAMPAIGN));
+                        detail.push((m.mission.text.clone(), TEXT));
+                    }
+                }
+            }
+            detail.push((String::new(), DIM));
+            if view.details {
+                detail.push(("Campaign history (newest first)".into(), CAMPAIGN));
+                detail.extend(c.history.iter().rev().map(|n| (format!("{} ago · {}: {}", ago((survey::now().max(0) as u64).saturating_sub(n.at) as f32), n.kind, n.text), DIM)));
+            } else { detail.push(("d shows history and saved mission prompts".into(), DIM)); }
+        }
+        let read_width = (width - 6).clamp(1, 96);
+        let lines: Vec<_> = detail.iter().flat_map(|(s, col)| wrap(if s.is_empty() { "\n" } else { s }, read_width as usize).into_iter().map(move |line| (line, *col))).collect();
+        let dy = y + 6 + room as i32;
+        let height = (y + h - 6 - dy).max(1) as usize;
+        app.campaign_view.scroll = app.campaign_view.scroll.min(lines.len().saturating_sub(height));
+        for (i, (line, col)) in lines.iter().skip(app.campaign_view.scroll).take(height).enumerate() { seg(fb, x + 3, dy + i as i32, line, read_width, *col, Some(BOX)); }
+        if lines.len() > height {
+            let label = format!("{}–{} / {} · PgUp/Dn", app.campaign_view.scroll + 1, (app.campaign_view.scroll + height).min(lines.len()), lines.len());
+            seg(fb, x + 3, y + h - 6, &label, width - 6, DIM, Some(BOX));
+        }
+    }
+    let error = if app.campaign_view.error.is_empty() { &app.campaign_error } else { &app.campaign_view.error };
+    seg(fb, x + 2, y + h - 5, error, width - 4, v3(1.0, 0.5, 0.4), Some(BOX));
+    let controls = if typing { "Enter save/next · Shift+Enter or Ctrl+J newline · ↑↓ cursor · Esc cancel" }
+        else if matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link)) { "↑↓ / wheel choose · Home/End · Enter select · Esc cancel" }
+        else { "n new · e objective · s stage · t edit stage · m draft · l link mission" };
+    seg(fb, x + 2, y + h - 3, controls, width - 4, CAMPAIGN, Some(BOX));
+    if !typing { seg(fb, x + 2, y + h - 2, "h handoff · v verify · a accept stage · r reopen · c finish · x archive", width - 4, CAMPAIGN, Some(BOX)); }
+    seg(fb, x + 2, y + h - 4, "o open ship · d history · Enter log · Tab pane · PgUp/Dn · Esc back", width - 4, DIM, Some(BOX));
 }

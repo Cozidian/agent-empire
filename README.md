@@ -75,6 +75,8 @@ zoom and still lets you select individual worlds and agents at any distance.
 | `A`              | **anomalies**: discoveries, investigations and history across worlds |
 | `V`              | **sectors**: group worlds and inspect their combined activity       |
 | `H` / `h`        | **hyperlanes**: manage named connections / toggle dependency overlay |
+| `O`              | **campaigns**: objectives, linked missions and reviewed handoffs    |
+| `Y`              | **shipyard**: saved ship designs: rename (`r`) or scrap (`x`) them  |
 | `t`              | **mission**: write a task for the selected world (launch a ship with it, or queue it) |
 | `b`              | **fleet order**: one order to every agent in the selected system or world |
 | `u`              | **moon**: found a git worktree off the selected world, with its own agent |
@@ -173,6 +175,38 @@ you wrote it; other species get it in front of the mission. A ship keeps its rol
 shows in the outliner, on its cards and in its hull: scouts, frigates (builders) and inspectors
 each have their own silhouette.
 
+### Ship designs
+
+A **design** is a saved outfit for new ships: a species, a role, standing orders of its own and
+the skills it should lean on. In the mission composer `Ctrl+D` picks the next design (and then none
+again); it sets the species and role, switches to launching, and shows the design under the role
+row: its orders, and each skill marked **✓** if the chosen species can find it from this world or
+**✗** if it can't. Everything stays adjustable for this launch: `↑↓` species, `⇧⇥` role, and
+`Ctrl+R` **refits** the ship: write its standing orders (`Alt+⏎` new line), `⇥` to the skills and
+`␣` to give or take one, `⏎` to keep the changes or `Esc` to drop them. `Ctrl+S` in the refit saves
+the ship as a design (saving under an existing name updates that design). With no design picked,
+the composer launches exactly as before.
+
+The ship gets the design's orders after its role's, then a line naming its skills, the same way
+as a role: Claude as a system prompt, Grok as `--rules`, Codex as `developer_instructions`, and
+other species in front of the mission. Skills aren't installed or copied: a ship can use only
+skills its species finds on its own, so ✗ ones are named but unavailable (the ship still launches,
+with a warning).
+
+| species | finds skills in (in the world, up to its repo root · in your home)             |
+| ------- | ------------------------------------------------------------------------------- |
+| claude  | `.claude/skills` · `~/.claude/skills`                                           |
+| codex   | `.agents/skills` · `~/.agents/skills`, `~/.codex/skills`                        |
+| grok    | `.grok/skills`, `.agents/skills`, `.claude/skills` · the same under `~`          |
+| others  | none: skills are only named in their orders                                     |
+
+A design never holds a world's files, and a world's structures (its skills, AGENTS.md, MCP
+servers…) stay with the world. `Y` opens the **shipyard**, the list of designs: `r` renames one
+and `x` scraps it. Designs are kept in `$XDG_STATE_HOME/empire/designs.json` (normally
+`~/.local/state/empire/designs.json`) and survive restarts. A ship keeps its own copy of its
+orders and skills, through upgrades and restarts, so renaming or scrapping a design never touches
+ships already launched from it; the ship card shows which design a ship came from.
+
 The composer also lists the ships already on the world: **give it to** one of them and it takes
 the mission when it's next free (`⇥` steps through launch, each ship, and queue-for-anyone). If
 `TYPESAFE_API_KEY` is set, **Jev** (TypeSafe's System One model) suggests where the mission should go
@@ -204,6 +238,80 @@ worlds, errors), `w` narrows to the selected entry's world and its moons, and `/
 `x` clears the filters. The pane below the list spells out the selected entry: its full text, when it
 happened, its world and the agent involved, if that agent is still around. `⏎` goes to that agent or world,
 and `c` opens comms with the agent.
+
+## Campaigns
+
+Press **`O`** to give missions a shared purpose, such as “Ship Kiplat authentication.” A campaign
+keeps an objective, acceptance criteria, ordered stages, linked missions, handoff notes and review
+history. It stays available after ships leave or missions are removed from the daemon's log.
+
+Start with **`n`**, enter the objective, then the acceptance criteria. **`s`** plans a stage: choose
+its world or worktree moon and describe the task. Plan as many stages as useful; only a stage
+whose predecessors have been accepted can receive a campaign mission or an accepted outcome.
+A sequence might be scout → accepted plan → builder on a moon → inspector → reviewed docking.
+It is optional: one ship can carry the whole campaign, and a stage can link several missions.
+
+**`m`** opens the existing mission composer with the objective, criteria, current task, and
+accepted handoffs and verification notes from preceding stages. You can edit the draft, attach
+screenshots, choose a ship, or choose a species and role for a new one. It defaults to queueing;
+nothing is sent until you submit the composer. **Esc** cancels and returns to the campaign.
+New campaign missions link back to their stage through saved metadata. **`l`** links an existing
+mission explicitly, including work on another world or moon, without sending a new order.
+The selected stage and its linked ship appear first, followed by the objective, criteria, handoff
+and verification. **`d`** expands or collapses saved mission prompts and history.
+
+**`o`** opens the stage's linked ship, prioritizing one waiting for input; **Esc** returns to the
+same campaign. Agent questions and replies stay in the ship's native terminal. When a waiting
+state and question are detected, the campaign shows them above the stage; questions written as
+ordinary agent output may require opening the ship to read them. A live linked ship remains
+accessible after its mission reports finished. **Enter** opens the stage world's mission log.
+
+The review sequence is deliberately manual:
+
+1. A finished agent turn means **reported finished**. It does not establish correctness.
+2. **`h`** records findings, changes, evidence and unresolved questions for the handoff.
+3. **`v`** records what you checked and the results, marking the stage **verified by the player**.
+   Linked missions still queued or under way must finish first.
+4. **`a`** accepts that stage. It makes the next stage available; it does not launch it.
+5. Once every stage is accepted, **`c`**, then **`y`**, accepts the campaign against its objective
+   and criteria. No test result or agent status completes a campaign automatically.
+
+| key in campaigns | action |
+| ---------------- | ------ |
+| `Tab` / `Shift+Tab` | switch between campaigns and stages |
+| `↑↓` / `j k` / wheel / click | select; `Home/End` reach the first/last item |
+| `PgUp/Dn` / wheel over details | scroll the selected campaign |
+| `o` | open the linked ship (waiting ship first); `Esc` returns to the campaign |
+| `d` | show or hide history and saved mission prompts |
+| `n` / `e` | create a campaign / edit its objective and criteria |
+| `s` / `t` | add a stage / edit its world and task |
+| `m` / `l` | draft a mission / link an existing mission |
+| `h` / `v` / `a` | record a handoff / record verification / accept the stage |
+| `r` | reopen the selected stage and subsequent reviews |
+| `c` | complete the campaign after `y` confirmation |
+| `x` | archive or restore the campaign; missions and agents keep running |
+| `Enter` / `Esc` | open the stage world's mission log / return to the galaxy |
+
+Text fields support pasted paragraphs and **Shift+Enter**, **Alt+Enter**, or **Ctrl+J** for a
+newline. **Enter** saves or advances; **Esc** discards the edit. Objectives are single lines of
+up to 120 characters; criteria, tasks and review notes allow up to 8,000 characters each.
+
+Changing the objective or criteria reopens all reviews. Editing a stage, linking new mission
+evidence, or explicitly reopening a stage clears its acceptance and subsequent reviews; previous
+verification and handoff notes remain in history. If the campaign changes while its mission
+composer is open, submission asks you to cancel and reopen it with fresh context.
+
+Missing missions retain their saved prompt, world, agent, times and last observed status, and
+are labelled as snapshots. Their absence does not mean success: you can record a manual review
+using evidence you still have. Missing folders keep their stages but cannot receive a new draft.
+Unarchived campaigns keep available stage worlds charted; archive them with `x` before forgetting
+those dormant worlds with `X` on the galaxy.
+
+Campaigns are saved in `$XDG_STATE_HOME/empire/campaigns.json` (normally
+`~/.local/state/empire/campaigns.json`). Galaxy windows share locked, atomic updates; unreadable
+records are preserved and save failures keep the edit open. Campaigns prepare prompts and record
+outcomes; Claude, Codex and the other harnesses keep their own reasoning, tools, context management
+and execution. Empire does not start the next stage, merge a branch, or dock a moon automatically.
 
 ## Commander
 
@@ -533,7 +641,9 @@ Press `1`–`9` to answer, `⏎` to open comms instead, `⇥` for the next one w
 - `draw.rs`: procedural dithered planets, ships, outliner, situation log, dialogs, comms.
 - `structure.rs`: structures (AI resources) a world has built, and their construction orders.
 - `anomaly.rs`: persistent findings, lifecycle history, filters and explicit reports.
+- `campaign.rs`: objectives, ordered stages, mission snapshots and manual review history.
 - `hyperlane.rs`: named, directional relationships between worlds.
+- `design.rs`: saved ship designs, and which skill folders each species reads.
 - `sector.rs`: named groups of worlds; `state.rs`: shared locked, atomic local storage.
 - `survey.rs`: background git survey of every world (status, size, worktrees, PRs via `gh`) and
   Claude/Codex usage.

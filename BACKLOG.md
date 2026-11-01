@@ -34,20 +34,27 @@ Agreed direction: Empire coordinates projects, discoveries and outcomes. Each ag
 - Verified: 110 tests passed (1 live API test ignored), release build, rendered map/editor previews, and an isolated terminal test of creation, rename, overlay, restart persistence and removal.
 - Future: automatic discovery, plus optional overlays for anomalies, campaigns and release readiness.
 
-## Campaigns — next
+## Campaigns — implemented (2026-11-01)
 
 - Shared objective, linked missions, acceptance criteria and handoff evidence across worlds.
 - Begin with manual handoffs; allow one agent to carry an entire campaign.
 - Optional scout → accepted plan → builder on a moon → inspector → reviewed docking sequence.
 - Automate only chosen transitions later; do not add a competing agent reasoning loop.
 - Distinguish reported-finished, verified and accepted outcomes before automatic progression.
+- Delivered: `O` campaign view, objective/criteria and stage planning, existing mission linking, contextual mission drafts, persistent snapshots, handoff notes and explicit verification/acceptance.
+- Reopening or changing evidence invalidates affected reviews while preserving their history; campaigns never launch the next stage automatically.
+- Verified: 120 tests passed (1 live API test ignored), release build, rendered layouts, and an isolated terminal test through review, acceptance, a queued handoff, and daemon restart with campaign metadata preserved.
 
-## Ship designs and refits
+## Ship designs and refits — designs implemented (2026-11-01), refits next
 
 - Save reusable species, role, standing instructions, skills and workflow configurations.
 - Apply designs to deployed ships as refits; show pending versus effective equipment.
 - Respect native harness support: instruction delivery, reload or deliberate session handoff as appropriate.
 - Distinguish planet-wide resources from equipment assigned to one ship.
+- Delivered: `Y` shipyard (rename, scrap), `Ctrl+D` design and `Ctrl+R` refit in the mission composer, `designs.json`; ships keep their own copy of orders and skills through upgrades and restarts.
+- Skills are named in a ship's orders, not installed; each skill is marked ✓/✗ by whether the chosen species finds it. Codex takes orders as `developer_instructions`.
+- Not yet: refitting ships already deployed, and workflow configurations.
+- Verified: 130 tests passed (1 live API test ignored), and an isolated daemon test of a design launch, crash restart and hot upgrade, with the Codex instructions checked by `codex debug prompt-input`.
 
 ## Empire chronicle
 

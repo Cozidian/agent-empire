@@ -1,6 +1,8 @@
 mod anomaly;
 mod client;
+mod campaign;
 mod daemon;
+mod design;
 mod draw;
 mod game;
 mod gfx;
