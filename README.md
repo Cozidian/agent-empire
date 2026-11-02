@@ -92,7 +92,8 @@ implementation or testing succeeded. You remain in charge of testing, committing
 
 Ships and planets highlight agents needing an answer or ready for you to check. **Tab** on the
 galaxy selects the next agent needing you; **C** opens the attention list across projects.
-Permission questions remain incoming transmissions; number keys answer the displayed choices.
+Permission questions remain incoming transmissions, with the command the agent wants to run shown
+in full and highlighted; number keys answer the displayed choices and **h** hails the ship.
 When the galaxy is closed, desktop notifications report questions and completed longer turns.
 
 **A** opens anomalies across the galaxy; a planet's **a** action filters to that project.
@@ -133,6 +134,7 @@ when GitHub is unavailable. Unpushed commits still appear as freighters travelli
 | H / n | Home / add a project folder |
 | e / t | Launch an agent / give the selected planet a task |
 | Tab / C | Next agent needing you / attention list |
+| 1-9 / h | Answer / hail (open comms with) the incoming transmission |
 | A | Anomalies |
 | L / S | Selected planet's task history / situation log |
 | i / x on a ship | Ship information / dismiss with confirmation |

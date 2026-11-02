@@ -1494,12 +1494,23 @@ fn transmission(fb: &mut Fb, app: &App, l: &Lay, t: f32) {
     }
     let inner = (width - 4) as usize;
     let waiting = app.agents.iter().filter(|a| a.dying.is_none() && a.status == Status::Blocked).count();
-    let mut body: Vec<(String, V3)> = Vec::new();
-    for c in &q.context {
-        body.push((trunc(c, inner), DIM));
+    // the command (or file) it wants is the point of the message: wrapped in full and lit up
+    let cmd = v3(1.0, 0.82, 0.45);
+    let lines = |s: &str, max: usize, c: V3| {
+        let mut w = wrap(s, inner);
+        if w.len() > max { w.truncate(max); w[max - 1] = trunc(&format!("{}…", w[max - 1]), inner); }
+        w.into_iter().map(move |l| (l, c))
+    };
+    let mut context: Vec<Vec<(String, V3)>> = q.context.iter().map(|c| if commandish(c) { lines(c, 4, cmd).collect() } else { lines(c, 2, DIM).collect() }).collect();
+    let mut rest: Vec<(String, V3)> = lines(&q.question, 2, TEXT).collect();
+    for d in &q.detail {
+        rest.extend(if commandish(d) { lines(d, 8, cmd).collect::<Vec<_>>() } else { lines(d, 3, TEXT * 0.8).collect() });
     }
-    body.push((trunc(&q.question, inner), TEXT));
-    body.push((String::new(), DIM));
+    rest.push((String::new(), DIM));
+    // on a short terminal the oldest context gives way first
+    let room = (l.rows - 6 - q.options.len().min(9) as i32 - 3).max(0) as usize;
+    while !context.is_empty() && context.iter().map(Vec::len).sum::<usize>() + rest.len() > room { context.remove(0); }
+    let body: Vec<(String, V3)> = context.into_iter().flatten().chain(rest).collect();
     let height = body.len() as i32 + q.options.len().min(9) as i32 + 3;
     let x = (cw - width) / 2;
     let y = 2;
@@ -1517,8 +1528,14 @@ fn transmission(fb: &mut Fb, app: &App, l: &Lay, t: f32) {
         seg(fb, cx + 1, r, &trunc(&o.label, inner - 4), width - 4 - (cx + 1 - x - 2), TEXT, Some(BOX));
     }
     let more = if waiting > 1 { format!(" · ⇥ next ({} waiting)", waiting - 1) } else { String::new() };
-    let hint = format!(" 1-{} answer · ⏎ open comms{more} ", q.options.len().min(9));
+    let hint = format!(" 1-{} answer · h hail{more} ", q.options.len().min(9));
     seg(fb, x + width - 2 - hint.chars().count() as i32, y + height - 1, &hint, width, DIM, Some(BOX));
+}
+
+/// A transmission line naming what the agent wants to run: Codex's `$ cmd` or `• Running …`, Claude's `Bash(…)`.
+fn commandish(l: &str) -> bool {
+    let l = l.trim_start_matches(['•', '⏺', '└', '●', ' ']).to_lowercase();
+    l.starts_with("$ ") || l.starts_with("running ") || l.starts_with("bash(") || l.starts_with("command:")
 }
 
 pub fn commander_button(app: &App, w: &World) -> String {
@@ -2402,6 +2419,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("Enter / double click", "open project or native agent terminal"),
         ("H / n", "home planet / add a folder"),
         ("Tab / C", "next agent needing you / all attention"),
+        ("1-9 / h", "answer / hail an incoming transmission"),
         ("A", "anomalies: investigate, dismiss or resolve"),
         ("e / t", "launch agent / give planet a task"),
         ("L / S", "planet task history / situation log"),

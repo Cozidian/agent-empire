@@ -3416,14 +3416,8 @@ fn handle(
         KeyCode::Up | KeyCode::Char('k') => pick(app, cur.map_or(0, |c| c.saturating_sub(1))),
         KeyCode::Home | KeyCode::Char('g') => pick(app, 0),
         KeyCode::End | KeyCode::Char('G') => pick(app, rows.len().saturating_sub(1)),
-        // the transmission on screen takes Enter, unless you've picked another agent
-        KeyCode::Enter
-            if let Some(id) = app.transmission().map(|a| a.id)
-                && app.sel != Some(Sel::GitHub)
-                && !matches!(app.sel, Some(Sel::Planet(_) | Sel::Sector(_, _)))
-                && !(app.cam.z < SECTOR_ZOOM && matches!(app.sel, Some(Sel::Sys(_))))
-                && !matches!(app.sel, Some(Sel::Agent(s)) if s != id) =>
-        {
+        // hail the transmission on screen: its own key, so Enter keeps landing on whatever is selected
+        KeyCode::Char('h') if let Some(id) = app.transmission().map(|a| a.id) => {
             app.sel = Some(Sel::Agent(id));
             app.open_comms(id, client, l);
         }
@@ -4318,7 +4312,7 @@ mod commander_tests {
             a.title = format!("task for ship {id}");
             app.agents.push(a);
         }
-        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![] });
+        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![], detail: vec![] });
         app.sel = Some(Sel::Sys("/beta".into()));
         let world = app.world(0.0, 0.0);
         let l = Lay::new(&Fb::new(120, 40), false);
@@ -4649,6 +4643,32 @@ mod structure_tests {
             handle(&mut app, &world, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), 1.0, &mut None);
             assert!(matches!(&app.mode, Mode::Workspace { key, .. } if key == "/uninhabited/world"));
         }
+    }
+
+    #[test]
+    fn a_transmission_shows_the_whole_command_and_h_hails_its_ship() {
+        let mut app = App::new();
+        let mut ship = ship_card_tests::ship(1, false);
+        ship.status = Status::Blocked;
+        let cmd = "$ env EMPIRE_SOCK=/tmp/empire-city-check.sock XDG_STATE_HOME=/tmp/empire-city-check cargo run --release -- graphics --snapshot";
+        ship.ask = Some(Ask {
+            question: "Would you like to run the following command?".into(),
+            context: vec!["• Hook failed".into()],
+            detail: vec![cmd.into()],
+            options: vec![crate::proto::Choice { key: "1".into(), label: "Yes, proceed (y)".into() }],
+        });
+        app.agents.push(ship);
+        let world = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let mut fb = Fb::new(120, 40);
+        let l = Lay::new(&fb, false);
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let text: String = fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("h hail"), "{text}");
+        assert!(text.contains("--snapshot"), "the end of the command is on screen:\n{text}");
+        app.sel = Some(Sel::Planet("/somewhere".into()));
+        handle(&mut app, &world, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)), 1.0, &mut None);
+        assert!(matches!(app.mode, Mode::Comms(_)));
+        assert_eq!(app.sel, Some(Sel::Agent(1)));
     }
 
     #[test]

@@ -217,6 +217,9 @@ pub struct Ask {
     /// What it's about (the command, the file, …), a few lines above the question.
     pub context: Vec<String>,
     pub options: Vec<Choice>,
+    /// What's being asked for, between the question and its choices (Codex's `$ command`, a reason).
+    #[serde(default)]
+    pub detail: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
