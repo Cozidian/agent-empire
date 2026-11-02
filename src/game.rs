@@ -2444,7 +2444,6 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         if let Some(rx) = &app.discovering && let Ok(projects) = rx.try_recv() {
             app.sectors = app.workspace.sectors(&projects); app.projects = projects; app.discovering = None; app.fitted = false;
         }
-        app.score_reports();
         let mut cues = Vec::new();
         for m in std::mem::take(&mut pending).into_iter().chain(client.rx.try_iter()) {
             match m {
@@ -2577,6 +2576,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             }
             surveyed = Instant::now();
         }
+        app.score_reports();
         // quitting the editor hands you straight back to the file
         if app.editor_quit() {
             app.close_comms(client, &world);
