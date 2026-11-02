@@ -133,7 +133,10 @@ or pressing **-** to pull back; **z** fits the whole galaxy using the same expan
 
 Planets retain their seeded procedural appearance. Useful progress adds rings, city lights and
 other development without a separate management workflow. Music and sounds are synthesized
-locally; music starts when the galaxy opens and stops when you leave. Home and the project
+locally; music starts when the galaxy opens and stops when you leave. The score is composed
+on the fly and never repeats: slow, hopeful chord changes in a drifting key, with sections
+that move between pads, strings and a wordless choir. Echoing arpeggios, soft chimes and an
+improvised lead melody join once each section settles. Home and the project
 workspace show larger planetary portraits when there is enough room.
 
 Campaigns, expeditions, ship designs/refits, prescribed launch roles, fleet orders, manual
