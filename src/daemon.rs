@@ -4,6 +4,7 @@
 
 use crate::role::Role;
 use crate::proto::*;
+use crate::jev;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -172,6 +173,13 @@ struct Agent {
     refit: Option<RefitState>,
     /// The command a shell session runs instead of the shell (an editor on a file).
     run: Vec<String>,
+    /// Jev's (or the keyword scan's) read of the turn that just finished: transient, gone when the
+    /// ship leaves Done. `outcome_gen` counts turns so a late answer for an old one is dropped,
+    /// `outcome_due` is when to read the settled output, `outcome_from` (unix) when the turn began.
+    outcome: Option<Outcome>,
+    outcome_gen: u32,
+    outcome_due: Option<Instant>,
+    outcome_from: Option<u64>,
     /// Screen generation, bumped on every change, and the signal waiting viewers sleep on.
     version: u64,
     changed: Arc<Condvar>,
@@ -425,6 +433,7 @@ impl Agent {
             spec: self.spec.clone(),
             refit: self.refit.clone(),
             run: self.run.clone(),
+            outcome: self.outcome.clone(),
         }
     }
 
@@ -613,6 +622,10 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         spec: ShipSpec::default(),
         refit: None,
         run: Vec::new(),
+        outcome: None,
+        outcome_gen: 0,
+        outcome_due: None,
+        outcome_from: None,
         version: 1,
         changed: Arc::default(),
         status: Status::Booting,
@@ -898,6 +911,11 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
         let g = a.lock().unwrap();
         (g.refit_is("pending") || g.refit_is("applying")).then_some(g.id)
     }).collect();
+    // Jev's read of each ship's finished turn, and when that turn began
+    let outcomes: HashMap<u32, (Outcome, u64)> = agents.iter().filter_map(|a| {
+        let g = a.lock().unwrap();
+        Some((g.id, (g.outcome.clone()?, g.outcome_from?)))
+    }).collect();
     let mut h = hub.lock().unwrap();
     let busy: HashSet<u32> = h.missions.iter().filter(|m| matches!(m.state.as_str(), "sent" | "active")).filter_map(|m| m.agent).collect();
     let mut taken = HashSet::new();
@@ -933,9 +951,12 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
                 Some((_, _, Status::Done | Status::Idle, _)) if m.state == "active" => {
                     m.state = "done".into();
                     m.done_at = Some(unix_now());
+                    m.outcome = mission_outcome(m, &outcomes);
                 }
                 _ => {}
             },
+            // the read of its last turn can land a few seconds after the mission is marked done
+            "done" if m.outcome.is_none() => m.outcome = mission_outcome(m, &outcomes),
             _ => {}
         }
     }
@@ -1415,7 +1436,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             if let Err(msg) = crate::screenshots::validate(&attachments) { return Resp::Err { msg }; }
             let id = hub.lock().unwrap().missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
             let prompt = crate::screenshots::prompt(&text, &attachments);
-            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: to.filter(|_| !launch), at: unix_now(), done_at: None, fleet: None, campaign, campaign_job: String::new() };
+            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: to.filter(|_| !launch), at: unix_now(), done_at: None, fleet: None, campaign, campaign_job: String::new(), outcome: None };
             if launch {
                 match spawn(hub, &kind, &cwd, None, Some(&prompt), Role::parse(&role), &spec, &[]) {
                     Ok(aid) => {
@@ -1444,7 +1465,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                     g.note_task(&text);
                     g.cwd.clone()
                 };
-                h.missions.push(Mission { id: next, cwd, text: text.clone(), attachments: Vec::new(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet), campaign: None, campaign_job: String::new() });
+                h.missions.push(Mission { id: next, cwd, text: text.clone(), attachments: Vec::new(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet), campaign: None, campaign_job: String::new(), outcome: None });
                 next += 1;
                 sent += 1;
                 order(a, text.clone());
@@ -1764,10 +1785,12 @@ pub fn run() -> io::Result<()> {
                 if g.status != g.told {
                     g.told = g.status;
                     let long = g.worked_at.is_some_and(|w| now - w > Duration::from_secs(DESKTOP_TURN));
+                    outcome_turn(&mut g, long, now);
                     if !watched && (g.status == Status::Blocked || (g.status == Status::Done && long)) {
                         alert(&h, &g);
                     }
                 }
+                outcome_tick(&a, &mut g, now, outcome_gate());
                 if g.exited.is_some_and(|e| now - e > Duration::from_secs(6)) {
                     dead.push(id);
                 }
@@ -1878,6 +1901,200 @@ fn alert(hub: &Shared, a: &Agent) {
             let _ = g.writer.write_all(o.key.as_bytes());
         }
     });
+}
+
+// ───────────────────────── how a finished turn looks ─────────────────────────
+
+/// Set to 1 (with `TYPESAFE_API_KEY`) to have Jev read how a long turn ended; with the flag but
+/// no key (or when Jev fails) a keyword scan stands in. Either way it only ever adds a warning.
+const OUTCOME_FLAG: &str = "EMPIRE_JEV_OUTCOME";
+/// Seconds the final output gets to settle after the turn is Done.
+const OUTCOME_WAIT: u64 = 2;
+const OUTCOME_LABELS: [&str; 4] = ["completed", "partial", "failed", "needs_review"];
+/// Confidence given to a keyword-scan verdict.
+const SCAN_CONF: f32 = 0.5;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Gate {
+    Off,
+    /// Flag on, nothing to ask: keyword scan only.
+    Scan,
+    Jev,
+}
+
+fn gate_of(flag: bool, key: bool) -> Gate {
+    match (flag, key) {
+        (false, _) => Gate::Off,
+        (true, false) => Gate::Scan,
+        (true, true) => Gate::Jev,
+    }
+}
+
+fn outcome_gate() -> Gate {
+    let flag = std::env::var(OUTCOME_FLAG).ok();
+    // `enabled_with` wants a key, so ask it about the flag alone with a stand-in one
+    let on = jev::enabled_with(Some("x"), flag.as_deref());
+    gate_of(on, jev::enabled(OUTCOME_FLAG))
+}
+
+/// A turn is worth reading when it was long enough to matter and ended in Done.
+fn wants_outcome(gate: Gate, kind: &str, status: Status, long: bool) -> bool {
+    gate != Gate::Off && kind != "shell" && status == Status::Done && long
+}
+
+/// The status changed: forget the last turn's outcome, and line up a read of this one if it's due.
+fn outcome_turn(g: &mut Agent, long: bool, now: Instant) {
+    g.outcome = None;
+    g.outcome_due = None;
+    g.outcome_from = None;
+    g.outcome_gen = g.outcome_gen.wrapping_add(1);
+    if wants_outcome(outcome_gate(), &g.kind, g.status, long) {
+        g.outcome_due = Some(now + Duration::from_secs(OUTCOME_WAIT));
+        g.outcome_from = g.worked_at.map(|w| unix_now().saturating_sub(w.elapsed().as_secs()));
+    }
+}
+
+/// Screen lines worth reading as a result: no box drawing, rules, bare prompts or key hints.
+fn strip_chrome(screen: &str) -> String {
+    const HINTS: [&str; 14] = [
+        "esc to interrupt", "ctrl+c to", "ctrl-c to", "? for shortcuts", "shift+tab", "bypass permissions", "auto-accept",
+        "accept edits", "press enter to", "tab to queue", "for newline", "context left", "% context", "ctrl+t to",
+    ];
+    screen
+        .lines()
+        .map(unbox)
+        .filter(|l| l.chars().any(char::is_alphanumeric) && !matches!(*l, ">" | "❯" | "›" | "$"))
+        .filter(|l| {
+            let low = l.to_lowercase();
+            !HINTS.iter().any(|h| low.contains(h))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The last ~1500 chars of what's on screen, with chrome and secrets taken out.
+fn final_output(screen: &str) -> String {
+    crate::redact::tail(&crate::redact::redact(&strip_chrome(screen)), 1500)
+}
+
+fn outcome_req(kind: &str, mission: &str, output: &str) -> serde_json::Value {
+    let state = serde_json::json!({ "agent": kind, "mission": crate::redact::clip(&crate::redact::redact(mission), 300), "final_output": output });
+    jev::request(state, vec![
+        ("has_summary", jev::noul_q("Does `final_output` contain the agent's own summary of what it did or found in this turn (as opposed to only tool output, a prompt, or a screen that is still in progress)?")),
+        ("outcome", jev::choice_q("Judging from the agent's own words in `final_output`, how did its work on `mission` end? Say completed only when the agent reports the job done with nothing outstanding.", &[
+            ("completed", "the agent reports the work done, with nothing left over"),
+            ("partial", "the agent did part of it and says something remains, was skipped, or is left as a TODO"),
+            ("failed", "the agent reports errors, failures or that it could not do it"),
+            ("needs_review", "the agent finished but asks the user to review, decide or check something"),
+        ])),
+    ])
+}
+
+/// A Noul at or above this is a yes.
+const OUTCOME_YES: f32 = 0.7;
+
+/// Jev's reading: `None` is a failure (fall back); `Some(None)` is "nothing to say", because the
+/// output holds no summary to judge or Jev wasn't sure it did.
+fn read_outcome(v: &serde_json::Value) -> Option<Option<Outcome>> {
+    if jev::noul(v, "has_summary")? < OUTCOME_YES {
+        return Some(None);
+    }
+    let c = jev::choice(v, "outcome", &OUTCOME_LABELS)?;
+    Some(Some(Outcome { label: c.label, conf: c.confidence }))
+}
+
+/// What to record for a turn: Jev's reading, or the keyword scan when Jev gave none.
+fn outcome_of(answer: Option<&serde_json::Value>, output: &str) -> Option<Outcome> {
+    answer.and_then(read_outcome).unwrap_or_else(|| scan_outcome(output))
+}
+
+/// Only one outcome request is in flight at a time.
+static OUTCOME_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask Jev on a spawned thread (like `alert`) and hand `done` the answer, or `None` on any
+/// failure. False when a request is already in flight; nothing was started.
+fn outcome_ask(req: serde_json::Value, done: impl FnOnce(Option<serde_json::Value>) + Send + 'static) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if OUTCOME_BUSY.swap(true, SeqCst) {
+        return false;
+    }
+    thread::spawn(move || {
+        let answer = jev::post(&req).ok();
+        OUTCOME_BUSY.store(false, SeqCst);
+        done(answer);
+    });
+    true
+}
+
+/// `kw` in `t` as a word, not as "0 failed", "no errors:" or "failed: 0".
+fn mentions(t: &str, kw: &str) -> bool {
+    t.match_indices(kw).any(|(i, _)| {
+        let (before, after) = (&t[..i], &t[i + kw.len()..]);
+        let word = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+        let zero = ["0 ", "no ", "zero ", "without ", "not "].iter().any(|z| before.ends_with(z)) || [": 0", "=0", ": none"].iter().any(|z| after.starts_with(z));
+        word(before.chars().next_back()) && (kw.ends_with(':') || word(after.chars().next())) && !zero
+    })
+}
+
+/// The keyword stand-in for Jev: errors mean failed, leftovers partial, a request to look
+/// needs_review. When several match, the worse one wins.
+fn scan_outcome(output: &str) -> Option<Outcome> {
+    let low = output.to_lowercase();
+    let label = if ["error:", "failed", "panicked"].iter().any(|k| mentions(&low, k)) {
+        "failed"
+    } else if ["remaining", "skipped"].iter().any(|k| mentions(&low, k)) || mentions(output, "TODO") {
+        "partial"
+    } else if mentions(&low, "please review") {
+        "needs_review"
+    } else {
+        return None;
+    };
+    Some(Outcome { label: label.into(), conf: SCAN_CONF })
+}
+
+/// Read how a ship's finished turn went, once its output has settled.
+fn outcome_tick(a: &Arc<Mutex<Agent>>, g: &mut Agent, now: Instant, gate: Gate) {
+    let Some(due) = g.outcome_due else { return };
+    if gate == Gate::Off || g.status != Status::Done {
+        g.outcome_due = None;
+        return;
+    }
+    // like `settled` in `update`: wait for the final output to stop moving (some TUIs never do)
+    let settled = g.animated() || now - g.last_out > Duration::from_secs(OUTCOME_WAIT);
+    if now < due || (!settled && now < due + Duration::from_secs(8)) {
+        return;
+    }
+    let output = final_output(&g.parser.screen().contents());
+    if output.trim().is_empty() {
+        g.outcome_due = None;
+        return;
+    }
+    if gate == Gate::Scan {
+        g.outcome = scan_outcome(&output);
+        g.outcome_due = None;
+        return;
+    }
+    let (turn, fallback, a) = (g.outcome_gen, output.clone(), a.clone());
+    let started = outcome_ask(outcome_req(&g.kind, &g.task, &output), move |answer| {
+        let read = outcome_of(answer.as_ref(), &fallback);
+        let mut g = a.lock().unwrap();
+        if g.outcome_gen == turn && g.status == Status::Done {
+            g.outcome = read;
+        }
+    });
+    if started {
+        g.outcome_due = None;
+    } else if now > due + Duration::from_secs(30) {
+        // Jev has been busy too long: don't leave the turn unread
+        g.outcome = scan_outcome(&output);
+        g.outcome_due = None;
+    }
+}
+
+/// The outcome to log on a finished mission: that of the ship's turn that ended it.
+fn mission_outcome(m: &Mission, outcomes: &HashMap<u32, (Outcome, u64)>) -> Option<Outcome> {
+    let (o, from) = outcomes.get(&m.agent?)?;
+    (m.done_at? >= *from).then(|| o.clone())
 }
 
 /// `empire status`: one line for a status bar (`--json`: waybar-style JSON).
@@ -2418,5 +2635,202 @@ mod refit_tests {
         back.lock().unwrap().writer.kill();
         STAND_IN.with(|s| *s.borrow_mut() = None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ship(id: u32, status: Status) -> Arc<Mutex<Agent>> {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let mut a = new_agent(id, "claude", "/world", Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80);
+        a.status = status;
+        Arc::new(Mutex::new(a))
+    }
+
+    fn answer(summary: f64, label: &str, conf: f64) -> serde_json::Value {
+        json!({ "answers": {
+            "has_summary": { "type": "noul", "noul": summary },
+            "outcome": { "type": "choice", "choice": label, "confidence": conf, "probabilities": { label: 0.8 } },
+        }})
+    }
+
+    #[test]
+    fn only_a_long_finished_turn_of_an_agent_is_read_and_only_with_the_flag() {
+        assert_eq!(gate_of(false, true), Gate::Off);
+        assert_eq!(gate_of(true, false), Gate::Scan, "the keyword scan runs without a key");
+        assert_eq!(gate_of(true, true), Gate::Jev);
+        assert!(wants_outcome(Gate::Scan, "claude", Status::Done, true));
+        assert!(!wants_outcome(Gate::Off, "claude", Status::Done, true));
+        assert!(!wants_outcome(Gate::Jev, "claude", Status::Done, false), "short turns are not worth it");
+        assert!(!wants_outcome(Gate::Jev, "claude", Status::Idle, true));
+        assert!(!wants_outcome(Gate::Jev, "claude", Status::Blocked, true));
+        assert!(!wants_outcome(Gate::Jev, "shell", Status::Done, true));
+    }
+
+    #[test]
+    fn the_request_asks_two_questions_and_keeps_the_state_small_and_clean() {
+        let long = "x".repeat(900);
+        let r = outcome_req("claude", &format!("{long} sk-abcdefghijklmnop"), "all done");
+        assert_eq!(r["model"], jev::model());
+        assert_eq!(r["state"]["agent"], "claude");
+        assert_eq!(r["state"]["final_output"], "all done");
+        assert_eq!(r["state"]["mission"].as_str().unwrap().chars().count(), 300);
+        assert_eq!(r["questions"]["has_summary"]["type"], "noul");
+        assert_eq!(r["questions"]["outcome"]["type"], "choice");
+        let labels: HashSet<_> = r["questions"]["outcome"]["criteria"].as_object().unwrap().keys().cloned().collect();
+        assert_eq!(labels, OUTCOME_LABELS.iter().map(|s| s.to_string()).collect());
+        let r = outcome_req("claude", "fix it with sk-abcdefghijklmnop", "ok");
+        assert!(!r.to_string().contains("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn the_outcome_is_read_only_when_jev_says_there_is_a_summary() {
+        let o = |v: &serde_json::Value| read_outcome(v);
+        assert_eq!(o(&answer(0.9, "failed", 0.8)), Some(Some(Outcome { label: "failed".into(), conf: 0.8 })));
+        assert_eq!(o(&answer(0.7, "partial", 0.5)).flatten().map(|o| o.label), Some("partial".into()));
+        assert_eq!(o(&answer(0.69, "failed", 0.9)), Some(None), "unsure there is a summary: say nothing");
+        assert_eq!(o(&answer(0.1, "failed", 0.9)), Some(None));
+        // anything odd is a failure, which falls back to the scan
+        assert_eq!(o(&answer(0.9, "exploded", 0.9)), None);
+        assert_eq!(o(&json!({ "answers": { "outcome": { "type": "choice", "choice": "failed", "confidence": 0.9, "probabilities": { "failed": 1.0 } } } })), None);
+        assert_eq!(o(&json!({ "answers": { "has_summary": { "type": "noul", "noul": 0.9 } } })), None);
+        assert_eq!(o(&json!({ "answers": { "has_summary": { "type": "score", "score": 1.0 }, "outcome": {} } })), None);
+        assert_eq!(o(&json!({ "detail": "nope" })), None);
+    }
+
+    #[test]
+    fn an_error_or_a_missing_answer_falls_back_to_the_keyword_scan() {
+        let output = "FAILED: 2 tests. error: build broke";
+        assert_eq!(outcome_of(None, output).map(|o| o.label), Some("failed".into()));
+        assert_eq!(outcome_of(Some(&json!({ "answers": {} })), output).map(|o| o.label), Some("failed".into()));
+        // an answer of "nothing to say" is not an error: the scan does not second-guess it
+        assert_eq!(outcome_of(Some(&answer(0.1, "completed", 0.9)), output), None);
+        assert_eq!(outcome_of(None, "All good, nothing to add."), None);
+    }
+
+    #[test]
+    fn the_scan_reads_failure_leftovers_and_requests_for_review() {
+        let label = |t: &str| scan_outcome(t).map(|o| o.label);
+        assert_eq!(label("error: could not compile"), Some("failed".into()));
+        assert_eq!(label("2 tests failed"), Some("failed".into()));
+        assert_eq!(label("thread 'main' panicked at src/x.rs"), Some("failed".into()));
+        assert_eq!(label("Three files remaining"), Some("partial".into()));
+        assert_eq!(label("skipped the flaky test"), Some("partial".into()));
+        assert_eq!(label("left a TODO in the parser"), Some("partial".into()));
+        assert_eq!(label("Please review the migration"), Some("needs_review".into()));
+        assert_eq!(label("skipped one test, error: boom"), Some("failed".into()), "the worse reading wins");
+        assert_eq!(scan_outcome("error: x").unwrap().conf, SCAN_CONF);
+        // green runs and lookalikes are not warnings
+        assert_eq!(label("test result: ok. 116 passed; 0 failed; 0 ignored"), None);
+        assert_eq!(label("no errors: all clear, failed: 0"), None);
+        assert_eq!(label("Update Todos: wrote todolist, remainders"), None);
+        assert_eq!(label("a todo in lowercase, unfailed, errors"), None);
+        assert_eq!(label(""), None);
+    }
+
+    #[test]
+    fn terminal_chrome_and_secrets_stay_out_of_the_final_output() {
+        let screen = "╭────────────╮\n│ > │\n╰────────────╯\n● Fixed the parser and added tests.\n  Set OPENAI_API_KEY=sk-abcdefghijklmnop for the run\n? for shortcuts\n  esc to interrupt\n❯\n> \n─────────\n".replace("\\n", "\n");
+        let out = final_output(&screen);
+        assert_eq!(out, "● Fixed the parser and added tests.\nSet OPENAI_API_KEY=[redacted] for the run");
+        let many = (0..400).map(|i| format!("line number {i} of the output")).collect::<Vec<_>>().join("\n");
+        let out = final_output(&many);
+        assert_eq!(out.chars().count(), 1500);
+        assert!(out.ends_with("line number 399 of the output"));
+    }
+
+    #[test]
+    fn an_old_missions_file_still_loads_and_a_new_one_round_trips() {
+        let old = r#"[{"id":3,"cwd":"/w","text":"Fix it","state":"done","agent":2,"at":100,"done_at":160}]"#;
+        let ms: Vec<Mission> = serde_json::from_str(old).expect("old missions.json must keep loading");
+        assert_eq!((ms.len(), ms[0].id, ms[0].outcome.clone()), (1, 3, None));
+        // the way `run` loads it: a schema mismatch here would silently empty the log
+        assert_eq!(serde_json::from_str::<Vec<Mission>>(old).unwrap_or_default().len(), 1);
+        let mut m = ms[0].clone();
+        m.outcome = Some(Outcome { label: "partial".into(), conf: 0.6 });
+        let back: Vec<Mission> = serde_json::from_str(&serde_json::to_string(&vec![m.clone()]).unwrap()).unwrap();
+        assert_eq!(back, vec![m]);
+        // and a newer file read by a build that has the field but not Outcome's own fields
+        let v: Vec<Mission> = serde_json::from_str(r#"[{"id":1,"cwd":"/w","text":"t","state":"done","agent":null,"at":1,"done_at":2,"outcome":{}}]"#).unwrap();
+        assert_eq!(v[0].outcome, Some(Outcome::default()));
+        assert_eq!(v[0].outcome.as_ref().and_then(Outcome::warn), None);
+    }
+
+    #[test]
+    fn a_done_mission_takes_the_outcome_of_the_turn_that_finished_it() {
+        let hub = Shared::default();
+        let a = ship(2, Status::Working);
+        hub.lock().unwrap().agents.insert(2, a.clone());
+        hub.lock().unwrap().missions.push(Mission { id: 1, cwd: "/world".into(), text: "job".into(), state: "active".into(), agent: Some(2), at: 1, ..Mission::default() });
+        let mut logged = Vec::new();
+        a.lock().unwrap().status = Status::Done;
+        a.lock().unwrap().outcome_from = Some(unix_now() - 20);
+        // the turn is done but not yet read: the mission is done, with no tag
+        dispatch(&hub, &mut logged);
+        assert_eq!(hub.lock().unwrap().missions[0].state, "done");
+        assert_eq!(hub.lock().unwrap().missions[0].outcome, None);
+        // the read lands a little later and is carried over
+        a.lock().unwrap().outcome = Some(Outcome { label: "failed".into(), conf: 0.7 });
+        dispatch(&hub, &mut logged);
+        assert_eq!(hub.lock().unwrap().missions[0].outcome, Some(Outcome { label: "failed".into(), conf: 0.7 }));
+        assert_eq!(logged[0].outcome, hub.lock().unwrap().missions[0].outcome, "and is saved with the log");
+        // a mission finished before that turn began does not take it
+        hub.lock().unwrap().missions.push(Mission { id: 2, cwd: "/world".into(), text: "older".into(), state: "done".into(), agent: Some(2), at: 1, done_at: Some(unix_now() - 500), ..Mission::default() });
+        dispatch(&hub, &mut logged);
+        assert_eq!(hub.lock().unwrap().missions[1].outcome, None);
+    }
+
+    #[test]
+    fn a_settled_long_turn_is_scanned_and_then_forgotten_when_the_ship_moves_on() {
+        let a = ship(1, Status::Done);
+        let now = Instant::now();
+        {
+            let mut g = a.lock().unwrap();
+            g.parser.process(b"Ran the build.\r\nerror: linking failed\r\n");
+            g.last_out = now - Duration::from_secs(5);
+            g.outcome_due = Some(now - Duration::from_secs(1));
+            outcome_tick(&a, &mut g, now, Gate::Scan);
+            assert_eq!(g.outcome.as_ref().map(|o| o.label.as_str()), Some("failed"));
+            assert!(g.outcome_due.is_none());
+            assert_eq!(g.view(now).outcome, g.outcome);
+            // the next turn starts: nothing carries over
+            g.status = Status::Working;
+            outcome_turn(&mut g, true, now);
+            assert!(g.outcome.is_none() && g.view(now).outcome.is_none());
+        }
+        // output still moving: wait for it; off: never read
+        let b = ship(2, Status::Done);
+        let mut g = b.lock().unwrap();
+        g.parser.process(b"error: not yet\r\n");
+        g.last_out = now;
+        g.outcome_due = Some(now);
+        outcome_tick(&b, &mut g, now, Gate::Scan);
+        assert!(g.outcome.is_none() && g.outcome_due.is_some());
+        outcome_tick(&b, &mut g, now + Duration::from_secs(3), Gate::Off);
+        assert!(g.outcome.is_none() && g.outcome_due.is_none());
+    }
+
+    #[test]
+    fn agent_views_from_an_older_daemon_have_no_outcome() {
+        let v: AgentView = serde_json::from_str(r#"{"id":1,"kind":"claude","cwd":"/w","title":"","status":"done","age":0.5}"#).unwrap();
+        assert!(v.outcome.is_none());
+        let mut v = v;
+        v.outcome = Some(Outcome { label: "failed".into(), conf: 0.9 });
+        let back: AgentView = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back.outcome, v.outcome);
+    }
+
+    #[test]
+    fn only_warnings_above_the_confidence_floor_are_ever_shown() {
+        let w = |l: &str, c: f32| Outcome { label: l.into(), conf: c }.warn();
+        assert!(w("failed", 0.4).is_some_and(|w| w.red && w.text == "Looks failed"));
+        assert_eq!(w("partial", 0.4).map(|w| w.text), Some("Partly done"));
+        assert_eq!(w("needs_review", 1.0).map(|w| w.text), Some("Needs review"));
+        assert_eq!(w("failed", 0.39), None);
+        assert_eq!(w("completed", 1.0), None);
+        assert_eq!(w("healthy", 1.0), None);
     }
 }

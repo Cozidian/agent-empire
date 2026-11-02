@@ -95,6 +95,18 @@ galaxy selects the next agent needing you; **C** opens the attention list across
 Permission questions remain incoming transmissions; number keys answer the displayed choices.
 When the galaxy is closed, desktop notifications report questions and completed longer turns.
 
+**Outcome tags (optional, automatic).** "Done" only means a turn ended. With
+`EMPIRE_JEV_OUTCOME=1`, a turn longer than 15 seconds is read once its output settles. If the
+output holds the agent's own summary, TypeSafe's Jev model (`TYPESAFE_API_KEY`) judges whether
+the work looks failed, partial or needs review. A confident warning (0.4 or more) shows as "Looks
+failed" or "Partly done" instead of "Ready to check" on Home, in the needs list, higher in the
+attention list and on the mission log row, and is saved with the mission. It never shows a good-news
+badge, never asks anything and does nothing for you; low confidence, no summary or any error shows
+nothing. With the flag but no key (or if Jev fails) a keyword scan stands in (`error:`, `failed`,
+`panicked`; `remaining`, `skipped`, `TODO`; `please review`). The last 1500 characters of the
+screen, with secrets blanked, are sent to TypeSafe. `TYPESAFE_DEFAULT_MODEL` and `TYPESAFE_BASE_URL`
+override the model (`jev-1.14.0`) and endpoint.
+
 **A** opens anomalies across the galaxy; a planet's **a** action filters to that project.
 Anomalies include failing CI and unresolved Git conflicts, plus findings reported by you or an
 agent: bugs, unclear code, missing documentation and improvement opportunities. Each preserves
