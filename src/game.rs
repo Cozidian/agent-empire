@@ -8,7 +8,7 @@ use crate::draw;
 use crate::gfx::*;
 use crate::role::Role;
 use crate::structure::{Built, KINDS, Kind};
-use crate::proto::{AgentView, Ask, Mission, RefitState, Report, ScreenView, ShipSpec, War};
+use crate::proto::{AgentView, Ask, Mission, Pulse, RefitState, Report, ScreenView, ShipSpec, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crate::screenshots::{self, Attachment};
@@ -185,6 +185,8 @@ pub struct Agent {
     /// When it last started working.
     pub busy_at: f32,
     pub turns: u32,
+    /// Looping or erroring, as far as Advisor (or the repeat check) can tell; only while it is Working.
+    pub pulse: Option<Pulse>,
     pub report: Report,
     pub ask: Option<Ask>,
     pub war: Vec<War>,
@@ -1233,6 +1235,7 @@ impl App {
                 let a = &mut self.agents[i];
                 a.since = t - v.age;
                 a.turns = v.turns;
+                a.pulse = v.pulse.clone();
                 a.report = v.report.clone();
                 a.ask = v.ask.clone();
                 // what's aboard can change under a refit; say how one ended
@@ -1289,6 +1292,7 @@ impl App {
                     last_ping: t,
                     busy_at: t,
                     turns: v.turns,
+                    pulse: v.pulse.clone(),
                     report: v.report.clone(),
                     ask: v.ask.clone(),
                     war: v.war.clone(),
@@ -4256,6 +4260,7 @@ mod ship_card_tests {
             last_ping: 0.0,
             busy_at: 0.0,
             turns: 3,
+            pulse: None,
             report: Default::default(),
             ask: None,
             war: if war { vec![crate::proto::War { rival: 9, files: vec!["src/a.rs".into()] }] } else { vec![] },
@@ -5243,5 +5248,73 @@ mod editor_tests {
         let Mode::Planet(v) = &app.mode else { panic!("quitting the editor returns to the world's resources") };
         assert_eq!(v.preview, "# new", "the file is read again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod pulse_tests {
+    use super::*;
+    use crate::proto::Pulse;
+
+    fn working(label: &str, conf: f32) -> App {
+        let mut app = App::new();
+        app.history.clear();
+        app.online = true;
+        let mut a = ship_card_tests::ship(1, false);
+        a.cwd = "/code/web".into();
+        a.status = Status::Working;
+        a.title = "task of ship 1".into();
+        a.pulse = Some(Pulse { label: label.into(), conf });
+        app.agents.push(a);
+        app
+    }
+
+    fn render(app: &mut App, mode: Mode) -> String {
+        let w = app.world(0.0, 0.0);
+        let mut fb = Fb::new(140, 50);
+        let l = Lay::new(&fb, true);
+        app.sel = Some(Sel::Planet("/code/web".into()));
+        app.mode = mode;
+        draw::frame(&mut fb, app, &w, &l, 1.0, None);
+        fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn outliner_row(text: &str) -> String {
+        text.lines().find(|l| l.contains("task of ship 1")).unwrap_or_else(|| panic!("no row\n{text}")).to_string()
+    }
+
+    #[test]
+    fn a_looping_or_erroring_ship_wears_an_amber_mark_in_the_outliner() {
+        assert!(outliner_row(&render(&mut working("looping", 0.5), Mode::Galaxy)).contains('↻'));
+        assert!(outliner_row(&render(&mut working("erroring", 0.9), Mode::Galaxy)).contains("✖?"));
+    }
+
+    #[test]
+    fn nothing_else_shows_the_ship_looks_just_as_before() {
+        for (label, conf) in [("progressing", 0.99), ("waiting_on_tool", 0.99), ("looping", 0.49), ("erroring", 0.1), ("healthy", 1.0), ("", 1.0)] {
+            let mut app = working(label, conf);
+            let text = render(&mut app, Mode::Galaxy);
+            assert!(!text.contains('↻') && !text.contains("✖?"), "{label} {conf}: {}", outliner_row(&text));
+            assert!(!render(&mut app, Mode::Ship { id: 1, sel: 0 }).lines().any(|l| l.contains("pulse")), "{label} {conf}");
+        }
+        // a stale reading on a ship that has stopped working
+        let mut app = working("looping", 0.9);
+        app.agents[0].status = Status::Idle;
+        assert!(!outliner_row(&render(&mut app, Mode::Galaxy)).contains('↻'));
+        assert!(!render(&mut app, Mode::Ship { id: 1, sel: 0 }).lines().any(|l| l.contains("pulse")));
+    }
+
+    #[test]
+    fn the_ship_card_gets_a_pulse_row_and_keeps_its_menu_in_place() {
+        let mut app = working("looping", 0.72);
+        let text = render(&mut app, Mode::Ship { id: 1, sel: 0 });
+        let row = text.lines().find(|l| l.contains("pulse")).unwrap_or_else(|| panic!("no pulse row\n{text}"));
+        assert!(row.contains("↻ looping") && row.contains("seems to repeat itself"), "{row}");
+        let l = Lay::new(&Fb::new(140, 50), false);
+        let comms = text.lines().position(|r| r.contains("open comms")).unwrap() as i32;
+        let col = text.lines().nth(comms as usize).unwrap().chars().position(|c| c == 'o').unwrap() as i32;
+        assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms), Some(Some(0)));
+        let mut erroring = working("erroring", 0.6);
+        assert!(render(&mut erroring, Mode::Ship { id: 1, sel: 0 }).contains("✖? erroring"));
     }
 }
