@@ -3,6 +3,7 @@ mod anomaly;
 mod client;
 mod daemon;
 mod draw;
+mod redact;
 mod game;
 mod gfx;
 mod graphics;

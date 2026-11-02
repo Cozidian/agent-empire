@@ -8,7 +8,7 @@ use crate::draw;
 use crate::gfx::*;
 use crate::role::Role;
 use crate::structure::{Built, KINDS, Kind};
-use crate::proto::{AgentView, Ask, Mission, RefitState, Report, ScreenView, ShipSpec, War};
+use crate::proto::{AgentView, Ask, Mission, Outcome, RefitState, Report, ScreenView, ShipSpec, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crate::screenshots::{self, Attachment};
@@ -200,6 +200,8 @@ pub struct Agent {
     pub front: bool,
     /// The command a terminal session runs instead of the shell: an editor on a file.
     pub run: Vec<String>,
+    /// How its last finished turn looked, when Advisor (or the keyword scan) could tell.
+    pub outcome: Option<Outcome>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -951,7 +953,12 @@ impl App {
             v.push(Need { badge: format!("○{queued}"), label: format!("{queued} mission{} queued with no one here to take {}: press e to send a ship", if queued == 1 { "" } else { "s" }, if queued == 1 { "it" } else { "them" }), col: AMBER, act: None });
         }
         for a in here.iter().filter(|a| a.status == Status::Done) {
-            v.push(Need { badge: "✔".into(), label: format!("{} finished{}: take a look", a.kind, if a.title.is_empty() { String::new() } else { format!(" ({})", clip(&a.title, 30)) }), col: Status::Done.color(), act: Some(Act::Comms(a.id)) });
+            let title = if a.title.is_empty() { String::new() } else { format!(" ({})", clip(&a.title, 30)) };
+            // a turn that looks failed or half done says so; one that looks fine reads as it always did
+            match a.outcome.as_ref().and_then(Outcome::warn) {
+                Some(w) => v.push(Need { badge: w.glyph.into(), label: format!("{} finished{title}, {}: take a look", a.kind, w.text.to_lowercase()), col: warn_color(w.red), act: Some(Act::Comms(a.id)) }),
+                None => v.push(Need { badge: "✔".into(), label: format!("{} finished{title}: take a look", a.kind), col: Status::Done.color(), act: Some(Act::Comms(a.id)) }),
+            }
         }
         v
     }
@@ -1235,6 +1242,7 @@ impl App {
                 a.turns = v.turns;
                 a.report = v.report.clone();
                 a.ask = v.ask.clone();
+                a.outcome = v.outcome.clone();
                 // what's aboard can change under a refit; say how one ended
                 let was = a.refit.as_ref().map(|r| r.state.clone());
                 (a.role, a.design, a.spec, a.refit) = (Role::parse(&v.role), v.design.clone(), v.spec.clone(), v.refit.clone());
@@ -1299,6 +1307,7 @@ impl App {
                     wpos: (0.0, 0.0),
                     front: true,
                     run: v.run.clone(),
+                    outcome: v.outcome.clone(),
                 });
             }
         }
@@ -1900,7 +1909,17 @@ impl App {
                 detail.push_str(&format!("\n{}\n{}", q.context.join("\n"), q.question));
                 for o in &q.options { detail.push_str(&format!("\n{}: {}", o.key, o.label)); }
             }
-            rows.push(Attention { id: format!("agent:{}", a.id), world: a.cwd.clone(), kind: if waiting { "Input" } else { "Finished" }, title, detail, target: AttentionTarget::Agent(a.id), rank: if waiting { 0 } else { 5 } });
+            // a finished turn that looks failed or half done comes up before the ordinary finished ones
+            let warn = a.outcome.as_ref().and_then(Outcome::warn).filter(|_| !waiting);
+            let (kind, rank) = match (waiting, warn) {
+                (true, _) => ("Input", 0),
+                (_, Some(w)) if w.red => ("Failed?", 2),
+                (_, Some(w)) if w.text == "Partly done" => ("Partial?", 3),
+                (_, Some(_)) => ("Review?", 3),
+                _ => ("Finished", 5),
+            };
+            if let Some(w) = warn { detail.push_str(&format!("\n{}", w.text)); }
+            rows.push(Attention { id: format!("agent:{}", a.id), world: a.cwd.clone(), kind, title, detail, target: AttentionTarget::Agent(a.id), rank });
         }
         for p in &w.planets {
             let here: Vec<_> = self.agents.iter().filter(|a| a.cwd == p.key && a.kind != "shell" && a.dying.is_none()).collect();
@@ -2217,6 +2236,9 @@ impl ShipAct {
 }
 
 const AMBER: V3 = v3(1.0, 0.75, 0.3);
+
+/// The colour of a warning badge: red when it looks failed, else amber. Never green.
+pub fn warn_color(red: bool) -> V3 { if red { RED } else { AMBER } }
 
 /// What a refit is to put aboard, by design name or role.
 pub fn refit_name(r: &RefitState) -> String {
@@ -4266,6 +4288,7 @@ mod ship_card_tests {
             wpos: (0.0, 0.0),
             front: true,
             run: Vec::new(),
+            outcome: None,
         }
     }
 
@@ -5243,5 +5266,116 @@ mod editor_tests {
         let Mode::Planet(v) = &app.mode else { panic!("quitting the editor returns to the world's resources") };
         assert_eq!(v.preview, "# new", "the file is read again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::proto::Outcome;
+
+    fn done(label: &str, conf: f32) -> Agent {
+        let mut a = ship_card_tests::ship(1, false);
+        a.cwd = "/code/review".into();
+        a.status = Status::Done;
+        a.title = "Test the settings form".into();
+        a.outcome = Some(Outcome { label: label.into(), conf });
+        a
+    }
+
+    fn lines(app: &mut App, w: &World, mode: Mode) -> String {
+        let mut fb = Fb::new(120, 36);
+        let l = Lay::new(&fb, false);
+        app.mode = mode;
+        draw::frame(&mut fb, app, w, &l, 1.0, None);
+        fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn home(a: Agent) -> String {
+        let mut app = App::new();
+        app.history.clear();
+        app.workspace.root = "/code".into();
+        app.projects = vec!["/code/review".into()];
+        app.agents.push(a);
+        let w = app.world(1.0, 0.0);
+        lines(&mut app, &w, Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 })
+    }
+
+    #[test]
+    fn home_says_when_a_finished_turn_looks_failed_or_half_done() {
+        assert!(home(done("failed", 0.8)).contains("Looks failed"));
+        assert!(home(done("partial", 0.4)).contains("Partly done"));
+        assert!(home(done("needs_review", 0.9)).contains("Needs review"));
+        for quiet in [done("completed", 0.99), done("failed", 0.39), done("whatever", 1.0)] {
+            let text = home(quiet);
+            assert!(text.contains("Ready to check") && !text.contains("Looks failed"), "{text}");
+        }
+        let mut none = done("failed", 1.0);
+        none.outcome = None;
+        assert!(home(none).contains("Ready to check"));
+    }
+
+    #[test]
+    fn a_working_ship_carries_no_warning_even_if_an_old_outcome_lingers() {
+        let mut a = done("failed", 0.9);
+        a.status = Status::Working;
+        assert!(!home(a).contains("Looks failed"));
+    }
+
+    #[test]
+    fn the_need_label_names_the_doubt_and_never_shows_a_green_tick_for_it() {
+        let mut app = App::new();
+        app.agents.push(done("failed", 0.8));
+        let need = &app.needs("/code/review")[0];
+        assert!(need.label.contains("looks failed") && need.badge == "✖" && need.col == warn_color(true));
+        app.agents[0].outcome = Some(Outcome { label: "partial".into(), conf: 0.6 });
+        let need = &app.needs("/code/review")[0];
+        assert!(need.label.contains("partly done") && need.badge == "◐" && need.col == warn_color(false));
+        // looks fine, unsure, or unread: the line it has always had
+        for o in [Some(Outcome { label: "completed".into(), conf: 0.9 }), Some(Outcome { label: "failed".into(), conf: 0.1 }), None] {
+            app.agents[0].outcome = o;
+            let need = &app.needs("/code/review")[0];
+            assert_eq!((need.badge.as_str(), need.label.as_str()), ("✔", "claude finished (Test the settings form): take a look"));
+        }
+    }
+
+    #[test]
+    fn a_turn_that_looks_failed_ranks_above_the_ordinary_finished_ones() {
+        let mut app = App::new();
+        let mut plain = ship_card_tests::ship(2, false);
+        plain.cwd = "/code/aaa".into();
+        plain.status = Status::Done;
+        app.agents = vec![plain, done("failed", 0.7)];
+        let w = app.world(0.0, 0.0);
+        let rows = app.attention(&w);
+        let kinds: Vec<_> = rows.iter().filter(|r| r.id.starts_with("agent:")).map(|r| (r.id.as_str(), r.kind)).collect();
+        assert_eq!(kinds, [("agent:1", "Failed?"), ("agent:2", "Finished")]);
+        app.agents[1].outcome = Some(Outcome { label: "completed".into(), conf: 0.9 });
+        assert!(app.attention(&w).iter().all(|r| r.kind != "Failed?"));
+    }
+
+    #[test]
+    fn the_mission_log_flags_only_done_missions_that_look_off() {
+        let mut app = App::new();
+        app.history.clear();
+        let m = |id, outcome: Option<Outcome>| Mission { id, cwd: "/code/review".into(), text: format!("job {id}"), state: "done".into(), at: 100, done_at: Some(160), outcome, ..Mission::default() };
+        app.missions = vec![
+            m(1, Some(Outcome { label: "failed".into(), conf: 0.9 })),
+            m(2, Some(Outcome { label: "completed".into(), conf: 0.9 })),
+            m(3, None),
+            m(4, Some(Outcome { label: "partial".into(), conf: 0.2 })),
+        ];
+        let w = app.world(0.0, 0.0);
+        let text = lines(&mut app, &w, Mode::Log { world: "/code/review".into(), sel: 0, open: HashSet::new() });
+        let row = |n: u32| text.lines().find(|l| l.contains(&format!("job {n}"))).unwrap_or_else(|| panic!("job {n} missing in\n{text}")).to_string();
+        assert!(row(1).contains("✖ looks failed"), "{}", row(1));
+        for n in [2, 3, 4] {
+            let r = row(n);
+            assert!(!r.contains('✖') && !r.contains('◐') && !r.to_lowercase().contains("completed"), "{r}");
+        }
+        let open = HashSet::from([1, 4]);
+        let text = lines(&mut app, &w, Mode::Log { world: "/code/review".into(), sel: 0, open });
+        assert_eq!(text.matches("looks failed").count(), 2, "row and details: {text}");
+        assert!(!text.contains("partly done"));
     }
 }
