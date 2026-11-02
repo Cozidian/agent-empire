@@ -16,11 +16,15 @@ pub enum Msg {
     Down(String),
     Screen(u32, ScreenView),
     Spawned { id: u32, kind: String, cwd: String },
+    /// An editor session is open and ready to show.
+    Editing(u32),
     Error(String),
 }
 
 pub enum Cmd {
     Spawn { kind: String, cwd: String },
+    /// Open a terminal session in `cwd` that runs `run` (an editor on a file).
+    Edit { cwd: String, run: Vec<String> },
     Kill(u32),
     Input(u32, String),
     /// A chat message: pasted, then submitted on its own so it isn't taken as a newline.
@@ -173,8 +177,10 @@ impl Client {
                     let _ = mtx.send(message);
                     continue;
                 };
+                let editing = matches!(cmd, Cmd::Edit { .. });
                 let (req, spawn) = match cmd {
-                    Cmd::Spawn { kind, cwd } => (Req::Spawn { kind: kind.clone(), cwd: cwd.clone() }, Some((kind, cwd))),
+                    Cmd::Spawn { kind, cwd } => (Req::Spawn { kind: kind.clone(), cwd: cwd.clone(), run: Vec::new() }, Some((kind, cwd))),
+                    Cmd::Edit { cwd, run } => (Req::Spawn { kind: "shell".into(), cwd, run }, None),
                     Cmd::Kill(id) => (Req::Kill { id }, None),
                     Cmd::Input(id, data) => (Req::Input { id, data }, None),
                     Cmd::Resize(id, cols, rows) => (Req::Resize { id, cols, rows }, None),
@@ -196,6 +202,7 @@ impl Client {
                     continue;
                 }
                 let msg = match reply {
+                    Ok(Resp::Spawned { id }) if editing => Some(Msg::Editing(id)),
                     Ok(Resp::Spawned { id }) => spawn.map(|(kind, cwd)| Msg::Spawned { id, kind, cwd }),
                     Ok(Resp::Err { msg }) => Some(Msg::Error(msg)),
                     Ok(_) => None,

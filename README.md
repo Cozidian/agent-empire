@@ -51,9 +51,15 @@ Enter or double-click a planet to open its workspace:
   session after confirmation and keeps you on the project. Closing a shell stops its running
   commands too; cancelling leaves it running.
 - **Anomalies** (`a`): inspect detected problems and reported discoveries on this planet.
-- **Project resources**: browse `AGENTS.md`, `CLAUDE.md`, skills, hooks, MCP configuration and
-  other agent instruction files. Previews are read-only. Existing build/renovation shortcuts
-  prepare ordinary tasks you can inspect before sending.
+- **Project resources**: browse `AGENTS.md`, `CLAUDE.md`, skills, subagents, commands, hooks, MCP
+  configuration and other agents' instruction files; each kind found stands as a spire on the
+  planet. **Enter** or **e** opens the selected file in your editor (`$VISUAL`, `$EDITOR`, else
+  nvim, vim, vi or nano) as a full terminal; quit the editor to come straight back with the
+  file re-read, or step out with **F12** and pick it up again later (it's listed as an Editor
+  under Terminals). On an empty plot, **Enter** or **n** lays a short first draft (`AGENTS.md`,
+  `CLAUDE.md`, `.claude/skills/new-skill/SKILL.md`, `.mcp.json`…) and opens it; **n** on a kind
+  that holds many adds another. Existing files are never overwritten. **B** instead briefs a
+  ship to build or renovate it, as an ordinary task you can inspect before sending.
 
 The project header shows branch, changed files and ahead/behind counts. Agent rows show their
 current task or question. On wider terminals, selecting an agent with a handoff shows its actual
@@ -141,7 +147,10 @@ when GitHub is unavailable. Unpushed commits still appear as freighters travelli
 The galaxy overview can zoom out to six times the previous visible span. Keep scrolling down
 or pressing **-** to pull back; **z** fits the whole galaxy using the same expanded range.
 
-Planets retain their seeded procedural appearance. Useful progress adds rings, city lights and
+Planets retain their seeded procedural appearance, with curved daylight shading, soft atmosphere,
+ocean glints and drifting cloud banks. Fitted two-colour octant cells give surfaces and glows smoother
+gradients; small worlds receive a little extra light to stay readable on the map.
+Useful progress adds rings, city lights and
 other development without a separate management workflow. Music and sounds are synthesized
 locally; music starts when the galaxy opens and stops when you leave. The score is composed
 on the fly and never repeats: slow, hopeful chord changes in a drifting key, with sections
@@ -202,3 +211,16 @@ EMPIRE_SOCK=/tmp/empire-dev.sock XDG_STATE_HOME=/tmp/empire-dev ./target/release
 ```
 
 Never stop or alter the user's real daemon or state during tests.
+
+### Graphics comparison
+
+`cargo run --release -- graphics` opens an offline, animated comparison with fixed example
+worlds at portrait and map sizes. **Space** switches between the polished renderer and the classic look;
+**p** freezes rotation for comparison, and **q / Esc** leaves. It never connects to the daemon,
+starts agents or audio, or reads/writes workspace state.
+
+The polished renderer is the default in the galaxy and planetary portraits. The comparison keeps
+the same procedural world identities and terminal resolution for both looks.
+
+For reproducible 140×48 terminal captures, use `empire graphics --snapshot` and
+`empire graphics --snapshot --classic` (ANSI output, fixed animation time).

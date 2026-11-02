@@ -1,9 +1,11 @@
 //! Structures: what a world has built for the agents that work on it. Every AI resource in a
 //! folder (AGENTS.md, CLAUDE.md, skills, subagents, commands, MCP servers, hooks, other
 //! species' rules) is a building on its planet. The survey finds them; a construction order
-//! is a mission to build one, or to renovate one that's already standing.
+//! is a mission to build one, or to renovate one that's already standing; or you found one
+//! yourself from a first draft and write it in your own editor.
 
 use crate::gfx::{V3, v3};
+use std::io::{self, Write};
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -113,6 +115,72 @@ impl Kind {
             (k, true) => format!("Renovate this repo's {} ({here}). Read them against the code as it is now: fix what's out of date or wrong, fill gaps agents keep running into, cut what's generic or redundant. Keep them short. Commit the changes.", k.what()),
         }
     }
+}
+
+impl Kind {
+    /// Where a hand-written one goes, and its first draft: what to fill in, nothing more.
+    /// Kinds that hold many (skills, subagents, commands) get a fresh name each time.
+    fn draft(self, root: &Path) -> (String, String) {
+        let fresh = |dir: &str, stem: &str, file: &str| {
+            (1..).map(|n| if n == 1 { stem.to_string() } else { format!("{stem}-{n}") })
+                .find(|name| !root.join(dir).join(format!("{name}{file}")).exists() && !root.join(dir).join(name).exists())
+                .map(|name| (format!("{dir}/{name}{file}"), name))
+                .unwrap()
+        };
+        let agents = root.join("AGENTS.md").exists();
+        match self {
+            Kind::Charter => ("AGENTS.md".into(), "# AGENTS.md\n\nWhat this project is and how it's laid out, for coding agents.\n\n## Build, run, test\n\n```\n\n```\n\n## Conventions\n\n- \n\n## Don'ts\n\n- \n".into()),
+            Kind::Archive if agents => ("CLAUDE.md".into(), "@AGENTS.md\n\n<!-- Claude-specific notes below; everything else lives in AGENTS.md. -->\n".into()),
+            Kind::Archive => ("CLAUDE.md".into(), "# CLAUDE.md\n\n## Build, run, test\n\n```\n\n```\n\n## Conventions\n\n- \n".into()),
+            Kind::Academy => {
+                let (path, name) = fresh(".claude/skills", "new-skill", "");
+                (format!("{path}/SKILL.md"), format!("---\nname: {name}\ndescription: When to use this skill, in one sentence.\n---\n\n# {name}\n\n1. \n"))
+            }
+            Kind::Barracks => {
+                let (path, name) = fresh(".claude/agents", "new-agent", ".md");
+                (path, format!("---\nname: {name}\ndescription: When to hand work to this agent.\ntools: Read, Grep, Glob\n---\n\nWhat this agent does, and how.\n"))
+            }
+            Kind::Command => (fresh(".claude/commands", "new-command", ".md").0, "---\ndescription: What this command does.\n---\n\n$ARGUMENTS\n".into()),
+            Kind::Relay => (".mcp.json".into(), "{\n  \"mcpServers\": {}\n}\n".into()),
+            Kind::Watchtower => (".claude/settings.json".into(), "{\n  \"hooks\": {}\n}\n".into()),
+            Kind::Embassy if agents => ("GEMINI.md".into(), "@AGENTS.md\n".into()),
+            Kind::Embassy => ("GEMINI.md".into(), "# GEMINI.md\n\n".into()),
+        }
+    }
+
+    /// Lay a new one on the world at `root` for you to write, returning the file to open.
+    /// A file already standing there is opened as it is, never overwritten.
+    pub fn found(self, root: &Path) -> io::Result<String> {
+        let (path, text) = self.draft(root);
+        let file = root.join(&path);
+        if !file.exists() {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&file)?.write_all(text.as_bytes())?;
+        }
+        Ok(path)
+    }
+}
+
+/// The editor to write in: `$VISUAL`, then `$EDITOR`, then the first of nvim, vim, vi or nano
+/// that's installed. `None` when there's nothing to edit with.
+pub fn editor(env: impl Fn(&str) -> Option<String>, installed: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+    for var in ["VISUAL", "EDITOR"] {
+        let words: Vec<String> = env(var).unwrap_or_default().split_whitespace().map(String::from).collect();
+        if words.first().is_some_and(|p| installed(p)) {
+            return Some(words);
+        }
+    }
+    ["nvim", "vim", "vi", "nano"].into_iter().find(|p| installed(p)).map(|p| vec![p.to_string()])
+}
+
+/// A program by name on `$PATH`, or by path.
+pub fn installed(prog: &str) -> bool {
+    if prog.contains('/') {
+        return Path::new(prog).is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(prog).is_file()))
 }
 
 /// Every structure standing on the world at `path`.
@@ -246,6 +314,40 @@ mod tests {
         mk(".claude/settings.json", r#"{"hooks":{}}"#);
         assert_eq!(survey(dir.to_str().unwrap()).iter().find(|b| b.kind == Kind::Watchtower), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn founding_lays_a_draft_once_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("empire-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(Kind::Charter.found(&dir).unwrap(), "AGENTS.md");
+        assert!(std::fs::read_to_string(dir.join("AGENTS.md")).unwrap().contains("## Build, run, test"));
+        std::fs::write(dir.join("AGENTS.md"), "mine").unwrap();
+        assert_eq!(Kind::Charter.found(&dir).unwrap(), "AGENTS.md");
+        assert_eq!(std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(), "mine", "an existing file is opened, not replaced");
+        // with an AGENTS.md standing, CLAUDE.md just points to it
+        Kind::Archive.found(&dir).unwrap();
+        assert!(std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap().starts_with("@AGENTS.md"));
+        // kinds that hold many get a fresh name each time, and the survey sees them
+        assert_eq!(Kind::Academy.found(&dir).unwrap(), ".claude/skills/new-skill/SKILL.md");
+        assert_eq!(Kind::Academy.found(&dir).unwrap(), ".claude/skills/new-skill-2/SKILL.md");
+        assert_eq!(Kind::Command.found(&dir).unwrap(), ".claude/commands/new-command.md");
+        let got = survey(dir.to_str().unwrap());
+        assert_eq!(got.iter().find(|b| b.kind == Kind::Academy).map(|b| b.count), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_editor_is_yours_first_then_whatever_is_installed() {
+        let env = |vars: &'static [(&'static str, &'static str)]| move |k: &str| vars.iter().find(|v| v.0 == k).map(|v| v.1.to_string());
+        let all = |_: &str| true;
+        assert_eq!(editor(env(&[("VISUAL", "hx"), ("EDITOR", "vim")]), all), Some(vec!["hx".into()]));
+        assert_eq!(editor(env(&[("EDITOR", "code --wait")]), all), Some(vec!["code".into(), "--wait".into()]));
+        // a configured editor that isn't installed falls through to what is
+        assert_eq!(editor(env(&[("EDITOR", "gone")]), |p| p == "vi"), Some(vec!["vi".into()]));
+        assert_eq!(editor(env(&[]), |p| p == "nvim" || p == "nano"), Some(vec!["nvim".into()]));
+        assert_eq!(editor(env(&[]), |_| false), None);
     }
 
     #[test]

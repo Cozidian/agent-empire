@@ -156,6 +156,12 @@ impl Survey {
         }
     }
 
+    /// Look at a world's structures again now (you've just written one), not on the next round.
+    pub fn rescan(&self, path: &str) {
+        let built = crate::structure::survey(path);
+        self.data.lock().unwrap().worlds.entry(path.to_string()).or_default().structures = built;
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.data.lock().unwrap().clone()
     }

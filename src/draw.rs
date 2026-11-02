@@ -21,6 +21,41 @@ const TEXT: V3 = v3(0.85, 0.88, 0.94);
 const TERM_FG: V3 = v3(0.847, 0.871, 0.914);
 const TERM_BG: V3 = v3(0.043, 0.059, 0.102);
 
+/// A repeatable visual bench: no workspace, agents, files or daemon.
+pub fn graphics_preview(fb: &mut Fb, polished: bool, t: f32) {
+    fb.clear_text();
+    for y in 0..fb.h { for x in 0..fb.w {
+        let st = rnd2(x as i32, y as i32, 11);
+        let mut c = v3(0.006, 0.008, 0.02);
+        if st > 0.9965 { c += hsv(rnd2(x as i32, y as i32, 5) * 0.3 + 0.5, 0.3, 0.15 + (st - 0.9965) / 0.0035 * 0.5); }
+        fb.px[y * fb.w + x] = c;
+    } }
+    let (w, h) = (fb.w as f32, fb.h as f32);
+    let radius = (w / 10.0).min(h * 0.19);
+    let cy = h * 0.43;
+    for (i, (kind, seed, name)) in [(0, 0.218, "PELAGIC / TERRAN"), (4, 0.731, "VESPER / GAS GIANT"), (3, 0.467, "BOREAL / ICE")].into_iter().enumerate() {
+        let x = w * (i as f32 + 0.5) / 3.0;
+        let p = Planet { key: String::new(), name: name.into(), agents: vec![], terrain: kind, seed, wpos: (x, cy), r: radius,
+            host: None, moons: vec![], level: 2, dormant: false, fog: 0.0, last_seen: 0 };
+        sphere_style(fb, x, cy, radius, &p, (-1.0, -0.5), t, polished);
+        let row = ((cy + radius) / 4.0) as i32 + 2;
+        let col = x as i32 / 2 - name.len() as i32 / 2;
+        if fb.cols >= 90 { fb.text(col, row, name, DIM); }
+        // the same materials at map scale, where silhouette matters more than detail
+        sphere_style(fb, x - 10.0, h * 0.82, 4.0, &p, (-1.0, -0.5), t, polished);
+        sphere_style(fb, x + 10.0, h * 0.82, 8.0, &p, (-1.0, -0.5), t, polished);
+    }
+    if fb.cols >= 90 {
+        star(fb, (w / 3.0, h * 0.82), 3.2, 31, v3(1.0, 0.72, 0.42), t);
+        hull(fb, (w * 2.0 / 3.0, h * 0.82), 1.5, 59, Role::None, v3(0.4, 0.85, 0.95));
+    }
+    bloom(fb, 0.5, 0.7);
+    let label = if polished { "GRAPHICS LAB / POLISHED" } else { "GRAPHICS LAB / CLASSIC" };
+    fb.text(3, 2, label, TEXT);
+    if fb.cols >= 90 { fb.text(3, 4, "Same worlds. Same light. A quieter, deeper surface.", DIM); }
+    fb.text(3, fb.rows as i32 - 2, if fb.cols >= 70 { "Space compare  /  p pause  /  q leave     ·     Offline preview" } else { "Space compare · p pause · q leave" }, DIM);
+}
+
 pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Option<&Sound>) {
     fb.clear_text();
     if let Mode::Workspace { key, sel } = &app.mode { workspace(fb, app, w, key, *sel, l, t); return; }
@@ -221,11 +256,18 @@ fn terrain(kind: u8, lon: f32, lat: f32, seed: f32) -> (V3, V3, V3) {
 
 /// A lit, rotating planet with an atmosphere rim, lit from `light` (toward the star).
 fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), t: f32) {
+    sphere_style(fb, cx, cy, r, p, light, t, true);
+}
+
+fn sphere_style(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), t: f32, polished: bool) {
     let l = {
         let v = v3(light.0, light.1, 0.55);
         v / (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
     };
-    let e = r + 4.0;
+    let air = (r * 0.055).clamp(0.8, 2.8);
+    // a little fill keeps tiny worlds legible without flattening the portraits
+    let fill = 1.0 - smoothstep(5.0, 14.0, r);
+    let e = r + if polished { air * 5.0 } else { 4.0 };
     let tilt = (rnd(p.seed.to_bits() ^ 83) - 0.5) * 1.4;
     let (st, ct) = tilt.sin_cos();
     let (_, _, atm) = terrain(p.terrain, 0.0, 0.0, p.seed);
@@ -237,7 +279,9 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
             if d2 > 1.0 {
                 let d = d2.sqrt();
                 let lit = ((dx * l.x + dy * l.y) / d).max(0.0) * 0.7 + 0.3;
-                fb.px[i] += atm * (-(d - 1.0) * r * 0.9).exp() * 0.4 * lit;
+                fb.px[i] += if polished {
+                    atm * (-((d - 1.0) * r / air).powf(1.25)).exp() * 0.24 * lit * (1.0 - 0.7 * p.fog)
+                } else { atm * (-(d - 1.0) * r * 0.9).exp() * 0.4 * lit };
                 continue;
             }
             let nz = (1.0 - d2).sqrt();
@@ -247,6 +291,25 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
             let ndl = dx * l.x + dy * l.y + nz * l.z;
             let day = smoothstep(-0.12, 0.5, ndl);
             let mut c = alb * (0.035 + 1.05 * day) + emit * (1.0 - 0.6 * day) + atm * (1.0 - nz).powi(3) * 0.9 * day;
+            if polished {
+                let diffuse = mixf(ndl.max(0.0), day, fill * 0.22);
+                let rim = (1.0 - nz).powi(3);
+                c = alb * (0.025 + fill * 0.055 + 1.12 * diffuse) + emit * (1.0 - 0.6 * day);
+                c += atm * (0.025 + rim * 0.42) * smoothstep(-0.15, 0.65, ndl);
+                c += v3(0.32, 0.12, 0.055) * (-((ndl - 0.025) * 12.0).powi(2)).exp() * rim;
+                if p.terrain <= 1 {
+                    // the half vector gives water a small, quiet glint
+                    let h = v3(l.x, l.y, l.z + 1.0);
+                    let nh = (dx * h.x + dy * h.y + nz * h.z) / (h.x * h.x + h.y * h.y + h.z * h.z).sqrt();
+                    let sea = smoothstep(0.0, 0.18, alb.z - alb.y);
+                    c += v3(0.7, 0.82, 0.9) * nh.max(0.0).powi(48) * sea * diffuse * 0.5;
+                    // broad cloud banks drift independently of the surface
+                    let u = lon + t * 0.006;
+                    let cloud = fbm(u.cos() * 4.0 + 23.0, u.sin() * 4.0 + latitude * 5.0, p.seed.to_bits() ^ 211);
+                    let cloud = smoothstep(0.51, 0.72, cloud) * 0.72;
+                    c = mix(c * (1.0 - cloud * 0.18), s3(0.06 + fill * 0.05 + diffuse * 0.94), cloud);
+                }
+            }
             // a city world glitters on its night side
             if p.level >= 2 && day < 0.35 {
                 let cell = ((lon * 16.0).floor() as i32, (dy * 12.0).floor() as i32);
@@ -258,7 +321,8 @@ fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), 
             }
             // a neglected world goes grey and dim under the fog
             let grey = s3((c.x + c.y + c.z) / 3.0);
-            fb.px[i] = mix(c, mix(grey, v3(0.35, 0.3, 0.5) * grey.x * 2.0, 0.5), p.fog) * (1.0 - 0.7 * p.fog);
+            let c = mix(c, mix(grey, v3(0.35, 0.3, 0.5) * grey.x * 2.0, 0.5), p.fog) * (1.0 - 0.7 * p.fog);
+            fb.px[i] = if polished { mix(fb.px[i], c, smoothstep(-0.5, 0.6, (1.0 - d2.sqrt()) * r)) } else { c };
         }
     }
     // and the nebula closes in around it
@@ -1866,6 +1930,9 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
             seg(fb, 4, y, title, width - 7 - if size > 0 { size + 2 } else { 0 }, if i == sel { accent } else { TEXT }, Some(bg));
             seg(fb, width - 3 - size, y, label, size, color, Some(bg));
             if height == 2 { seg(fb, 6, y + 1, note, width - 9, DIM, Some(bg)); }
+        } else if let WorkAct::Edit(kind, _) = action {
+            seg(fb, 4, y, &kind.glyph().to_string(), 1, kind.color(), Some(bg));
+            seg(fb, 6, y, title, width - 8, if i == sel { accent } else { TEXT }, Some(bg));
         } else {
             seg(fb, 4, y, title, width - 6, if i == sel { accent } else { TEXT }, Some(bg));
             if height == 2 { seg(fb, 4, y + 1, note, width - 6, DIM, Some(bg)); }
@@ -1875,6 +1942,7 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
     let terminal = rows.get(sel).is_some_and(|r| matches!(r.2, WorkAct::Agent(id) if app.agent(id).is_some_and(|a| a.kind == "shell")));
     seg(fb, 2, l.rows - 2, if home { "↑↓ choose · Enter open · e launch · n folder · r root · R refresh · Esc galaxy" }
         else if terminal { "Enter reopen · s new terminal · x close · ↑↓ choose · H home · Esc galaxy" }
+        else if rows.get(sel).is_some_and(|r| matches!(r.2, WorkAct::Edit(..))) { "Enter edit in your editor · ↑↓ choose · t task · s terminal · H home · Esc galaxy" }
         else { "↑↓ choose · Enter open · t task · e agent · s terminal · a anomalies · x dismiss · H home" }, l.cols - 4, TEXT, Some(BAR));
     let context = rows.get(sel).map(|(_, note, a)| if home { if let WorkAct::Project(p) = a { tilde(p) } else { note.clone() } }
         else if terminal { "F12 / Ctrl-] returns here and keeps the terminal running.".into() } else { note.clone() });
@@ -1948,9 +2016,9 @@ fn planet_view(fb: &mut Fb, app: &App, w: &World, v: &PlanetView, l: &Lay, t: f3
     for (i, line) in lines.iter().skip(scroll).take(g.preview_rows as usize).enumerate() {
         seg(fb, x, g.preview_y + i as i32, line, g.width, TEXT, None);
     }
-    seg(fb, x, l.rows - 3, &format!("{} · {} files · lines {}–{} / {}", if v.building().is_some() { "B renovate" } else { "B construct" }, v.files().len(), scroll + 1, (scroll + g.preview_rows as usize).min(lines.len()), lines.len()), g.width, DIM, None);
+    seg(fb, x, l.rows - 3, &format!("{} · {} files · lines {}–{} / {}", if v.building().is_some() { "e edit · B renovate" } else { "Enter write · B construct" }, v.files().len(), scroll + 1, (scroll + g.preview_rows as usize).min(lines.len()), lines.len()), g.width, DIM, None);
     fb.panel(0, l.rows - 2, l.cols, 2, BAR);
-    let keys = if l.cols >= 60 { "↑↓ choose · Tab pane · 1–8 building · B build/renovate" } else { "↑↓ choose · Tab pane · B build · Esc back" };
+    let keys = if l.cols >= 80 { "↑↓ choose · Tab pane · e edit · n new · B brief a ship · 1–8 building · Esc back" } else if l.cols >= 50 { "↑↓ choose · e edit · n new · B brief · Esc back" } else { "e edit · n new · Esc back" };
     seg(fb, 2, l.rows - 2, keys, l.cols - 4, TEXT, Some(BAR));
     seg(fb, 2, l.rows - 1, "PgUp/Dn read · R refresh · c comms", l.cols - 4, DIM, Some(BAR));
     if let Some((msg, at)) = &app.toast && t - at < 3.2 {
@@ -2345,6 +2413,9 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("s / e / t", "new terminal / new agent / quick task"),
         ("a / x", "anomalies / dismiss selected session"),
         ("H / Esc", "home / galaxy"),
+        ("PROJECT RESOURCES", ""),
+        ("Enter / e", "write the file in your editor ($EDITOR, else nvim)"),
+        ("n / B", "lay a new one to write / brief a ship to build it"),
         ("TERMINAL", ""),
         ("Ctrl-] / F12", "return; all other keys go to the terminal"),
         ("QUICK TASK", ""),
@@ -2372,6 +2443,7 @@ fn comms(fb: &mut Fb, app: &App, l: &Lay, t: f32, id: u32) {
     let a = app.agents.iter().find(|a| a.id == id);
     let accent = a.map_or(DIM, |a| a.status.color());
     let title = match a {
+        Some(a) if !a.run.is_empty() => format!("✎ WRITING {} @ {} · quit the editor to return", a.run.last().map_or("", |f| f.as_str()), base_name(&a.cwd)),
         Some(a) => format!("◆ COMMS ▸ {} @ {} · {}", a.kind, base_name(&a.cwd), a.status.label()),
         None => "◆ COMMS".into(),
     };
