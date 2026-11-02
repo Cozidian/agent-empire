@@ -1024,36 +1024,37 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
 fn top_bar(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     fb.panel(0, 0, l.cols, 1, BAR);
-    let title = if app.sector_map() { " ◆ AGENT EMPIRE · SECTORS " } else { " ◆ AGENT EMPIRE " };
+    let title = if l.cols < 32 { " ◆ " } else if l.cols < 60 { " ◆ EMPIRE " }
+        else if app.sector_map() { " ◆ AGENT EMPIRE · SECTORS " } else { " ◆ AGENT EMPIRE " };
     for (k, ch) in title.chars().enumerate() {
         fb.put_bg(k as i32, 0, ch, hsv(0.52 + k as f32 * 0.015 - t * 0.04, 0.45, 1.0), Some(BAR));
     }
     let live: Vec<&Agent> = app.agents.iter().filter(|a| a.dying.is_none()).collect();
     let moons = w.planets.iter().filter(|p| p.host.is_some()).count();
+    let worlds = w.planets.len() - moons;
     let moons = if moons > 0 { format!(" · {moons} moon{}", if moons == 1 { "" } else { "s" }) } else { String::new() };
-    let stats = format!("  {} systems · {} worlds{moons} · {} agents  ", w.systems.len(), w.planets.len() - w.planets.iter().filter(|p| p.host.is_some()).count(), live.len());
-    let mut x = seg(fb, title.chars().count() as i32, 0, &stats, l.cols, DIM, Some(BAR));
-    for (s, c) in tally(live.iter().copied(), t) {
-        x = seg(fb, x, 0, &format!("{s}  "), l.cols - x, c, Some(BAR));
-    }
-    let right = format!("{} daemon  {} ", if app.online { "●" } else { "○" }, clock());
+    let stats = [format!(" {} systems · {worlds} worlds{moons} · {} agents  ", w.systems.len(), live.len()),
+        format!(" {worlds} worlds · {} agents  ", live.len()), format!(" {} agents  ", live.len())];
+    let mark = if app.online { "●" } else { "○" };
+    let right = if l.cols >= 100 { format!("{mark} daemon  {} ", clock()) }
+        else { format!("{mark} {} ", if app.online { "online" } else { "offline" }) };
     let rc = l.cols - right.chars().count() as i32;
-    // usage left, Stellaris resource-bar style; drop the bars if space is tight
-    for bars in [true, false] {
-        let parts = resources(&app.survey.limits, bars);
-        let w: i32 = parts.iter().map(|(s, _)| s.chars().count() as i32).sum();
-        if rc - w - 2 > x {
-            let mut rx = rc - w - 2;
-            for (s, c) in parts {
-                rx = seg(fb, rx, 0, &s, l.cols, c, Some(BAR));
-            }
-            break;
-        }
+    let start = title.chars().count() as i32;
+    // measure whole groups before drawing; leave connection status its own space
+    for (summary, all, detail) in [(0, true, 2), (0, true, 1), (1, true, 1), (2, true, 0), (2, false, 0), (2, false, -1)] {
+        let counts = tally(live.iter().copied().filter(|a| all || a.status.needs_you()), t);
+        let parts = if detail < 0 { vec![] } else { resources(&app.survey.limits, detail) };
+        let sw = stats[summary].chars().count() as i32 + counts.iter().map(|(s, _)| s.chars().count() as i32 + 2).sum::<i32>();
+        let rw: i32 = parts.iter().map(|(s, _)| s.chars().count() as i32).sum();
+        if start + sw + rw + 2 > rc { continue; }
+        let mut x = seg(fb, start, 0, &stats[summary], sw, DIM, Some(BAR));
+        for (s, c) in counts { x = seg(fb, x, 0, &format!("{s}  "), rc - x, c, Some(BAR)); }
+        let mut x = rc - rw - 2;
+        for (s, c) in parts { x = seg(fb, x, 0, &s, rc - x, c, Some(BAR)); }
+        break;
     }
-    if rc > x {
-        let c = if app.online { v3(0.35, 1.0, 0.55) } else { v3(1.0, 0.35, 0.3) };
-        seg(fb, rc, 0, &right, l.cols, c, Some(BAR));
-    }
+    let c = if app.online { v3(0.35, 1.0, 0.55) } else { v3(1.0, 0.35, 0.3) };
+    seg(fb, rc, 0, &right, l.cols - rc, c, Some(BAR));
 }
 
 /// Colour for how much of an allowance is used up.
@@ -1081,31 +1082,35 @@ fn until(secs: i64) -> String {
 }
 
 /// `CLAUDE 5h ▰▰▰▱▱ 62% · wk 31%  ↻1h12   CODEX wk 28%`
-fn resources(limits: &[survey::Limit], bars: bool) -> Vec<(String, V3)> {
+fn resources(limits: &[survey::Limit], detail: i32) -> Vec<(String, V3)> {
     let mut out = Vec::new();
     let mut who: Vec<&str> = limits.iter().map(|l| l.who).collect();
     who.dedup();
     for name in who {
-        let ls: Vec<&survey::Limit> = limits.iter().filter(|l| l.who == name).collect();
+        let mut ls: Vec<&survey::Limit> = limits.iter().filter(|l| l.who == name).collect();
+        if detail == 0 {
+            // keep the tightest window and its label when allowances must be compact
+            if let Some(l) = ls.iter().copied().max_by(|a, b| a.used.total_cmp(&b.used)) { ls = vec![l]; }
+        }
         out.push((format!("{} ", name.to_uppercase()), kind_color(name)));
         for (i, lim) in ls.iter().enumerate() {
             if i > 0 {
                 out.push((" · ".into(), DIM * 0.7));
             }
             out.push((format!("{} ", lim.window), DIM));
-            if bars {
+            if detail == 2 {
                 out.push((format!("{} ", meter(lim.used / 100.0, 5)), strain(lim.used)));
             }
             out.push((format!("{:.0}%", lim.used), strain(lim.used)));
         }
         // when the tightest window will refill, once it starts to matter
         if let Some(l) = ls.iter().max_by(|a, b| a.used.total_cmp(&b.used))
-            && l.used >= 50.0
+            && detail > 0 && l.used >= 50.0
             && let Some(r) = l.resets
         {
             out.push((format!(" ↻{}", until(r - survey::now())), DIM));
         }
-        out.push(("   ".into(), DIM));
+        out.push((if detail == 0 { "  " } else { "   " }.into(), DIM));
     }
     out
 }
@@ -1775,6 +1780,37 @@ impl PlanetLayout {
     }
 }
 
+/// Visible workspace rows; headers and notes share the same geometry for drawing and clicks.
+pub struct WorkspaceLayout {
+    pub width: i32,
+    pub items: Vec<(usize, i32, i32)>,
+    headings: Vec<(i32, String)>,
+}
+
+impl WorkspaceLayout {
+    pub fn new(app: &App, rows: &[(String, String, WorkAct)], key: &str, sel: usize, l: &Lay) -> Self {
+        let mut layout = Self { width: if l.cols >= 105 { l.cols * 2 / 3 } else { l.cols }, items: vec![], headings: vec![] };
+        let mut off = 0;
+        loop {
+            layout.items.clear(); layout.headings.clear();
+            let mut y = 7;
+            let mut group = None;
+            for (i, (_, _, action)) in rows.iter().enumerate().skip(off) {
+                let next = Some(app.work_group(key, action));
+                let h = if matches!(action, WorkAct::Agent(_)) || matches!(action, WorkAct::Project(p) if app.home_need(p).is_some()) { 2 } else { 1 };
+                let heading = next != group;
+                let gap = if heading { if group.is_some() { 2 } else { 1 } } else { 0 };
+                if y + gap + h > l.rows - 3 { break; }
+                if heading { y += gap; layout.headings.push((y - 1, next.clone().unwrap())); group = next; }
+                layout.items.push((i, y, h)); y += h;
+            }
+            if layout.items.iter().any(|(i, _, _)| *i == sel) || off >= sel { break; }
+            off += 1;
+        }
+        layout
+    }
+}
+
 /// A planet's sessions and everyday actions, with room for its landscape.
 fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, t: f32) {
     fb.px.fill(PANEL);
@@ -1787,13 +1823,19 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
         let ships = app.agents.iter().filter(|a| a.kind != "shell" && a.dying.is_none()).count();
         let waiting = app.agents.iter().filter(|a| a.kind != "shell" && a.status.needs_you() && a.dying.is_none()).count();
         let terminals = app.agents.iter().filter(|a| a.kind == "shell" && a.dying.is_none()).count();
-        format!("{} projects · {ships} ships · {waiting} need you · {terminals} terminals", w.planets.iter().filter(|p| p.key != key).count())
+        let mut parts = vec![format!("{} projects", w.planets.iter().filter(|p| p.key != key).count())];
+        if ships > 0 { parts.push(format!("{ships} ships")); }
+        if waiting > 0 { parts.push(format!("{waiting} need you")); }
+        if terminals > 0 { parts.push(format!("{terminals} terminals")); }
+        parts.join(" · ")
     } else if let Some(s) = app.survey.worlds.get(key).filter(|s| s.git) {
         format!("{} · {} changed · ↑{} unpushed · ↓{} behind", s.branch, s.dirty, s.ahead, s.behind)
     } else { tilde(key) };
     seg(fb, 2, 4, &summary, l.cols - 4, accent, Some(BAR));
-    let width = if l.cols >= 105 { l.cols * 2 / 3 } else { l.cols };
     let rows = app.work_rows(w, key);
+    let sel = sel.min(rows.len().saturating_sub(1));
+    let layout = WorkspaceLayout::new(app, &rows, key, sel, l);
+    let width = layout.width;
     let output = rows.get(sel).and_then(|(_, _, a)| if let WorkAct::Agent(id) = a { app.outputs.get(id) } else { None });
     if width < l.cols && output.is_some() {
         seg(fb, width + 2, 7, "LATEST TERMINAL OUTPUT", l.cols - width - 4, accent, None);
@@ -1808,18 +1850,38 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
         spires(fb, app, p, (x, y), radius, t);
         seg(fb, width + 2, l.rows - 6, if home { "Your fleet starts here." } else { "A world of your own." }, l.cols - width - 4, DIM, None);
     }
-    let page = ((l.rows - 10) / 2).max(1) as usize;
-    let off = sel.saturating_sub(page - 1);
-    for (i, (title, note, _)) in rows.iter().enumerate().skip(off).take(page) {
-        let y = 7 + (i - off) as i32 * 2;
+    for (y, heading) in &layout.headings {
+        seg(fb, 4, *y, heading, width - 6, if heading == "NEEDS YOU" { v3(1.0, 0.78, 0.45) } else { accent * 0.8 }, None);
+    }
+    for &(i, y, height) in &layout.items {
+        let (title, note, action) = &rows[i];
         let bg = if i == sel { SELBG } else { PANEL };
-        fb.panel(1, y, width - 2, 2, bg);
-        seg(fb, 2, y, &format!("{} {title}", if i == sel { "›" } else { " " }), width - 4, if i == sel { accent } else { TEXT }, Some(bg));
-        seg(fb, 4, y + 1, note, width - 6, DIM, Some(bg));
+        fb.panel(1, y, width - 2, height, bg);
+        seg(fb, 2, y, if i == sel { "›" } else { " " }, 1, accent, Some(bg));
+        if home {
+            let need = if let WorkAct::Project(p) = action { app.home_need(p) } else { None };
+            let label = need.map_or_else(|| if matches!(action, WorkAct::Project(_)) { note.as_str() } else { "" }, |a| if a.status == Status::Blocked { "Needs input" } else { "Ready to check" });
+            let color = need.map_or(DIM, |a| a.status.color());
+            let size = (label.chars().count() as i32).min((width - 10) / 2).max(0);
+            seg(fb, 4, y, title, width - 7 - if size > 0 { size + 2 } else { 0 }, if i == sel { accent } else { TEXT }, Some(bg));
+            seg(fb, width - 3 - size, y, label, size, color, Some(bg));
+            if height == 2 { seg(fb, 6, y + 1, note, width - 9, DIM, Some(bg)); }
+        } else {
+            seg(fb, 4, y, title, width - 6, if i == sel { accent } else { TEXT }, Some(bg));
+            if height == 2 { seg(fb, 4, y + 1, note, width - 6, DIM, Some(bg)); }
+        }
     }
     fb.panel(0, l.rows - 2, l.cols, 2, BAR);
-    seg(fb, 2, l.rows - 2, if home { "↑↓ choose · Enter open · e launch · n folder · r root · R refresh · Esc galaxy" } else { "↑↓ choose · Enter open · t task · e agent · s terminal · a anomalies · x dismiss · H home" }, l.cols - 4, TEXT, Some(BAR));
-    seg(fb, 2, l.rows - 1, "Agents and terminals keep running when you leave.", l.cols - 4, DIM, Some(BAR));
+    let terminal = rows.get(sel).is_some_and(|r| matches!(r.2, WorkAct::Agent(id) if app.agent(id).is_some_and(|a| a.kind == "shell")));
+    seg(fb, 2, l.rows - 2, if home { "↑↓ choose · Enter open · e launch · n folder · r root · R refresh · Esc galaxy" }
+        else if terminal { "Enter reopen · s new terminal · x close · ↑↓ choose · H home · Esc galaxy" }
+        else { "↑↓ choose · Enter open · t task · e agent · s terminal · a anomalies · x dismiss · H home" }, l.cols - 4, TEXT, Some(BAR));
+    let context = rows.get(sel).map(|(_, note, a)| if home { if let WorkAct::Project(p) = a { tilde(p) } else { note.clone() } }
+        else if terminal { "F12 / Ctrl-] returns here and keeps the terminal running.".into() } else { note.clone() });
+    seg(fb, 2, l.rows - 1, context.as_deref().unwrap_or("Agents and terminals keep running when you leave."), l.cols - 4, DIM, Some(BAR));
+    if let (Some((first, _, _)), Some((last, _, _))) = (layout.items.first(), layout.items.last()) && (*first > 0 || *last + 1 < rows.len()) {
+        seg(fb, 4, l.rows - 3, &format!("{}–{} of {} · scroll for more", first + 1, last + 1, rows.len()), width - 6, DIM, None);
+    }
     if let Some((msg, at)) = &app.toast && t - at < 3.2 { seg(fb, 2, 5, msg, l.cols - 4, accent, Some(BAR)); }
 }
 
@@ -2258,11 +2320,12 @@ pub fn refit_label(r: &crate::proto::RefitState) -> (String, V3) {
 fn confirm(fb: &mut Fb, app: &App, id: u32, l: &Lay) {
     let (x, y, w, h) = centered(l, 60, 8);
     let accent = v3(1.0, 0.4, 0.3);
-    frame_box(fb, x, y, w, h, "✖ DECOMMISSION", accent);
+    let shell = app.agent(id).is_some_and(|a| a.kind == "shell");
+    frame_box(fb, x, y, w, h, if shell { "CLOSE TERMINAL" } else { "✖ DECOMMISSION" }, accent);
     let who = app.agent(id).map_or("this agent".into(), |a| format!("{} on {}", a.kind, base_name(&a.cwd)));
-    seg(fb, x + 3, y + 2, &format!("Decommission {who}?"), w - 6, TEXT, Some(BOX));
-    seg(fb, x + 3, y + 3, "Its process is terminated; unsaved work in it is lost.", w - 6, DIM, Some(BOX));
-    seg(fb, x + 3, y + h - 2, "y decommission · any other key cancels", w - 6, accent, Some(BOX));
+    seg(fb, x + 3, y + 2, &if shell { format!("Close Terminal #{id}?") } else { format!("Decommission {who}?") }, w - 6, TEXT, Some(BOX));
+    seg(fb, x + 3, y + 3, if shell { "Its shell and running commands will be stopped." } else { "Its process is terminated; unsaved work in it is lost." }, w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + h - 2, if shell { "y close terminal · any other key cancels" } else { "y decommission · any other key cancels" }, w - 6, accent, Some(BOX));
 }
 
 fn help(fb: &mut Fb, l: &Lay) {

@@ -26,7 +26,9 @@ Manually added folders and the root are saved in `$XDG_STATE_HOME/empire/workspa
 (normally `~/.local/state/empire/workspace.json`). Existing projects from Empire's history and
 running sessions remain visible. Discovered projects stay charted without requiring an agent.
 
-Home lists projects needing you first, with counts of ships, terminals and outstanding handoffs.
+Home puts projects needing you first, with clear input/check labels and their latest question or task.
+Other projects use compact rows grouped by parent folder; only nonzero ship and terminal counts
+are shown. The selected project's full path stays in the footer. Folder headings are not selectable.
 Choose a project to open its workspace, or press **e** on its Home row to launch a ship.
 **r on Home** edits the project root. New ships depart from Home and settle into the project's
 orbit; they remain there between tasks until you dismiss them.
@@ -43,8 +45,11 @@ Enter or double-click a planet to open its workspace:
 - **Open another terminal** (`s`): start your normal shell in the project folder. Open as many
   as you need for `git pull`, development servers, logs and manual testing. Shells never take
   agent tasks or generate agent permission/completion alerts.
-- Select an agent or terminal and press **Enter** to return to it. **x** dismisses the selected
-  session after confirmation. Dismissing a shell terminates its foreground work too.
+- **Agents** and **Terminals** have separate sections. Every terminal has a stable number and
+  shows its current title. Select one and press **Enter** to reopen it; **F12** or **Ctrl-]**
+  returns with that session selected. **s** opens another terminal. **x** closes the selected
+  session after confirmation and keeps you on the project. Closing a shell stops its running
+  commands too; cancelling leaves it running.
 - **Anomalies** (`a`): inspect detected problems and reported discoveries on this planet.
 - **Project resources**: browse `AGENTS.md`, `CLAUDE.md`, skills, hooks, MCP configuration and
   other agent instruction files. Previews are read-only. Existing build/renovation shortcuts
@@ -60,6 +65,11 @@ excerpt, not an independently verified summary. Open the native terminal for the
 Every key in a native terminal, including **Esc** and **Ctrl+C**, goes to that session.
 **Ctrl-]** or **F12** returns to the project or galaxy. Scrolling uses the application's own mouse
 support when available, otherwise Empire's terminal history. Drag to select and copy text.
+
+The galaxy and terminal status bar adapts to the window width. Smaller windows shorten the
+fleet summary and usage display, keeping connection status visible. Compact usage shows each
+provider's most-used allowance window; meters, reset times and world counts return when space
+allows. At the narrowest sizes, usage and quiet ship tallies give way to agents needing you.
 
 In the planet task composer, **Enter** sends; **Alt+Enter**, **Shift+Enter** or **Ctrl+J** adds a
 line. Pasted line breaks are preserved. **Ctrl+V** pastes clipboard text or attaches a screenshot.

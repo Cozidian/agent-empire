@@ -1702,10 +1702,14 @@ impl App {
         }
     }
 
-    fn close_comms(&mut self, client: &Client) {
+    fn close_comms(&mut self, client: &Client, w: &World) {
         client.watch(None);
         self.screen = None;
-        if let Some(key) = self.workspace_return.take() { self.mode = Mode::Workspace { key, sel: 0 }; return; }
+        if let Some(key) = self.workspace_return.take() {
+            let id = self.talking_to();
+            let sel = self.work_rows(w, &key).iter().position(|r| matches!(r.2, WorkAct::Agent(a) if Some(a) == id)).unwrap_or(0);
+            self.mode = Mode::Workspace { key, sel }; return;
+        }
         self.mode = if std::mem::take(&mut self.commander_return) { Mode::Commander } else { self.planet_return.take().map_or(Mode::Galaxy, Mode::Planet) };
     }
 
@@ -2482,7 +2486,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             && !app.agents.iter().any(|a| a.id == id)
             && app.comms_at.elapsed() > Duration::from_secs(4)
         {
-            app.close_comms(client);
+            app.close_comms(client, &world);
         }
 
         if let Mode::Ship { id, .. } = app.mode
@@ -2503,7 +2507,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             }
             if handle(&mut app, &world, &lay, client, sound, ev, t, &mut drag) {
                 if app.talking_to().is_some() {
-                    app.close_comms(client);
+                    app.close_comms(client, &world);
                 }
                 return Ok(());
             }
@@ -2659,6 +2663,27 @@ impl App {
         if let Err(e) = result { self.toast(e, t); }
     }
 
+    pub fn home_need(&self, key: &str) -> Option<&Agent> {
+        self.agents.iter().filter(|a| a.cwd == key && a.kind != "shell" && a.dying.is_none() && a.status.needs_you()).min_by_key(|a| (a.status, a.id))
+    }
+
+    pub fn work_group(&self, key: &str, action: &WorkAct) -> String {
+        if key != crate::workspace::HOME {
+            return match action {
+                WorkAct::Agent(id) if self.agent(*id).is_some_and(|a| a.kind == "shell") => "TERMINALS",
+                WorkAct::Agent(_) => "AGENTS",
+                WorkAct::Anomalies | WorkAct::Files => "PROJECT",
+                _ => "WORK",
+            }.into();
+        }
+        if let WorkAct::Project(key) = action {
+            if self.home_need(key).is_some() { return "NEEDS YOU".into(); }
+            let folder = parent(key);
+            Path::new(&folder).strip_prefix(&self.workspace.root).ok().filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| tilde(&folder), |p| p.to_string_lossy().into_owned())
+        } else { "WORKSPACE".into() }
+    }
+
     pub fn work_rows(&self, w: &World, key: &str) -> Vec<(String, String, WorkAct)> {
         let mut rows = vec![];
         if key == crate::workspace::HOME {
@@ -2666,11 +2691,14 @@ impl App {
             rows.push(("Add a folder".into(), "Any existing or new project folder".into(), WorkAct::Add));
             rows.push(("Refresh projects".into(), if self.discovering.is_some() { "Discovering repositories…".into() } else { "Discover Git projects under your root".into() }, WorkAct::Refresh));
             let mut planets: Vec<_> = w.planets.iter().filter(|p| p.key != crate::workspace::HOME).collect();
-            planets.sort_by_key(|p| (!self.agents.iter().any(|a| a.cwd == p.key && a.kind != "shell" && a.status.needs_you()), p.name.clone()));
+            planets.sort_by_key(|p| (self.home_need(&p.key).map_or(2, |a| if a.status == Status::Blocked { 0 } else { 1 }), parent(&p.key), p.name.to_lowercase()));
             for p in planets {
-                let ships: Vec<_> = self.agents.iter().filter(|a| a.cwd == p.key && a.kind != "shell" && a.dying.is_none()).collect();
-                let need = ships.iter().find(|a| a.status.needs_you());
-                let note = need.map_or_else(|| format!("{} ships · {}", ships.len(), tilde(&p.key)), |a| format!("{} · {}", a.status.label(), a.ask.as_ref().map_or(a.title.as_str(), |q| q.question.as_str())));
+                let mut counts = vec![];
+                for (shell, name) in [(false, "ship"), (true, "terminal")] {
+                    let n = self.agents.iter().filter(|a| a.cwd == p.key && (a.kind == "shell") == shell && a.dying.is_none()).count();
+                    if n > 0 { counts.push(format!("{n} {name}{}", if n == 1 { "" } else { "s" })); }
+                }
+                let note = self.home_need(&p.key).map_or_else(|| counts.join(" · "), |a| a.ask.as_ref().map_or(a.title.as_str(), |q| q.question.as_str()).into());
                 rows.push((p.name.clone(), note, WorkAct::Project(p.key.clone())));
             }
             let actions: Vec<_> = rows.drain(..3).collect(); rows.extend(actions);
@@ -2678,11 +2706,12 @@ impl App {
             rows.push(("Give this planet a task".into(), "An available agent here takes it; busy agents finish first".into(), WorkAct::Task));
             rows.push(("Launch an agent from Home".into(), "Claude · Codex · Grok".into(), WorkAct::Launch));
             rows.push(("Open another terminal".into(), "An ordinary shell in this project, kept running when you leave".into(), WorkAct::Terminal));
-            let mut sessions: Vec<_> = self.agents.iter().filter(|a| a.cwd == key && a.kind != "shell" && a.dying.is_none()).collect();
+            let mut sessions: Vec<_> = self.agents.iter().filter(|a| a.cwd == key && a.dying.is_none()).collect();
             sessions.sort_by_key(|a| (a.kind == "shell", !a.status.needs_you(), a.id));
             for a in sessions {
                 let label = if a.kind == "shell" { format!("Terminal #{}", a.id) } else { format!("{} #{} · {}", a.kind, a.id, a.status.label()) };
-                let note = a.ask.as_ref().map_or_else(|| if a.title.is_empty() { "Open the terminal to continue".into() } else { a.title.clone() }, |q| q.question.clone());
+                let note = if a.kind == "shell" && a.status == Status::Exited { "Exited · x to remove".into() }
+                    else { a.ask.as_ref().map_or_else(|| if a.title.is_empty() { "Open the terminal to continue".into() } else { a.title.clone() }, |q| q.question.clone()) };
                 rows.push((label, note, WorkAct::Agent(a.id)));
             }
             let count = self.anomalies.findings.iter().filter(|f| f.world == key && f.state.active()).count();
@@ -2742,7 +2771,9 @@ fn workspace_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
     let Mode::Workspace { key, sel } = &app.mode else { return };
     let (key, mut sel) = (key.clone(), *sel);
     let rows = app.work_rows(w, &key);
-    let page = ((l.rows - 10) / 2).max(1) as usize;
+    sel = sel.min(rows.len().saturating_sub(1));
+    let layout = draw::WorkspaceLayout::new(app, &rows, &key, sel, l);
+    let page = layout.items.len().max(1);
     let mut action = None;
     match ev {
         Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
@@ -2765,17 +2796,17 @@ fn workspace_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
             KeyCode::Char('r') if key == crate::workspace::HOME => action = Some(WorkAct::Root),
             KeyCode::Char('s') if key != crate::workspace::HOME => action = Some(WorkAct::Terminal),
             KeyCode::Char('a') if key != crate::workspace::HOME => action = Some(WorkAct::Anomalies),
-            KeyCode::Char('x') => if let Some((_, _, WorkAct::Agent(id))) = rows.get(sel) { app.mode = Mode::Confirm { id: *id }; return; },
+            KeyCode::Char('x') => if let Some((_, _, WorkAct::Agent(id))) = rows.get(sel) { app.workspace_return = Some(key.clone()); app.mode = Mode::Confirm { id: *id }; return; },
             _ => {}
         },
         Event::Mouse(m) => match m.kind {
             MouseEventKind::ScrollUp => sel = sel.saturating_sub(1),
             MouseEventKind::ScrollDown => sel = (sel + 1).min(rows.len().saturating_sub(1)),
-            MouseEventKind::Up(MouseButton::Left) if m.row >= 7 && (m.row as i32) < l.rows - 3 => {
-                let off = sel.saturating_sub(page - 1);
-                let at = off + (m.row as usize - 7) / 2;
-                if at == sel { action = rows.get(at).map(|r| r.2.clone()); }
-                sel = at.min(rows.len().saturating_sub(1));
+            MouseEventKind::Up(MouseButton::Left) if m.column > 0 && (m.column as i32) < layout.width - 1 => {
+                if let Some(&(at, _, _)) = layout.items.iter().find(|(_, y, h)| (m.row as i32) >= *y && (m.row as i32) < y + h) {
+                    if at == sel { action = rows.get(at).map(|r| r.2.clone()); }
+                    sel = at;
+                }
             }
             _ => {}
         },
@@ -2809,7 +2840,7 @@ fn handle(
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 let page = (l.rows - 4).max(1) as isize;
                 if is_leave(&k) {
-                    app.close_comms(client);
+                    app.close_comms(client, w);
                 } else if k.modifiers.contains(KeyModifiers::SHIFT) && k.code == KeyCode::PageUp {
                     app.scroll_by(page, client);
                 } else if k.modifiers.contains(KeyModifiers::SHIFT) && k.code == KeyCode::PageDown {
@@ -2957,7 +2988,10 @@ fn handle(
                     app.say(Ev::Agent, msg, v3(1.0, 0.5, 0.35)).on(&cwd).by(id);
                 }
             }
-            app.mode = Mode::Galaxy;
+            app.mode = if let Some(key) = app.workspace_return.take() {
+                let sel = app.work_rows(w, &key).iter().position(|r| matches!(r.2, WorkAct::Agent(a) if a == id)).unwrap_or(0);
+                Mode::Workspace { key, sel }
+            } else { Mode::Galaxy };
             return false;
         }
         Mode::Ship { id, sel } => {
@@ -3648,6 +3682,69 @@ mod screenshot_tests {
         assert!(rows.iter().any(|r| r.contains("Next available agent")));
         assert!(rows.iter().any(|r| r.contains("Ctrl+V") && r.contains("Ctrl+X")));
         assert!(rows.iter().any(|r| r.contains("Enter send")));
+    }
+}
+
+#[cfg(test)]
+mod top_bar_tests {
+    use super::*;
+
+    #[test]
+    fn status_bar_keeps_connection_and_complete_fleet_counts_when_narrow() {
+        let mut app = App::new();
+        for id in 1..=16 {
+            let mut a = ship_card_tests::ship(id, false);
+            a.cwd = format!("/fleet/system{}/world{id}", id % 4);
+            a.status = if id == 1 { Status::Blocked } else { Status::Idle };
+            app.agents.push(a);
+        }
+        app.mode = Mode::Comms(1);
+        app.survey.limits = vec![
+            survey::Limit { who: "claude", window: "wk".into(), used: 50.0, resets: Some(survey::now() + 86400) },
+            survey::Limit { who: "codex", window: "wk".into(), used: 52.0, resets: Some(survey::now() + 86400) },
+        ];
+        let w = app.world(1.0, 0.0);
+        for online in [true, false] {
+            app.online = online;
+            for cols in 40..=220 {
+                let mut fb = Fb::new(cols, 12); let l = Lay::new(&fb, false);
+                draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+                let row: String = fb.txt[..cols].iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+                assert!(row.contains(if online { "●" } else { "○" }), "connection lost at {cols}: {row}");
+                assert!(row.contains("16 agents"), "fleet count lost at {cols}: {row}");
+                assert!(row.contains(&format!("{}1", Status::Blocked.glyph(1.0))), "attention lost at {cols}: {row}");
+                assert!(row.contains(&format!("  {} ", if online { "●" } else { "○" })), "connection needs breathing room: {row}");
+                if cols >= 80 {
+                    assert!(row.contains("CLAUDE") && row.contains("50%") && row.contains("CODEX") && row.contains("52%"), "usage lost at {cols}: {row}");
+                }
+                if cols == 220 { assert!(row.contains(&format!("{} systems", w.systems.len())) && row.contains(&format!("{} worlds", w.planets.len())) && row.contains("▰") && row.contains("↻"), "wide detail lost: {row}"); }
+                if online && [40, 60, 80, 120, 220].contains(&cols) { println!("{cols}: {row}"); }
+            }
+        }
+    }
+
+    #[test]
+    fn status_bar_handles_missing_usage_and_compacts_multiple_windows() {
+        let mut app = App::new(); app.mode = Mode::Comms(0); app.cam.z = 0.7;
+        let w = app.world(1.0, 0.0);
+        for cols in 20..=100 {
+            let mut fb = Fb::new(cols, 12); let l = Lay::new(&fb, false);
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let row: String = fb.txt[..cols].iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+            assert!(if cols < 100 { row.ends_with("○ offline ") } else { row.contains("○ daemon") }, "offline status lost at {cols}: {row}");
+            assert!(!row.contains('%'));
+        }
+        app.cam.z = 1.0;
+        app.survey.limits = vec![
+            survey::Limit { who: "claude", window: "5h".into(), used: 95.0, resets: None },
+            survey::Limit { who: "claude", window: "wk".into(), used: 20.0, resets: None },
+            survey::Limit { who: "codex", window: "wk".into(), used: 52.0, resets: None },
+        ];
+        let mut fb = Fb::new(80, 12); let l = Lay::new(&fb, false);
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let row: String = fb.txt[..80].iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(row.contains("CLAUDE 5h 95%") && row.contains("CODEX wk 52%"), "tightest allowances must survive: {row}");
+        assert!(!row.contains("20%"), "compact usage should show the tightest window: {row}");
     }
 }
 
@@ -4743,8 +4840,71 @@ mod anomaly_tests {
 mod workspace_tests {
     use super::*;
 
+    #[test]
+    fn home_groups_quiet_projects_and_mouse_opens_the_rendered_row() {
+        let mut app = App::new(); app.history.clear(); app.workspace.root = "/code".into();
+        app.projects = vec!["/code/team/zebra".into(), "/code/tools/alpha".into(), "/code/team/api".into(), "/code/tools/review".into()];
+        let mut agent = ship_card_tests::ship(1, false); agent.cwd = "/code/tools/review".into(); agent.status = Status::Done;
+        agent.title = "Test the settings form".into(); app.agents.push(agent);
+        let w = app.world(1.0, 0.0);
+        let home = crate::workspace::HOME;
+        let projects: Vec<_> = app.work_rows(&w, home).into_iter().filter_map(|(_, _, a)| if let WorkAct::Project(p) = a { Some(p) } else { None }).collect();
+        assert_eq!(projects, ["/code/tools/review", "/code/team/api", "/code/team/zebra", "/code/tools/alpha"]);
+        for (cols, height) in [(120, 35), (80, 24), (36, 14)] {
+            let mut fb = Fb::new(cols, height); let l = Lay::new(&fb, false);
+            app.mode = Mode::Workspace { key: home.into(), sel: 0 };
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let lines: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+            assert!(lines.iter().any(|s| s.contains("NEEDS YOU")));
+            assert!(!lines.iter().any(|s| s.contains("0 ships")));
+            if height >= 24 {
+                let row = lines.iter().position(|s| s.contains("zebra")).unwrap();
+                for _ in 0..2 {
+                    let click = Event::Mouse(event::MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 6, row: row as u16, modifiers: KeyModifiers::NONE });
+                    handle(&mut app, &w, &l, &Client::isolated(), None, click, 1.0, &mut None);
+                }
+                assert!(matches!(&app.mode, Mode::Workspace { key, .. } if key == "/code/team/zebra"));
+            }
+            app.mode = Mode::Workspace { key: home.into(), sel: 0 };
+            press(&mut app, &w, &l, &Client::isolated(), KeyCode::End);
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+            assert!(text.contains("Refresh projects"), "the final action remains reachable at {cols} columns");
+        }
+    }
+
     fn press(app: &mut App, w: &World, l: &Lay, client: &Client, code: KeyCode) {
         handle(app, w, l, client, None, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 1.0, &mut None);
+    }
+
+    #[test]
+    fn project_terminals_are_listed_reopened_and_closed_only_after_confirmation() {
+        let mut app = App::new(); app.history.clear();
+        for id in 1..=2 {
+            let mut shell = ship_card_tests::ship(id, false); shell.cwd = "/world".into(); shell.kind = "shell".into();
+            app.agents.push(shell);
+        }
+        let w = app.world(1.0, 0.0); let mut fb = Fb::new(120, 35); let l = Lay::new(&fb, false);
+        let rows = app.work_rows(&w, "/world");
+        let selected = rows.iter().position(|r| matches!(r.2, WorkAct::Agent(2))).expect("the second terminal must be listed");
+        app.mode = Mode::Workspace { key: "/world".into(), sel: selected };
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("TERMINALS") && text.contains("Terminal #1") && text.contains("Terminal #2"));
+        let (client, commands) = Client::recording();
+        press(&mut app, &w, &l, &client, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Comms(2)));
+        press(&mut app, &w, &l, &client, KeyCode::F(12));
+        assert!(matches!(&app.mode, Mode::Workspace { key, sel } if key == "/world" && *sel == selected));
+        press(&mut app, &w, &l, &client, KeyCode::Char('x'));
+        assert!(matches!(app.mode, Mode::Confirm { id: 2 }));
+        assert!(!commands.try_iter().any(|c| matches!(c, Cmd::Kill(_))));
+        press(&mut app, &w, &l, &client, KeyCode::Esc);
+        assert!(matches!(&app.mode, Mode::Workspace { key, sel } if key == "/world" && *sel == selected));
+        press(&mut app, &w, &l, &client, KeyCode::Char('x'));
+        press(&mut app, &w, &l, &client, KeyCode::Char('y'));
+        assert!(commands.try_iter().any(|c| matches!(c, Cmd::Kill(2))));
+        assert!(matches!(&app.mode, Mode::Workspace { key, .. } if key == "/world"));
     }
 
     #[test]
