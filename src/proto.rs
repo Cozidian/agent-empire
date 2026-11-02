@@ -131,6 +131,9 @@ pub struct AgentView {
     /// Border conflicts: other agents on this world editing the same files.
     #[serde(default)]
     pub war: Vec<War>,
+    /// Working ships on this world whose tasks look like the same job (not a file conflict, which is `war`).
+    #[serde(default)]
+    pub overlap: Vec<Overlap>,
     /// The design it was launched from, by name ("" for none).
     #[serde(default)]
     pub design: String,
@@ -175,6 +178,19 @@ pub struct ShipSpec {
 impl ShipSpec {
     /// Nothing of its own to tell the ship.
     pub fn is_bare(&self) -> bool { self.orders.trim().is_empty() && self.skills.is_empty() }
+}
+
+/// Another ship on the same world doing what looks like the same work, and how likely (0..1).
+/// Only shown from `Overlap::SHOW` up.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Overlap {
+    pub rival: u32,
+    pub p: f32,
+}
+
+impl Overlap {
+    /// A Noul at or above this counts as a yes.
+    pub const SHOW: f32 = 0.7;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
