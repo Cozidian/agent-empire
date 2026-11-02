@@ -8,7 +8,7 @@ use crate::draw;
 use crate::gfx::*;
 use crate::role::Role;
 use crate::structure::{Built, KINDS, Kind};
-use crate::proto::{AgentView, Ask, Mission, RefitState, Report, ScreenView, ShipSpec, War};
+use crate::proto::{AgentView, Ask, Mission, Overlap, RefitState, Report, ScreenView, ShipSpec, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crate::screenshots::{self, Attachment};
@@ -188,6 +188,8 @@ pub struct Agent {
     pub report: Report,
     pub ask: Option<Ask>,
     pub war: Vec<War>,
+    /// Working ships on its world doing what looks like the same job.
+    pub overlap: Vec<Overlap>,
     pub role: Role,
     /// The design it was launched from, by name ("" for none).
     pub design: String,
@@ -1263,6 +1265,7 @@ impl App {
                 }
                 let a = &mut self.agents[i];
                 a.war = v.war.clone();
+                a.overlap = v.overlap.clone();
                 if !title.is_empty() {
                     a.title = title;
                 }
@@ -1292,6 +1295,7 @@ impl App {
                     report: v.report.clone(),
                     ask: v.ask.clone(),
                     war: v.war.clone(),
+                    overlap: v.overlap.clone(),
                     role: Role::parse(&v.role),
                     design: v.design.clone(),
                     spec: v.spec.clone(),
@@ -4259,6 +4263,7 @@ mod ship_card_tests {
             report: Default::default(),
             ask: None,
             war: if war { vec![crate::proto::War { rival: 9, files: vec!["src/a.rs".into()] }] } else { vec![] },
+            overlap: vec![],
             role: Role::None,
             design: String::new(),
             spec: ShipSpec::default(),
@@ -5243,5 +5248,77 @@ mod editor_tests {
         let Mode::Planet(v) = &app.mode else { panic!("quitting the editor returns to the world's resources") };
         assert_eq!(v.preview, "# new", "the file is read again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use crate::proto::Overlap;
+
+    fn fleet(p: f32) -> App {
+        let mut app = App::new();
+        app.history.clear();
+        app.online = true;
+        for (id, rival) in [(1, 2), (2, 1)] {
+            let mut a = ship_card_tests::ship(id, false);
+            a.cwd = "/code/web".into();
+            a.status = Status::Working;
+            a.title = format!("task of ship {id}");
+            a.overlap = vec![Overlap { rival, p }];
+            app.agents.push(a);
+        }
+        app
+    }
+
+    fn render(app: &mut App, mode: Mode) -> String {
+        let w = app.world(0.0, 0.0);
+        let mut fb = Fb::new(140, 50);
+        let l = Lay::new(&fb, true);
+        app.sel = Some(Sel::Planet("/code/web".into()));
+        app.mode = mode;
+        draw::frame(&mut fb, app, &w, &l, 1.0, None);
+        fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn both_outliner_rows_wear_a_dim_badge_for_the_other_ship() {
+        let mut app = fleet(0.8);
+        let text = render(&mut app, Mode::Galaxy);
+        let row = |id: u32| text.lines().find(|l| l.contains(&format!("task of ship {id}"))).unwrap_or_else(|| panic!("no row for {id}\n{text}")).to_string();
+        assert!(row(1).contains("≈#2"), "{}", row(1));
+        assert!(row(2).contains("≈#1"), "{}", row(2));
+        assert!(!text.contains('⚔'), "an overlap is not a file conflict");
+        let mut quiet = fleet(0.8);
+        for a in &mut quiet.agents { a.overlap.clear(); }
+        assert!(!render(&mut quiet, Mode::Galaxy).contains('≈'));
+    }
+
+    #[test]
+    fn the_ship_card_gets_an_overlap_row_only_when_there_is_one() {
+        let mut app = fleet(0.9);
+        let text = render(&mut app, Mode::Ship { id: 1, sel: 0 });
+        let row = text.lines().find(|l| l.contains("overlap")).unwrap_or_else(|| panic!("no overlap row\n{text}"));
+        assert!(row.contains("≈ claude #2"), "{row}");
+        // the card grows by a row, and its menu is still where the clicks land
+        let l = Lay::new(&Fb::new(140, 50), false);
+        let comms = text.lines().position(|r| r.contains("open comms")).unwrap() as i32;
+        let col = text.lines().nth(comms as usize).unwrap().chars().position(|c| c == 'o').unwrap() as i32;
+        assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms), Some(Some(0)));
+        app.agents[0].overlap.clear();
+        assert!(!render(&mut app, Mode::Ship { id: 1, sel: 0 }).lines().any(|l| l.contains("overlap")));
+    }
+
+    #[test]
+    fn a_red_conflict_keeps_its_own_row_beside_an_overlap() {
+        let mut app = fleet(0.9);
+        app.agents[0].war = vec![War { rival: 9, files: vec!["src/a.rs".into()] }];
+        let w = app.world(0.0, 0.0);
+        let mut fb = Fb::new(140, 50);
+        let l = Lay::new(&fb, true);
+        app.sel = Some(Sel::Agent(1));
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("⚔ vs #9") && text.contains("≈ claude #2"), "{text}");
     }
 }

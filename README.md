@@ -66,6 +66,17 @@ current task or question. On wider terminals, selecting an agent with a handoff 
 recent terminal output, including testing instructions when the agent provided them. This is an
 excerpt, not an independently verified summary. Open the native terminal for the full conversation.
 
+**Overlapping work (optional, automatic).** With `EMPIRE_JEV_OVERLAP=1`, when two or more ships are
+Working on one world, TypeSafe's Jev model (`TYPESAFE_API_KEY`) is asked, once per pair, whether
+their tasks ask for the same work or work likely to edit the same files. At 0.7 or more both ships
+get a dim `≈#7` in the outliner and an `overlap` row on the ship card. This comes earlier than
+the red `⚔` border conflict, which still means files were really edited by both. It is only a
+hint: nothing is asked of you or done for you, and a low score, a missing key or any error shows
+nothing. With the flag but no key (or if Jev fails), shared file paths or mostly shared words in
+the two tasks stand in. Only the species and the first line of each task (up to 300 characters)
+are sent, never terminal text; a world is asked about at most once every 30 seconds. The model
+(`jev-1.14.0`) and endpoint can be overridden with `TYPESAFE_DEFAULT_MODEL` and `TYPESAFE_BASE_URL`.
+
 ## Native terminals and quick tasks
 
 Every key in a native terminal, including **Esc** and **Ctrl+C**, goes to that session.
