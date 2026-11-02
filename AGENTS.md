@@ -18,10 +18,11 @@ Single binary crate, no workspace. `src/main.rs` dispatches subcommands (`daemon
 - `draw.rs`: all rendering — pixels for the galaxy, text cells for HUD and dialogs. Each `Mode`
   has a draw function dispatched from `frame()`.
 - `survey.rs`: background thread surveying each world (git, `gh` PRs, usage limits).
+- `workspace.rs`: configured project root, repository discovery and manual folders. `sector.rs`:
+  folder-derived groups. `anomaly.rs`: detected and reported project findings.
 - `structure.rs`: AI resources found in a world (AGENTS.md, skills, MCP, hooks…) and their
-  construction briefs. `role.rs`: ship roles and their launch flags. `design.rs`: saved ship
-  designs and where each species finds skills. `jev.rs`: TypeSafe Jev
-  suggestions (needs `TYPESAFE_API_KEY`). `screenshots.rs`: mission image attachments.
+  construction briefs. `role.rs`: legacy session launch flags, preserved across resumes;
+  new ships use native defaults. `screenshots.rs`: task image attachments.
 - `gfx.rs` / `octant.rs`: framebuffer and octant renderer. `sound.rs`: synthesized cues and music.
 
 ## Build, run, test
@@ -29,7 +30,6 @@ Single binary crate, no workspace. `src/main.rs` dispatches subcommands (`daemon
 ```
 cargo build --release          # binary: ./target/release/empire
 cargo test                     # all unit tests; no daemon, network or audio needed
-cargo test jev_live -- --ignored --nocapture   # hits the real Jev API, needs TYPESAFE_API_KEY
 ./target/release/empire        # open the galaxy (starts/hot-upgrades the daemon)
 ./target/release/empire status # quick check against a running daemon
 ```

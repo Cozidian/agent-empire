@@ -22,6 +22,7 @@ pub struct Book {
     pub sectors: Vec<Sector>,
 }
 
+#[cfg(test)]
 impl Book {
     fn name(&self, name: &str, except: Option<u64>) -> Result<String, String> {
         if name.chars().any(char::is_control) { return Err("Use a single-line sector name".into()); }
@@ -63,8 +64,9 @@ impl Book {
 }
 
 
-pub fn path() -> std::path::PathBuf { crate::daemon::dirs_state().join("sectors.json") }
 
+
+#[cfg(test)]
 pub fn edit(path: &std::path::Path, change: impl FnOnce(&mut Book)) -> std::io::Result<Book> { crate::state::edit(path, change) }
 
 #[cfg(test)]

@@ -111,10 +111,6 @@ pub fn validate(attachments: &[Attachment]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn clipboard(dir: &Path) -> Result<Attachment, String> {
-    save(&clipboard_bytes(true)?, "Clipboard screenshot.png".into(), dir)
-}
-
 pub enum Clipboard {
     Image(Attachment),
     Text(String),
