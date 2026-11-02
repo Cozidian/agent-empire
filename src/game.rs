@@ -631,6 +631,8 @@ pub struct App {
     pub commander_detail: usize,
     commander_return: bool,
     pub kinds: Vec<String>,
+    /// Advisor's suggestion for the mission being written (off unless enabled).
+    pub route: crate::route::Route,
     pub screen: Option<(u32, ScreenView)>,
     pub panel: bool,
     pub bg: Vec<V3>,
@@ -892,6 +894,7 @@ impl App {
             editor: None,
             rescan: Vec::new(),
             kinds: detect_kinds(),
+            route: crate::route::Route::new(),
             screen: None,
             panel: true,
             bg: Vec::new(),
@@ -1344,6 +1347,25 @@ impl App {
             }
             (_, Status::Working) => self.fx.push(ring(to.color(), 20.0)),
             _ => {}
+        }
+    }
+
+    /// Advisor's pick for the mission being written: preselects the species, nothing more.
+    fn route_step(&mut self) {
+        if !self.route.enabled { return; }
+        let input = match &self.mode {
+            Mode::Brief { planet, text, .. } => crate::route::Input::new(&base_name(planet), &text.s, &self.kinds),
+            _ => None,
+        };
+        let open = matches!(self.mode, Mode::Brief { .. });
+        if let Some(i) = self.route.step(Instant::now(), open, input.as_ref(), crate::route::ask) {
+            // the composer lists every installed species; Advisor's list is the known ones among them
+            let name = input.as_ref().map(|inp| inp.kinds[i].clone());
+            if let (Some(name), Mode::Brief { kind, .. }) = (name, &mut self.mode)
+                && let Some(at) = self.kinds.iter().position(|k| *k == name)
+            {
+                *kind = at;
+            }
         }
     }
 
@@ -2432,6 +2454,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         if let Some(rx) = &app.discovering && let Ok(projects) = rx.try_recv() {
             app.sectors = app.workspace.sectors(&projects); app.projects = projects; app.discovering = None; app.fitted = false;
         }
+        app.route_step();
         let mut cues = Vec::new();
         for m in std::mem::take(&mut pending).into_iter().chain(client.rx.try_iter()) {
             match m {
@@ -3307,11 +3330,13 @@ fn handle(
                     let up = k.code == KeyCode::Up;
                     if !text.vertical(up) {
                         *kind = if up { (*kind + nk - 1) % nk } else { (*kind + 1) % nk };
+                        app.route.touched = true;
                     }
                 }
                 KeyCode::Tab | KeyCode::BackTab => { *launch = !*launch; }
                 KeyCode::Enter if !text.s.trim().is_empty() || !attachments.is_empty() => {
                     let prompt = if text.s.trim().is_empty() { "Review the attached screenshots." } else { text.s.trim() };
+                    app.route.record(&app.kinds[*kind]);
                     let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: app.kinds[*kind].clone(), launch: *launch, attachments: attachments.clone(), draft: true, role: String::new(), to: None, campaign: None, spec: ShipSpec::default() };
                     *sending = true;
                     client.send(cmd);
