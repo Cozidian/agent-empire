@@ -170,6 +170,8 @@ struct Agent {
     spec: ShipSpec,
     /// A refit ordered for it; `role` and `spec` stay what it's actually running with.
     refit: Option<RefitState>,
+    /// The command a shell session runs instead of the shell (an editor on a file).
+    run: Vec<String>,
     /// Screen generation, bumped on every change, and the signal waiting viewers sleep on.
     version: u64,
     changed: Arc<Condvar>,
@@ -227,8 +229,11 @@ impl Agent {
         }
     }
 
-    /// The question line near the bottom of the screen, if the agent seems to be
-    /// asking the player something, plus how many times that line is on screen.
+    /// The question near the bottom of the screen, if the agent seems to be asking
+    /// the player something, plus how many times its first line is on screen.
+    /// The text includes what the question is about (the command, the edit), so a
+    /// later prompt is not the same question as the one just answered. A confirm
+    /// hint under the choices is not the question.
     fn question(&self) -> Option<(String, usize)> {
         const ASK: [&str; 14] = [
             "do you want", "would you like", "(y/n)", "[y/n]", "proceed?", "yes, proceed", "allow execution",
@@ -236,19 +241,29 @@ impl Agent {
             "trust this folder", "do you trust",
         ];
         let text = self.parser.screen().contents().to_lowercase();
-        let hits: Vec<&str> = text.lines().map(unbox).rev().filter(|l| !l.is_empty()).take(8).filter(|l| ASK.iter().any(|k| l.contains(k))).collect();
-        // the question itself, not one of its numbered answers (unless that's all there is)
-        let line = hits.iter().find(|l| option(l).is_none()).or(hits.first())?;
-        let line = line.to_string();
-        let count = text.lines().filter(|l| unbox(l) == line).count();
-        Some((line, count))
+        let lines: Vec<&str> = text.lines().map(unbox).filter(|l| !l.is_empty()).collect();
+        let window = &lines[lines.len().saturating_sub(20)..];
+        let hit = |l: &str| ASK.iter().any(|k| l.contains(k));
+        let hint = |l: &str| l.contains("enter to confirm") && !l.contains('?');
+        let real = window.iter().enumerate().rev().find(|(_, l)| hit(l) && option(l).is_none() && !hint(l)).map(|(i, _)| i);
+        let i = real.or_else(|| window.iter().enumerate().rev().find(|(_, l)| hit(l) && option(l).is_none()).map(|(i, _)| i))?;
+        let mut parts = vec![window[i].to_string()];
+        for l in &window[i + 1..] {
+            if option(l).is_some() || hint(l) { break; }
+            if l.starts_with("environment:") || l.starts_with("permission rule:") || l.starts_with("input:") { continue; }
+            parts.push((*l).to_string());
+        }
+        let header = window[i];
+        let count = lines.iter().filter(|l| **l == header).count();
+        Some((parts.join("\n"), count))
     }
 
     /// The question being asked, with its context and choices, for answering from orbit.
     fn ask(&self) -> Option<Ask> {
         let (q, _) = self.question()?;
+        let header = q.lines().next().unwrap_or(q.as_str());
         let lines: Vec<String> = self.parser.screen().contents().lines().map(|l| unbox(l).to_string()).collect();
-        let qi = lines.iter().rposition(|l| l.to_lowercase() == q)?;
+        let qi = lines.iter().rposition(|l| l.to_lowercase() == header)?;
         let mut context = Vec::new();
         let mut gaps = 0;
         for l in lines[..qi].iter().rev() {
@@ -335,6 +350,10 @@ impl Agent {
             self.set(Status::Exited);
             return;
         }
+        // the prompt has left the screen: the next one, even the same command, is a new question
+        if self.question().is_none() {
+            self.answered = None;
+        }
         if self.kind == "shell" { self.set(Status::Idle); return; }
         let up = (now - self.started).as_secs_f32();
         let quiet = (now - self.last_out).as_secs_f32();
@@ -405,6 +424,7 @@ impl Agent {
             war: Vec::new(),
             spec: self.spec.clone(),
             refit: self.refit.clone(),
+            run: self.run.clone(),
         }
     }
 
@@ -458,6 +478,7 @@ impl Agent {
             sgr: s.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
             alt: s.alternate_screen(),
             version: self.version,
+            exited: self.exited.is_some(),
         }
     }
 }
@@ -591,6 +612,7 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         role: Role::None,
         spec: ShipSpec::default(),
         refit: None,
+        run: Vec::new(),
         version: 1,
         changed: Arc::default(),
         status: Status::Booting,
@@ -611,9 +633,10 @@ fn launch_line(kind: &str, exe: &str, resume: Option<&str>, prompt: Option<&str>
 }
 
 /// Launch an agent in `cwd`, picking up its old session if we have one.
-fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>, role: Role, spec: &ShipSpec) -> anyhow::Result<u32> {
+#[allow(clippy::too_many_arguments)]
+fn spawn(hub: &Shared, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>, role: Role, spec: &ShipSpec, run: &[String]) -> anyhow::Result<u32> {
     let id = next_id(hub);
-    spawn_as(hub, id, kind, cwd, resume, prompt, role, spec).map(|_| id)
+    spawn_as(hub, id, kind, cwd, resume, prompt, role, spec, run).map(|_| id)
 }
 
 #[cfg(test)]
@@ -624,13 +647,17 @@ thread_local! {
 
 /// Launch an agent as ship `id` (a new one, or one being relaunched in place).
 #[allow(clippy::too_many_arguments)]
-fn spawn_as(hub: &Shared, id: u32, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>, role: Role, spec: &ShipSpec) -> anyhow::Result<Arc<Mutex<Agent>>> {
+fn spawn_as(hub: &Shared, id: u32, kind: &str, cwd: &str, resume: Option<&str>, prompt: Option<&str>, role: Role, spec: &ShipSpec, run: &[String]) -> anyhow::Result<Arc<Mutex<Agent>>> {
     let exe = exe_path().to_string_lossy().into_owned();
     if kind == "grok" {
         install_grok_hooks(&exe);
     }
     let pty = native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })?;
-    let (prog, args) = launch_line(kind, &exe, resume, prompt, role, spec);
+    // a shell session can run one command instead of the shell; agents always run their species
+    let (prog, args) = match run.split_first() {
+        Some((prog, args)) if kind == "shell" => (prog.clone(), args.to_vec()),
+        _ => launch_line(kind, &exe, resume, prompt, role, spec),
+    };
     #[cfg(test)]
     let prog = STAND_IN.with(|s| s.borrow().clone()).unwrap_or(prog);
     let mut cmd = CommandBuilder::new(&prog);
@@ -659,6 +686,9 @@ fn spawn_as(hub: &Shared, id: u32, kind: &str, cwd: &str, resume: Option<&str>, 
     agent.role = role;
     agent.spec = spec.clone();
     agent.note_task(prompt.unwrap_or(""));
+    if kind == "shell" {
+        agent.run = run.to_vec();
+    }
     Ok(watch(hub, agent)?)
 }
 
@@ -745,6 +775,8 @@ struct Handoff {
     session: Option<String>,
     #[serde(default)]
     refit: Option<RefitState>,
+    #[serde(default)]
+    run: Vec<String>,
 }
 
 /// Replace this daemon with the binary on disk, keeping every agent: same pid,
@@ -781,6 +813,7 @@ fn upgrade(hub: &Shared) -> io::Result<()> {
             report: g.report.clone(),
             session: g.session.clone(),
             refit: g.refit.clone(),
+            run: g.run.clone(),
         });
     }
     let file = dirs_state().join("handoff.json");
@@ -815,6 +848,7 @@ fn adopt(hub: &Shared, file: &str) -> anyhow::Result<()> {
         a.report = h.report;
         a.session = h.session;
         a.refit = resumed(h.refit);
+        a.run = h.run;
         watch(hub, a)?;
     }
     Ok(())
@@ -991,7 +1025,7 @@ fn relaunch(hub: &Shared, id: u32, role: Role, spec: &ShipSpec) -> Result<String
     }
     // the same ship, picking up where it was
     let launch = |role: Role, spec: &ShipSpec| -> Result<Arc<Mutex<Agent>>, String> {
-        let a = spawn_as(hub, id, &kind, &cwd, Some(&session), None, role, spec).map_err(|e| e.to_string())?;
+        let a = spawn_as(hub, id, &kind, &cwd, Some(&session), None, role, spec, &[]).map_err(|e| e.to_string())?;
         {
             let mut g = a.lock().unwrap();
             g.task = task.clone();
@@ -1037,7 +1071,7 @@ fn launch_moon(hub: &Shared, cwd: &str, branch: &str, kind: &str) -> Result<u32,
     let p = path.to_string_lossy().into_owned();
     // the moon is still there (its crew left): just send a ship back
     if path.is_dir() && git(&p, &["rev-parse", "--git-dir"]).is_ok() {
-        return spawn(hub, kind, &p, None, None, Role::None, &ShipSpec::default()).map_err(|e| e.to_string());
+        return spawn(hub, kind, &p, None, None, Role::None, &ShipSpec::default(), &[]).map_err(|e| e.to_string());
     }
     let exists = git(&top, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
     if exists {
@@ -1045,7 +1079,7 @@ fn launch_moon(hub: &Shared, cwd: &str, branch: &str, kind: &str) -> Result<u32,
     } else {
         git(&top, &["worktree", "add", "-b", branch, &p])?;
     }
-    spawn(hub, kind, &p, None, None, Role::None, &ShipSpec::default()).map_err(|e| e.to_string())
+    spawn(hub, kind, &p, None, None, Role::None, &ShipSpec::default(), &[]).map_err(|e| e.to_string())
 }
 
 /// Merge a moon's branch into its world, then recall its agents and remove it.
@@ -1116,7 +1150,7 @@ fn resurrect(hub: &Shared) {
         if std::path::Path::new(&a.cwd).is_dir() {
             // a claude that never got a prompt has nothing to resume
             let session = a.session.filter(|s| a.kind != "claude" || claude_transcript(s));
-            match spawn(hub, &a.kind, &a.cwd, session.as_deref(), None, Role::parse(&a.role), &a.spec) {
+            match spawn(hub, &a.kind, &a.cwd, session.as_deref(), None, Role::parse(&a.role), &a.spec, &[]) {
                 Ok(id) => if let Some(g) = hub.lock().unwrap().agents.get(&id) { g.lock().unwrap().refit = resumed(a.refit) },
                 Err(e) => eprintln!("could not bring back {} in {}: {e}", a.kind, a.cwd),
             }
@@ -1383,7 +1417,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             let prompt = crate::screenshots::prompt(&text, &attachments);
             let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: to.filter(|_| !launch), at: unix_now(), done_at: None, fleet: None, campaign, campaign_job: String::new() };
             if launch {
-                match spawn(hub, &kind, &cwd, None, Some(&prompt), Role::parse(&role), &spec) {
+                match spawn(hub, &kind, &cwd, None, Some(&prompt), Role::parse(&role), &spec, &[]) {
                     Ok(aid) => {
                         m.state = "sent".into();
                         m.agent = Some(aid);
@@ -1475,7 +1509,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             hub.lock().unwrap().missions.retain(|m| m.id != id);
             Resp::Ok
         }
-        Req::Spawn { kind, cwd } => match spawn(hub, &kind, &cwd, None, None, Role::None, &ShipSpec::default()) {
+        Req::Spawn { kind, cwd, run } => match spawn(hub, &kind, &cwd, None, None, Role::None, &ShipSpec::default(), &run) {
             Ok(id) => Resp::Spawned { id },
             Err(e) => Resp::Err { msg: format!("could not launch {kind}: {e}") },
         },
@@ -2072,6 +2106,44 @@ mod screenshot_tests {
         std::fs::remove_dir_all(dir).unwrap();
         assert!(grok_vitals(std::path::Path::new("/no/such/empire-grok-session")).is_none());
     }
+
+    /// A Codex approval sits above its status line. The footer is the same for every
+    /// command, so a later prompt must still count as waiting.
+    #[test]
+    fn a_later_codex_command_approval_still_needs_you() {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let writer = Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 };
+        let mut a = new_agent(1, "codex", "/world", writer, 40, 120);
+        let screen = "\
+Would you like to run the following command?\r\n\
+\r\n\
+Environment: local\r\n\
+\r\n\
+Reason: Allow the focused workspace tests to access pnpm's package store outside the sandbox?\r\n\
+\r\n\
+$ pnpm test --runInBand components/__tests__/text-help-workspace.test.tsx\r\n\
+\r\n\
+> 1. Yes, proceed (y)\r\n\
+2. Yes, and don't ask again for commands that start with `pnpm test` (p)\r\n\
+3. No, and tell Codex what to do differently (esc)\r\n\
+\r\n\
+Press enter to confirm or esc to cancel\r\n\
+\r\n\
+  GPT-6-Astra high · ~/code/app · ← for agents\r\n";
+        a.parser.process(screen.as_bytes());
+        // an earlier approval already answered that same footer
+        a.answered = Some(("press enter to confirm or esc to cancel".into(), 1));
+        a.started = Instant::now() - Duration::from_secs(30);
+        a.status = Status::Done;
+        a.update(Instant::now());
+        assert!(a.asking(), "the command prompt is a new question");
+        assert_eq!(a.status, Status::Blocked);
+        let (q, _) = a.question().unwrap();
+        assert!(q.contains("pnpm test"), "{q}");
+        let ask = a.ask().unwrap();
+        assert!(ask.options.len() >= 3, "{:?}", ask.options);
+        assert!(ask.options.iter().any(|o| o.label.to_lowercase().contains("proceed")));
+    }
 }
 
 #[cfg(test)]
@@ -2265,13 +2337,36 @@ mod refit_tests {
     }
 
     #[test]
+    fn a_terminal_can_run_one_command_and_says_when_it_has_ended() {
+        let dir = std::env::temp_dir().join(format!("empire-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = Shared::default();
+        let run: Vec<String> = ["sh", "-c", "printf 'writing AGENTS.md'"].map(String::from).to_vec();
+        let a = spawn_as(&hub, 3, "shell", &dir.to_string_lossy(), None, None, Role::None, &ShipSpec::default(), &run).unwrap();
+        for _ in 0..200 {
+            let g = a.lock().unwrap();
+            if g.exited.is_some() && g.parser.screen().contents().contains("writing AGENTS.md") {
+                break;
+            }
+            drop(g);
+            thread::sleep(Duration::from_millis(25));
+        }
+        let g = a.lock().unwrap();
+        assert!(g.parser.screen().contents().contains("writing AGENTS.md"), "it ran the command, not a shell");
+        assert!(g.screen().exited, "the screen says the program has ended");
+        assert_eq!(g.view(Instant::now()).run, run);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_refit_relaunches_the_same_ship_on_its_session_and_restores_it_on_failure() {
         let dir = std::env::temp_dir().join(format!("empire-refit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = stand_in(&dir);
         let hub = Shared::default();
         let cwd = dir.to_string_lossy().into_owned();
-        let first = spawn_as(&hub, 7, "claude", &cwd, Some("sess-1"), None, Role::Builder, &ShipSpec::default()).unwrap();
+        let first = spawn_as(&hub, 7, "claude", &cwd, Some("sess-1"), None, Role::Builder, &ShipSpec::default(), &[]).unwrap();
         let old_pid = first.lock().unwrap().writer.pid;
         // let the first launch get going before it's stood down
         let t = Instant::now();

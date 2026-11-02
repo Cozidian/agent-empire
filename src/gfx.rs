@@ -351,6 +351,73 @@ fn exact(c: V3) -> [u8; 3] {
     [f(c.x), f(c.y), f(c.z)]
 }
 
+/// Fit each octant's two colours to its surface, without ordered-dither grain.
+fn fitted_cell(fb: &Fb, r: usize, c: usize) -> Cell {
+    let p: [V3; 8] = std::array::from_fn(|k| {
+        let [r, g, b] = tone(fb.px[(4 * r + k / 2) * fb.w + 2 * c + k % 2]);
+        v3(r as f32, g as f32, b as f32) / 255.0
+    });
+    let dist = |a: V3, b: V3| { let d = a - b; d.x * d.x + d.y * d.y + d.z * d.z };
+    // seed with the most distinct colours, then fit two local means in display space
+    let (mut lo, mut hi, mut far) = (p[0], p[0], 0.0);
+    for i in 0..8 { for j in i + 1..8 {
+        let d = dist(p[i], p[j]);
+        if d > far { lo = p[i]; hi = p[j]; far = d; }
+    } }
+    let mut mask = 0;
+    for _ in 0..4 {
+        let (mut a, mut b, mut n) = (V3::default(), V3::default(), 0);
+        mask = 0;
+        for (k, &v) in p.iter().enumerate() {
+            if dist(v, hi) < dist(v, lo) { b += v; n += 1; mask |= 1 << k; } else { a += v; }
+        }
+        if n == 0 || n == 8 { return Cell { ch: ' ', fg: exact((a + b) / 8.0), bg: exact((a + b) / 8.0) }; }
+        lo = a / (8 - n) as f32; hi = b / n as f32;
+    }
+    Cell { ch: crate::octant::OCTANT[mask], fg: exact(hi), bg: exact(lo) }
+}
+
+#[cfg(test)]
+mod graphics_tests {
+    use super::*;
+
+    fn error(fb: &Fb, cell: Cell) -> f32 {
+        let mask = crate::octant::OCTANT.iter().position(|&c| c == cell.ch).unwrap();
+        (0..8).map(|k| {
+            let a = tone(fb.px[(k / 2) * fb.w + k % 2]);
+            let b = if mask & (1 << k) == 0 { cell.bg } else { cell.fg };
+            (0..3).map(|i| (a[i] as f32 - b[i] as f32).powi(2)).sum::<f32>()
+        }).sum()
+    }
+
+    #[test]
+    fn default_encoder_reduces_terminal_reconstruction_error() {
+        let mut fb = Fb::new(20, 8);
+        for k in 0..8 { fb.px[(k / 2) * fb.w + k % 2] = v3(0.1, 0.3, 0.6) * (0.15 + k as f32 * 0.11); }
+        let mut out = Out::new(fb.cols * fb.rows);
+        out.present(&fb, &mut io::sink()).unwrap();
+        assert!(error(&fb, out.prev[0].unwrap()) < error(&fb, octant_cell(&fb, 0, 0)) * 0.65);
+    }
+
+    #[test]
+    fn fitted_cells_preserve_silhouettes_and_text() {
+        let mut fb = Fb::new(20, 8);
+        for mask in 0..256 {
+            for k in 0..8 { fb.px[(k / 2) * fb.w + k % 2] = if mask & (1 << k) == 0 { v3(0.0, 0.0, 8.0 / 255.0) } else { v3(160.0, 200.0, 208.0) / 255.0 }; }
+            assert_eq!(error(&fb, fitted_cell(&fb, 0, 0)), 0.0, "silhouette {mask}");
+        }
+        let (fg, bg) = (v3(0.8, 0.6, 0.4), v3(0.04, 0.06, 0.08));
+        fb.put_bg(0, 0, 'A', fg, Some(bg));
+        let mut out = Out::new(fb.cols * fb.rows);
+        out.present(&fb, &mut io::sink()).unwrap();
+        let cell = out.prev[0].unwrap();
+        assert_eq!((cell.ch, cell.fg, cell.bg), ('A', exact(fg), exact(bg)));
+        let mut unchanged = Vec::new();
+        out.present(&fb, &mut unchanged).unwrap();
+        assert_eq!(unchanged, b"\x1b[?2026h\x1b[?2026l");
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct Cell {
     ch: char,
@@ -364,12 +431,16 @@ pub struct Out {
     prev: Vec<Option<Cell>>,
     buf: Vec<u8>,
     pub bytes: usize,
+    fitted: bool,
 }
 
 impl Out {
     pub fn new(cells: usize) -> Self {
-        Self { prev: vec![None; cells], buf: Vec::with_capacity(1 << 20), bytes: 0 }
+        Self { prev: vec![None; cells], buf: Vec::with_capacity(1 << 20), bytes: 0, fitted: true }
     }
+
+    /// Keep the classic encoder available for the offline comparison.
+    pub fn preview(cells: usize, fitted: bool) -> Self { Self { fitted, ..Self::new(cells) } }
 
     pub fn present(&mut self, fb: &Fb, w: &mut impl Write) -> io::Result<()> {
         let b = &mut self.buf;
@@ -395,7 +466,7 @@ impl Out {
                         });
                         Cell { ch: t.ch, fg: exact(t.fg), bg: exact(bg) }
                     }
-                    None => octant_cell(fb, r, c),
+                    None => if self.fitted { fitted_cell(fb, r, c) } else { octant_cell(fb, r, c) },
                 };
                 if self.prev[i] == Some(cell) {
                     at = false;

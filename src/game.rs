@@ -30,6 +30,8 @@ const NAG: f32 = 120.0;
 /// A turn shorter than this finishing is not worth a sound.
 const SHORT_TURN: f32 = 6.0;
 const FPS: u64 = 30;
+/// Resource files listed in a project's workspace before the rest fold into one row.
+const RESOURCE_ROWS: usize = 8;
 const DIM_LOG: V3 = v3(0.5, 0.55, 0.65);
 /// How many situation log entries are kept.
 const LOG_KEEP: usize = 500;
@@ -196,6 +198,8 @@ pub struct Agent {
     pub wpos: (f32, f32),
     /// In front of its planet (drawn after it).
     pub front: bool,
+    /// The command a terminal session runs instead of the shell: an editor on a file.
+    pub run: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -415,11 +419,28 @@ impl PlanetView {
         self.files().get(self.file).map(|f| if KINDS[self.sel] == Kind::Academy { format!("{f}/SKILL.md") } else { f.clone() })
     }
 
+    /// Look again (files may have been written, renamed or removed), keeping the selection.
+    fn refresh(&mut self) {
+        let path = self.files().get(self.file).cloned();
+        self.built = crate::structure::survey(&self.key);
+        self.file = path.and_then(|p| self.files().iter().position(|f| f == &p)).unwrap_or(0);
+        self.read();
+    }
+
+    /// Look again and select `file` (relative to the world), when it's of the building on show.
+    fn show(&mut self, file: &str) {
+        self.built = crate::structure::survey(&self.key);
+        let n = self.files().len();
+        self.file = (0..n).find(|&i| { self.file = i; self.path().as_deref() == Some(file) }).unwrap_or(0);
+        self.focus = self.focus.max(1);
+        self.read();
+    }
+
     fn read(&mut self) {
         use std::io::Read;
         self.scroll = 0;
         self.preview = match self.path() {
-            None => "This plot is empty. Press B to draft a construction order.".into(),
+            None => "This plot is empty. Enter lays a first draft to write yourself; B briefs a ship to build it.".into(),
             Some(p) => {
                 let read = || -> io::Result<String> {
                     let p = Path::new(&self.key).join(p);
@@ -602,6 +623,10 @@ pub struct App {
     pub toast: Option<(String, f32)>,
     pub mode: Mode,
     planet_return: Option<PlanetView>,
+    /// The editor session opened from a world's resources, while you're writing in it.
+    editor: Option<u32>,
+    /// Worlds whose structures were just written, for the survey to look at again now.
+    pub rescan: Vec<String>,
     pub commander: String,
     pub commander_detail: usize,
     commander_return: bool,
@@ -864,6 +889,8 @@ impl App {
             commander_detail: 0,
             commander_return: false,
             planet_return: None,
+            editor: None,
+            rescan: Vec::new(),
             kinds: detect_kinds(),
             screen: None,
             panel: true,
@@ -1240,7 +1267,8 @@ impl App {
                     a.title = title;
                 }
             } else {
-                if !first {
+                // an editor is a tool you opened, not an arrival
+                if !first && v.run.is_empty() {
                     if self.talking_to() != Some(v.id) {
                         cues.push(Cue::Spawn);
                     }
@@ -1270,6 +1298,7 @@ impl App {
                     refit: v.refit.clone(),
                     wpos: (0.0, 0.0),
                     front: true,
+                    run: v.run.clone(),
                 });
             }
         }
@@ -1705,12 +1734,20 @@ impl App {
     fn close_comms(&mut self, client: &Client, w: &World) {
         client.watch(None);
         self.screen = None;
+        // back from writing a file: the survey looks at its world again, and the file stays selected
+        let wrote = self.editor.take().and_then(|id| self.agent(id)).and_then(|a| Some((a.cwd.clone(), a.run.last()?.clone())));
+        if let Some((cwd, _)) = &wrote { self.rescan.push(cwd.clone()); }
         if let Some(key) = self.workspace_return.take() {
             let id = self.talking_to();
-            let sel = self.work_rows(w, &key).iter().position(|r| matches!(r.2, WorkAct::Agent(a) if Some(a) == id)).unwrap_or(0);
+            let file = wrote.map(|w| w.1);
+            let rows = self.work_rows(w, &key);
+            let sel = rows.iter().position(|r| matches!(&r.2, WorkAct::Edit(_, f) if Some(f) == file.as_ref()))
+                .or_else(|| rows.iter().position(|r| matches!(r.2, WorkAct::Agent(a) if Some(a) == id))).unwrap_or(0);
             self.mode = Mode::Workspace { key, sel }; return;
         }
         self.mode = if std::mem::take(&mut self.commander_return) { Mode::Commander } else { self.planet_return.take().map_or(Mode::Galaxy, Mode::Planet) };
+        // back from writing: show the file as it now stands
+        if let Mode::Planet(v) = &mut self.mode { v.refresh(); }
     }
 
     /// Enter on the current selection.
@@ -1741,6 +1778,41 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// The editor you're writing in has been quit.
+    fn editor_quit(&self) -> bool {
+        self.talking_to().is_some_and(|id| self.editor == Some(id) && self.screen.as_ref().is_some_and(|(i, s)| *i == id && s.exited))
+    }
+
+    /// Write a world's file in your own editor: a terminal session that hands you back, when you
+    /// quit, to where you opened it (the project, or its resources).
+    fn edit(&mut self, key: &str, file: String, client: &Client, l: &Lay, t: f32) {
+        // still open from before (you stepped out with F12): go back to it rather than open it twice
+        let open = self.agents.iter().find(|a| a.cwd == key && a.run.last() == Some(&file) && a.dying.is_none() && a.status != Status::Exited).map(|a| a.id);
+        if let Some(id) = open {
+            self.write_in(id, client, l);
+            return;
+        }
+        match crate::structure::editor(|k| std::env::var(k).ok(), crate::structure::installed) {
+            Some(mut run) => {
+                run.push(file.clone());
+                client.send(Cmd::Edit { cwd: key.into(), run });
+                self.toast(format!("✎ opening {file}…"), t);
+            }
+            None => self.toast("No editor found: set $EDITOR, or install nvim", t),
+        }
+    }
+
+    /// Show editor session `id`, remembering the project or resources view to come back to.
+    fn write_in(&mut self, id: u32, client: &Client, l: &Lay) {
+        match std::mem::replace(&mut self.mode, Mode::Galaxy) {
+            Mode::Planet(v) => self.planet_return = Some(v),
+            Mode::Workspace { key, .. } => self.workspace_return = Some(key),
+            other => { self.mode = other; return; }
+        }
+        self.open_comms(id, client, l);
+        self.editor = Some(id);
     }
 
     fn spawn(&mut self, kind: &str, cwd: &Path, client: &Client, t: f32) {
@@ -2391,6 +2463,10 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                         app.screen = Some((id, s));
                     }
                 }
+                Msg::Editing(id) => {
+                    // only if you're still where it was opened from; otherwise it waits under Terminals
+                    app.write_in(id, client, &Lay::new(&fb, app.panel));
+                }
                 Msg::Spawned { id, kind, cwd } => {
                     app.say(Ev::Agent, format!("◆ {kind} launched to {}", base_name(&cwd)), kind_color(&kind)).on(&cwd).by(id);
                     app.sel = Some(Sel::Agent(id));
@@ -2427,6 +2503,10 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             app.fit(&world, &lay);
             (app.cam.x, app.cam.y, app.cam.z) = (app.cam.tx, app.cam.ty, app.cam.tz);
             app.fitted = true;
+        }
+        for path in std::mem::take(&mut app.rescan) {
+            survey.rescan(&path);
+            surveyed = Instant::now() - Duration::from_secs(1);
         }
         if surveyed.elapsed() > Duration::from_millis(500) {
             survey.watch(world.planets.iter().filter(|p| p.key != crate::workspace::HOME).map(|p| p.key.clone()).collect());
@@ -2483,6 +2563,10 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                 app.award(&path, id, pts, &why, &mut cues);
             }
             surveyed = Instant::now();
+        }
+        // quitting the editor hands you straight back to the file
+        if app.editor_quit() {
+            app.close_comms(client, &world);
         }
         // a comms target that's gone for good drops you back to the galaxy
         // (a freshly launched agent takes a moment to show up in the list)
@@ -2568,7 +2652,7 @@ fn paste_brief(text: &mut Line, attachments: &mut Vec<Attachment>, pasted: &str,
 /// Handle one input event. Returns true to quit.
 #[allow(clippy::too_many_arguments)]
 /// Navigate the buildings without sending any order until its draft is submitted.
-fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event) {
+fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event, t: f32) {
     let Mode::Planet(mut v) = std::mem::replace(&mut app.mode, Mode::Galaxy) else { return };
     let g = draw::PlanetLayout::new(l);
     let before = (v.sel, v.file);
@@ -2576,6 +2660,8 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event) {
     let mut edge = None;
     let mut build = false;
     let mut comms = false;
+    // write the selected file in your editor; lay a new one first when asked or when the plot is empty
+    let (mut write, mut found) = (false, false);
     match ev {
         Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
             KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::Workspace { key: v.key, sel: 0 }; return; }
@@ -2588,18 +2674,12 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event) {
             KeyCode::Home => edge = Some(false),
             KeyCode::End => edge = Some(true),
             KeyCode::Char(d @ '1'..='8') => { v.sel = d as usize - '1' as usize; v.focus = 0; }
-            KeyCode::Enter => {
-                if v.files().is_empty() { build = true; }
-                else { v.focus = (v.focus + 1).min(2); }
-            }
+            KeyCode::Enter if v.focus == 0 && !v.files().is_empty() => v.focus = 1,
+            KeyCode::Enter | KeyCode::Char('e') => write = true,
+            KeyCode::Char('n') => found = true,
             KeyCode::Char('B' | 'b') => build = true,
             KeyCode::Char('c') => comms = true,
-            KeyCode::Char('R') => {
-                let path = v.files().get(v.file).cloned();
-                v.built = crate::structure::survey(&v.key);
-                v.file = path.and_then(|p| v.files().iter().position(|f| f == &p)).unwrap_or(0);
-                v.read();
-            }
+            KeyCode::Char('R') => v.refresh(),
             _ => {}
         },
         Event::Mouse(me) => {
@@ -2637,7 +2717,22 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event) {
     *pos = edge.map_or_else(|| pos.saturating_add_signed(delta).min(max), |end| if end { max } else { 0 });
     if before.0 != v.sel { v.file = 0; }
     if before != (v.sel, v.file) { v.read(); }
-    if build {
+    if write || found {
+        let kind = KINDS[v.sel];
+        let file = match v.path() {
+            Some(p) if !found => Ok(p),
+            _ => kind.found(Path::new(&v.key)).map_err(|e| format!("✖ cannot lay the {}: {e}", kind.name())),
+        };
+        match file {
+            Ok(f) => {
+                v.show(&f);
+                let key = v.key.clone();
+                app.mode = Mode::Planet(v);
+                app.edit(&key, f, client, l, t);
+            }
+            Err(e) => { app.toast(e, t); app.mode = Mode::Planet(v); }
+        }
+    } else if build {
         let (key, kind) = (v.key.clone(), KINDS[v.sel]);
         app.survey.worlds.entry(key.clone()).or_default().structures = v.built.clone();
         app.planet_return = Some(v);
@@ -2655,7 +2750,7 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event) {
 
 /// The ordinary actions available on a planet.
 #[derive(Clone)]
-pub enum WorkAct { Project(String), Agent(u32), Launch, Terminal, Task, Files, Anomalies, Root, Add, Refresh }
+pub enum WorkAct { Project(String), Agent(u32), Launch, Terminal, Task, Files, Edit(Kind, String), Anomalies, Root, Add, Refresh }
 
 impl App {
     fn has_agent(&self, key: &str) -> bool { self.agents.iter().any(|a| a.cwd == key && a.kind != "shell" && a.dying.is_none() && a.status != Status::Exited) }
@@ -2691,7 +2786,8 @@ impl App {
             return match action {
                 WorkAct::Agent(id) if self.agent(*id).is_some_and(|a| a.kind == "shell") => "TERMINALS",
                 WorkAct::Agent(_) => "AGENTS",
-                WorkAct::Anomalies | WorkAct::Files => "PROJECT",
+                WorkAct::Edit(..) | WorkAct::Files => "RESOURCES",
+                WorkAct::Anomalies => "PROJECT",
                 _ => "WORK",
             }.into();
         }
@@ -2728,14 +2824,30 @@ impl App {
             let mut sessions: Vec<_> = self.agents.iter().filter(|a| a.cwd == key && a.dying.is_none()).collect();
             sessions.sort_by_key(|a| (a.kind == "shell", !a.status.needs_you(), a.id));
             for a in sessions {
-                let label = if a.kind == "shell" { format!("Terminal #{}", a.id) } else { format!("{} #{} · {}", a.kind, a.id, a.status.label()) };
+                let label = match a.run.last() {
+                    Some(file) if a.kind == "shell" => format!("Editor #{} · {file}", a.id),
+                    _ if a.kind == "shell" => format!("Terminal #{}", a.id),
+                    _ => format!("{} #{} · {}", a.kind, a.id, a.status.label()),
+                };
                 let note = if a.kind == "shell" && a.status == Status::Exited { "Exited · x to remove".into() }
                     else { a.ask.as_ref().map_or_else(|| if a.title.is_empty() { "Open the terminal to continue".into() } else { a.title.clone() }, |q| q.question.clone()) };
                 rows.push((label, note, WorkAct::Agent(a.id)));
             }
+            // the world's structures, each file a row that opens straight in your editor
+            let built = self.survey.worlds.get(key).map(|w| w.structures.clone()).unwrap_or_default();
+            let files: Vec<(Kind, &String)> = built.iter().flat_map(|b| b.files.iter().map(move |f| (b.kind, f))).collect();
+            for &(kind, f) in files.iter().take(RESOURCE_ROWS) {
+                let path = if kind == Kind::Academy { format!("{f}/SKILL.md") } else { f.clone() };
+                rows.push((f.clone(), format!("{} · {} · Enter to edit", kind.name(), kind.about()), WorkAct::Edit(kind, path)));
+            }
+            let more = files.len().saturating_sub(RESOURCE_ROWS);
+            rows.push(match (files.len(), more) {
+                (0, _) => ("Add agent resources".into(), "No AGENTS.md, skills or MCP yet: write a first draft, or brief a ship".into(), WorkAct::Files),
+                (_, 0) => ("Browse or add resources".into(), format!("{} of {} kinds standing · skills, subagents, hooks, MCP and more", built.len(), KINDS.len()), WorkAct::Files),
+                _ => (format!("All resources · {more} more"), format!("{} files in {} kinds · browse, add or brief a ship", files.len(), built.len()), WorkAct::Files),
+            });
             let count = self.anomalies.findings.iter().filter(|f| f.world == key && f.state.active()).count();
             rows.push((format!("Anomalies · {count}"), "Detected problems and reported discoveries".into(), WorkAct::Anomalies));
-            rows.push(("Project resources".into(), "Browse instructions, skills, hooks and MCP files".into(), WorkAct::Files));
         }
         rows
     }
@@ -2753,6 +2865,7 @@ impl App {
                 self.mode = Mode::Brief { planet: key.into(), text: Line::default(), kind: 0, launch: !crewed, attachments: vec![], sending: false };
             }
             WorkAct::Files => self.mode = Mode::Planet(PlanetView::new(key.into())),
+            WorkAct::Edit(_, file) => self.edit(key, file, client, l, t),
             WorkAct::Anomalies => {
                 self.open_anomalies(); self.anomaly_filter.world = Some(key.into());
                 self.mode = Mode::Anomalies { id: self.anomaly_rows().first().map_or(0, |f| f.id), typing: false };
@@ -2849,7 +2962,7 @@ fn handle(
         workspace_input(app, w, l, client, &ev, t); return false;
     }
     if matches!(app.mode, Mode::Planet(_)) {
-        planet_input(app, l, client, &ev);
+        planet_input(app, l, client, &ev, t);
         return false;
     }
 
@@ -4152,6 +4265,7 @@ mod ship_card_tests {
             refit: None,
             wpos: (0.0, 0.0),
             front: true,
+            run: Vec::new(),
         }
     }
 
@@ -4616,7 +4730,7 @@ mod structure_tests {
         handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), 1.0, &mut None);
         draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
         let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
-        assert!(text.contains("Give this planet a task") && text.contains("Open another terminal") && text.contains("Project resources"));
+        assert!(text.contains("Give this planet a task") && text.contains("Open another terminal") && text.contains("RESOURCES") && text.contains("Add agent resources"));
     }
 
     #[test]
@@ -5021,5 +5135,113 @@ mod workspace_tests {
         let w = app.world(1.0, 0.0);
         assert!(w.planet(dir.to_str().unwrap()).is_some());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+    use crate::proto::ScreenView;
+
+    fn quit() -> ScreenView {
+        ScreenView { cols: 80, rows: 24, cursor: (0, 0), hide_cursor: false, lines: vec![], scroll: 0, history: 0, mouse: false, sgr: false, alt: false, version: 9, exited: true }
+    }
+
+    #[test]
+    fn an_empty_plot_lays_a_draft_and_opens_it_in_your_editor() {
+        let dir = std::env::temp_dir().join(format!("empire-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.to_string_lossy().into_owned();
+        let mut app = App::new();
+        let w = app.world(1.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 40), false);
+        let (client, commands) = Client::recording();
+        app.mode = Mode::Planet(PlanetView::new(key.clone()));
+        handle(&mut app, &w, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), 1.0, &mut None);
+        assert!(dir.join("AGENTS.md").is_file(), "Enter on the empty charter plot lays AGENTS.md");
+        let Mode::Planet(v) = &app.mode else { panic!("stays on the world until the editor is up") };
+        assert_eq!(v.path().as_deref(), Some("AGENTS.md"));
+        // with an editor installed it's opened in the world; without one, you're told how to get one
+        let edit = commands.try_iter().find_map(|c| if let Cmd::Edit { cwd, run } = c { Some((cwd, run)) } else { None });
+        match edit {
+            Some((cwd, run)) => assert!(cwd == key && run.len() >= 2 && run.last().map(String::as_str) == Some("AGENTS.md")),
+            None => assert!(app.toast.as_ref().is_some_and(|(m, _)| m.contains("No editor"))),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resources_stand_in_the_workspace_and_open_straight_in_the_editor() {
+        let key = "/home/me/world".to_string();
+        let mut app = App::new();
+        let skills = (0..10).map(|i| format!(".claude/skills/skill-{i}")).collect::<Vec<_>>();
+        app.survey.worlds.entry(key.clone()).or_default().structures = vec![
+            Built { kind: Kind::Charter, count: 1, files: vec!["AGENTS.md".into()] },
+            Built { kind: Kind::Academy, count: 10, files: skills },
+        ];
+        let w = app.world(1.0, 0.0);
+        let rows = app.work_rows(&w, &key);
+        let edits: Vec<_> = rows.iter().filter_map(|r| if let WorkAct::Edit(_, f) = &r.2 { Some(f.as_str()) } else { None }).collect();
+        assert_eq!(edits.len(), RESOURCE_ROWS, "a long list folds into one row");
+        assert_eq!(edits[0], "AGENTS.md");
+        assert_eq!(edits[1], ".claude/skills/skill-0/SKILL.md", "a skill opens its SKILL.md");
+        assert!(rows.iter().any(|r| r.0 == "All resources · 3 more" && matches!(r.2, WorkAct::Files)));
+        assert!(rows.iter().all(|r| !matches!(r.2, WorkAct::Edit(..)) || app.work_group(&key, &r.2) == "RESOURCES"));
+        // shown on the project screen, under its own heading
+        let mut fb = Fb::new(120, 50);
+        let l = Lay::new(&fb, false);
+        let sel = rows.iter().position(|r| matches!(r.2, WorkAct::Edit(..))).unwrap();
+        app.mode = Mode::Workspace { key: key.clone(), sel };
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("RESOURCES") && text.contains("⌂ AGENTS.md") && text.contains("Enter edit in your editor"));
+        // an editor already open on it is reused, and quitting it comes back to the same row
+        let mut editor = ship_card_tests::ship(6, false);
+        (editor.kind, editor.cwd, editor.status, editor.run) = ("shell".into(), key.clone(), Status::Idle, vec!["nvim".into(), "AGENTS.md".into()]);
+        app.agents.push(editor);
+        let (client, _) = Client::recording();
+        let rows = app.work_rows(&w, &key);
+        let sel = rows.iter().position(|r| matches!(&r.2, WorkAct::Edit(_, f) if f == "AGENTS.md")).unwrap();
+        app.mode = Mode::Workspace { key: key.clone(), sel };
+        handle(&mut app, &w, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), 1.0, &mut None);
+        assert!(matches!(app.mode, Mode::Comms(6)));
+        app.screen = Some((6, quit()));
+        assert!(app.editor_quit());
+        app.close_comms(&client, &w);
+        assert!(matches!(&app.mode, Mode::Workspace { key: k, sel: s } if *k == key && *s == sel));
+        assert_eq!(app.rescan, vec![key.clone()], "the survey looks at the world again");
+    }
+
+    #[test]
+    fn an_open_editor_is_reused_and_quitting_it_returns_to_the_file() {
+        let dir = std::env::temp_dir().join(format!("empire-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# old").unwrap();
+        let key = dir.to_string_lossy().into_owned();
+        let mut app = App::new();
+        let mut editor = ship_card_tests::ship(5, false);
+        (editor.kind, editor.cwd, editor.status, editor.run) = ("shell".into(), key.clone(), Status::Idle, vec!["nvim".into(), "AGENTS.md".into()]);
+        app.agents.push(editor);
+        let w = app.world(1.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 40), false);
+        let (client, commands) = Client::recording();
+        app.mode = Mode::Planet(PlanetView::new(key.clone()));
+        handle(&mut app, &w, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)), 1.0, &mut None);
+        assert!(matches!(app.mode, Mode::Comms(5)), "back into the editor already open on it");
+        assert!(!commands.try_iter().any(|c| matches!(c, Cmd::Edit { .. })), "not a second editor on the same file");
+        let mut fb = Fb::new(120, 40);
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        assert!((0..fb.cols as i32).map(|x| fb.txt[1 * fb.cols + x as usize].map_or(' ', |c| c.ch)).collect::<String>().contains("WRITING AGENTS.md"));
+        // the file changes in the editor, then the editor is quit
+        std::fs::write(dir.join("AGENTS.md"), "# new").unwrap();
+        assert!(!app.editor_quit());
+        app.screen = Some((5, quit()));
+        assert!(app.editor_quit());
+        app.close_comms(&client, &w);
+        let Mode::Planet(v) = &app.mode else { panic!("quitting the editor returns to the world's resources") };
+        assert_eq!(v.preview, "# new", "the file is read again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

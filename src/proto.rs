@@ -14,7 +14,13 @@ pub enum Req {
     List,
     /// The agent list, for onlookers (status bars) that shouldn't count as a galaxy being open.
     Peek,
-    Spawn { kind: String, cwd: String },
+    /// `run`: for a shell session, a command to run in place of the shell (an editor on a file).
+    Spawn {
+        kind: String,
+        cwd: String,
+        #[serde(default)]
+        run: Vec<String>,
+    },
     Kill { id: u32 },
     Input { id: u32, data: String },
     Resize { id: u32, cols: u16, rows: u16 },
@@ -134,6 +140,9 @@ pub struct AgentView {
     /// A refit ordered for it, and how it went; `role`/`design`/`spec` stay what's actually aboard.
     #[serde(default)]
     pub refit: Option<RefitState>,
+    /// The command a shell session runs instead of the shell (an editor on a file); empty for none.
+    #[serde(default)]
+    pub run: Vec<String>,
 }
 
 /// A refit ordered for a deployed ship: the outfit it's to get, and where that stands.
@@ -266,6 +275,9 @@ pub struct ScreenView {
     /// Bumped whenever the screen changes; 0 from a daemon that can't wait for changes.
     #[serde(default)]
     pub version: u64,
+    /// Its program has ended (an editor that's been quit).
+    #[serde(default)]
+    pub exited: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
