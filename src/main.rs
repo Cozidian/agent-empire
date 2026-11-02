@@ -6,6 +6,7 @@ mod draw;
 mod game;
 mod gfx;
 mod graphics;
+mod jev;
 mod octant;
 mod proto;
 mod role;
