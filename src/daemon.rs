@@ -13,7 +13,7 @@ use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -170,6 +170,9 @@ struct Agent {
     spec: ShipSpec,
     /// A refit ordered for it; `role` and `spec` stay what it's actually running with.
     refit: Option<RefitState>,
+    /// Screen generation, bumped on every change, and the signal waiting viewers sleep on.
+    version: u64,
+    changed: Arc<Condvar>,
 }
 
 impl Agent {
@@ -407,6 +410,12 @@ impl Agent {
 
     fn refit_is(&self, state: &str) -> bool { self.refit.as_ref().is_some_and(|r| r.state == state) }
 
+    /// The screen changed: wake anyone waiting to see it.
+    fn touch(&mut self) {
+        self.version += 1;
+        self.changed.notify_all();
+    }
+
     fn screen(&self) -> ScreenView {
         let s = self.parser.screen();
         let (rows, cols) = s.size();
@@ -448,6 +457,7 @@ impl Agent {
             mouse: s.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
             sgr: s.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
             alt: s.alternate_screen(),
+            version: self.version,
         }
     }
 }
@@ -581,6 +591,8 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         role: Role::None,
         spec: ShipSpec::default(),
         refit: None,
+        version: 1,
+        changed: Arc::default(),
         status: Status::Booting,
         since: now,
         exited: None,
@@ -669,6 +681,7 @@ fn watch(hub: &Shared, agent: Agent) -> io::Result<Arc<Mutex<Agent>>> {
                     let mut g = a.lock().unwrap();
                     g.parser.process(&buf[..n]);
                     g.last_out = Instant::now();
+                    g.touch();
                     let replies = std::mem::take(&mut g.parser.callbacks_mut().replies);
                     if !replies.is_empty() {
                         let _ = g.writer.write_all(&replies);
@@ -676,7 +689,9 @@ fn watch(hub: &Shared, agent: Agent) -> io::Result<Arc<Mutex<Agent>>> {
                 }
             }
         }
-        a.lock().unwrap().exited = Some(Instant::now());
+        let mut g = a.lock().unwrap();
+        g.exited = Some(Instant::now());
+        g.touch();
     });
     let a = agent.clone();
     thread::spawn(move || {
@@ -1557,13 +1572,18 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                 let (cols, rows) = (cols.clamp(20, 400), rows.clamp(5, 200));
                 g.writer.resize(rows, cols);
                 g.parser.set_size(NonZeroU16::new(rows).unwrap(), NonZeroU16::new(cols).unwrap());
+                g.touch();
                 Resp::Ok
             }
             None => missing(id),
         },
-        Req::Screen { id, scroll } => match get(id) {
+        Req::Screen { id, scroll, since, wait } => match get(id) {
             Some(a) => {
                 let mut g = a.lock().unwrap();
+                if wait > 0 && g.version == since {
+                    let changed = g.changed.clone();
+                    g = changed.wait_timeout_while(g, Duration::from_millis(wait.min(1000)), |g| g.version == since).unwrap().0;
+                }
                 g.parser.screen_mut().set_scrollback(scroll);
                 let screen = g.screen();
                 g.parser.screen_mut().set_scrollback(0);

@@ -23,6 +23,12 @@ pub enum Req {
         id: u32,
         #[serde(default)]
         scroll: usize,
+        /// Hold the reply until the screen has moved past this generation, for at most
+        /// `wait` milliseconds (0 = reply at once): changes stream without polling.
+        #[serde(default)]
+        since: u64,
+        #[serde(default)]
+        wait: u64,
     },
     /// The player looked at this agent: a finished turn is no longer news.
     Seen { id: u32 },
@@ -257,6 +263,9 @@ pub struct ScreenView {
     /// Full-screen app on the alternate screen (no scrollback of its own).
     #[serde(default)]
     pub alt: bool,
+    /// Bumped whenever the screen changes; 0 from a daemon that can't wait for changes.
+    #[serde(default)]
+    pub version: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -362,5 +371,20 @@ mod refit_tests {
         assert!(matches!(r, Req::Refit { id: 3, confirm: false, ref role, ref spec } if role == "builder" && *spec == ShipSpec::default()));
         let r: Req = serde_json::from_str(r#"{"op":"cancel_refit","id":3}"#).unwrap();
         assert!(matches!(r, Req::CancelRefit { id: 3 }));
+    }
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+
+    #[test]
+    fn screen_streaming_talks_to_older_builds_both_ways() {
+        // an older game asks without a version, and must get an answer at once
+        let req: Req = serde_json::from_str(r#"{"op":"screen","id":3,"scroll":2}"#).unwrap();
+        assert!(matches!(req, Req::Screen { id: 3, scroll: 2, since: 0, wait: 0 }));
+        // an older daemon's screen has no version, which tells the game to poll it as before
+        let old = r#"{"type":"screen","screen":{"cols":2,"rows":1,"cursor":[0,0],"hide_cursor":false,"lines":[]}}"#;
+        assert!(matches!(serde_json::from_str::<Resp>(old).unwrap(), Resp::Screen { screen } if screen.version == 0));
     }
 }
