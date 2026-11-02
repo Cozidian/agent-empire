@@ -217,6 +217,30 @@ pub struct Ask {
     /// What it's about (the command, the file, …), a few lines above the question.
     pub context: Vec<String>,
     pub options: Vec<Choice>,
+    /// Jev's risk read on this approval. Advice for the player to see; nothing acts on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskView>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum RiskLevel {
+    Calm,
+    Care,
+    NeedsYou,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RiskView {
+    /// Jev's risk label (`edit_in_project`, …), or `needs_you` when the denylist forced it.
+    pub label: String,
+    pub probability: f32,
+    pub level: RiskLevel,
+    /// Jev's probability that it touches something outside the project or can't be undone.
+    #[serde(default)]
+    pub outside: Option<f32>,
+    /// Why, when the denylist decided.
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
