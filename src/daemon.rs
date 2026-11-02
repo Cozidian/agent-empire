@@ -284,16 +284,20 @@ impl Agent {
         }
         context.reverse();
         let mut options = Vec::new();
+        let mut detail = Vec::new();
         for l in &lines[qi + 1..] {
             if let Some((n, label)) = option(l) {
                 options.push(Choice { key: n.into(), label: label.into() });
+            } else if options.is_empty() && !l.is_empty() && !l.to_lowercase().starts_with("environment:") {
+                // between the question and its choices: what it wants to run, and why
+                detail.push(l.clone());
             }
         }
         if options.is_empty() && (q.contains("(y/n)") || q.contains("[y/n]")) {
             options = vec![Choice { key: "y\r".into(), label: "Yes".into() }, Choice { key: "n\r".into(), label: "No".into() }];
         }
         let question = lines[qi].clone();
-        Some(Ask { question, context, options })
+        Some(Ask { question, context, options, detail })
     }
 
     /// A path as the agent named it, made absolute against its world.
@@ -2143,6 +2147,8 @@ Press enter to confirm or esc to cancel\r\n\
         let ask = a.ask().unwrap();
         assert!(ask.options.len() >= 3, "{:?}", ask.options);
         assert!(ask.options.iter().any(|o| o.label.to_lowercase().contains("proceed")));
+        assert_eq!(ask.detail.len(), 2, "{:?}", ask.detail);
+        assert!(ask.detail[1].starts_with("$ pnpm test --runInBand"), "{:?}", ask.detail);
     }
 }
 
