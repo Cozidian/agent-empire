@@ -2348,6 +2348,8 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
     let mut last_cue = Instant::now() - Duration::from_secs(10);
     let survey = survey::Survey::start();
     let mut surveyed = Instant::now() - Duration::from_secs(10);
+    // messages picked up while waiting for the next frame
+    let mut pending: Vec<Msg> = Vec::new();
 
     loop {
         let now = Instant::now();
@@ -2359,7 +2361,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             app.sectors = app.workspace.sectors(&projects); app.projects = projects; app.discovering = None; app.fitted = false;
         }
         let mut cues = Vec::new();
-        while let Ok(m) = client.rx.try_recv() {
+        for m in std::mem::take(&mut pending).into_iter().chain(client.rx.try_iter()) {
             match m {
                 Msg::MissionResult(result) => {
                     match result {
@@ -2383,7 +2385,9 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                     app.err = e;
                 }
                 Msg::Screen(id, s) => {
-                    if app.talking_to() == Some(id) {
+                    // two fetchers may cross in flight; never step back to an older frame of the same view
+                    let older = app.screen.as_ref().is_some_and(|(i, o)| *i == id && o.scroll == s.scroll && s.version < o.version);
+                    if app.talking_to() == Some(id) && !older {
                         app.screen = Some((id, s));
                     }
                 }
@@ -2522,9 +2526,24 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         draw::frame(&mut fb, &mut app, &world, &lay, t, sound);
         out.present(&fb, o)?;
 
-        let el = now.elapsed();
-        if el < budget {
-            std::thread::sleep(budget - el);
+        let deadline = now + budget;
+        if app.talking_to().is_none() {
+            if let Some(rest) = deadline.checked_duration_since(Instant::now()) {
+                std::thread::sleep(rest);
+            }
+            continue;
+        }
+        // in comms, wake at once for a keypress or a fresh screen instead of sleeping out the frame
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || event::poll(left.min(Duration::from_millis(2)))? {
+                break;
+            }
+            let before = pending.len();
+            pending.extend(client.rx.try_iter());
+            if pending[before..].iter().any(|m| matches!(m, Msg::Screen(..))) {
+                break;
+            }
         }
     }
 }

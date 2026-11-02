@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub enum Msg {
     MissionResult(Result<(), String>),
@@ -38,6 +38,8 @@ pub struct Client {
     tx: Sender<Cmd>,
     watch: Arc<Mutex<Option<u32>>>,
     scroll: Arc<AtomicUsize>,
+    /// Ask for the watched screen right away.
+    kick: Sender<()>,
 }
 
 impl Client {
@@ -50,7 +52,7 @@ impl Client {
     pub fn recording() -> (Self, Receiver<Cmd>) {
         let (events, rx) = mpsc::channel();
         let (tx, commands) = mpsc::channel();
-        (Self { rx, tx, events, watch: Arc::default(), scroll: Arc::default() }, commands)
+        (Self { rx, tx, events, watch: Arc::default(), scroll: Arc::default(), kick: mpsc::channel().0 }, commands)
     }
 
     pub fn start() -> Self {
@@ -84,30 +86,76 @@ impl Client {
             }
         });
 
-        // live screen of the agent in the comms window
+        // live screen of the agent in the comms window: the daemon holds each request until
+        // the screen changes, so output shows the moment it lands rather than on the next poll
         let (m, w, sc) = (mtx.clone(), watch.clone(), scroll.clone());
         thread::spawn(move || {
             let mut conn: Option<Conn> = None;
+            // (agent, scroll, version) of the last screen delivered
+            let mut seen: Option<(u32, usize, u64)> = None;
             loop {
                 let Some(id) = *w.lock().unwrap() else {
-                    thread::sleep(Duration::from_millis(50));
+                    seen = None;
+                    thread::sleep(Duration::from_millis(20));
                     continue;
+                };
+                let scroll = sc.load(Relaxed);
+                let since = match seen {
+                    Some((i, s, v)) if i == id && s == scroll => v,
+                    _ => 0,
                 };
                 if conn.is_none() {
                     conn = Conn::open().ok();
                 }
-                if let Some(c) = conn.as_mut() {
-                    match c.call(&Req::Screen { id, scroll: sc.load(Relaxed) }) {
-                        Ok(Resp::Screen { screen }) => {
+                let Some(c) = conn.as_mut() else {
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                };
+                let asked = Instant::now();
+                match c.call(&Req::Screen { id, scroll, since, wait: 250 }) {
+                    Ok(Resp::Screen { screen }) => {
+                        let version = screen.version;
+                        // you moved on while this one waited: a fresher request follows
+                        if *w.lock().unwrap() == Some(id) && sc.load(Relaxed) == scroll {
+                            seen = Some((id, scroll, version));
                             if m.send(Msg::Screen(id, screen)).is_err() {
                                 return;
                             }
                         }
-                        Ok(_) => {}
-                        Err(_) => conn = None,
+                        // an older daemon answers at once, so poll it as before; otherwise cap at ~120 updates a second
+                        let gap = Duration::from_millis(if version == 0 { 33 } else { 8 });
+                        if let Some(rest) = gap.checked_sub(asked.elapsed()) {
+                            thread::sleep(rest);
+                        }
                     }
+                    Ok(_) => thread::sleep(Duration::from_millis(33)),
+                    Err(_) => conn = None,
                 }
-                thread::sleep(Duration::from_millis(33));
+            }
+        });
+
+        // a screen at once when you open comms or scroll, without waiting out the stream's long poll
+        let (m, w, sc) = (mtx.clone(), watch.clone(), scroll.clone());
+        let (kick, kicks) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let mut conn: Option<Conn> = None;
+            while kicks.recv().is_ok() {
+                while kicks.try_recv().is_ok() {}
+                let Some(id) = *w.lock().unwrap() else { continue };
+                let scroll = sc.load(Relaxed);
+                if conn.is_none() {
+                    conn = Conn::open().ok();
+                }
+                let Some(c) = conn.as_mut() else { continue };
+                match c.call(&Req::Screen { id, scroll, since: 0, wait: 0 }) {
+                    Ok(Resp::Screen { screen }) if *w.lock().unwrap() == Some(id) && sc.load(Relaxed) == scroll => {
+                        if m.send(Msg::Screen(id, screen)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => conn = None,
+                }
             }
         });
 
@@ -162,7 +210,7 @@ impl Client {
             }
         });
 
-        Self { rx, tx, events, watch, scroll }
+        Self { rx, tx, events, watch, scroll, kick }
     }
 
 
@@ -188,10 +236,13 @@ impl Client {
     pub fn watch(&self, id: Option<u32>) {
         *self.watch.lock().unwrap() = id;
         self.scroll.store(0, Relaxed);
+        let _ = self.kick.send(());
     }
 
     /// Look this many lines back into the watched agent's history.
     pub fn scroll(&self, lines: usize) {
-        self.scroll.store(lines, Relaxed);
+        if self.scroll.swap(lines, Relaxed) != lines {
+            let _ = self.kick.send(());
+        }
     }
 }
