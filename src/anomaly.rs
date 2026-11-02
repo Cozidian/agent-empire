@@ -33,10 +33,39 @@ pub struct Finding {
     pub history: Vec<Event>,
     #[serde(default)]
     pub missions: Vec<u32>,
+    /// How serious Jev judged a free-text report, on the levels 0 info, 1 low, 2 high, 3 critical
+    /// (an expected value, so it can fall between levels). Absent in books written before it
+    /// existed, and for everything but reports, which use `kind_severity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<f32>,
+}
+
+/// The severity levels Jev scores a report on, lowest first.
+pub const LEVELS: [&str; 4] = ["info", "low", "high", "critical"];
+
+/// Severity by kind: what findings get when Jev is off, unsure or has not answered yet. CI
+/// failures, merge conflicts and uncrewed moons use this only. The map keeps today's order:
+/// everything that reaches the attention list ranks as "low", as it did with a fixed rank.
+pub fn kind_severity(kind: &str) -> f32 {
+    match kind {
+        "CI" => 2.0,
+        "Git" | "Moon" | "Report" => 1.0,
+        _ => 1.0,
+    }
+}
+
+/// Where a severity sits in the attention list (lower is more urgent): critical 2, high 3,
+/// low 4 (what every anomaly used to get), info 5. It only reorders; nothing is hidden by it.
+pub fn rank_for(severity: f32) -> u8 {
+    let level = if severity.is_finite() { severity.round().clamp(0.0, 3.0) as u8 } else { 1 };
+    5 - level
 }
 
 impl Finding {
     pub fn tag(&self) -> String { format!("[anomaly #{}]", self.id) }
+    /// Jev's score for a report, else the kind's plain severity.
+    pub fn effective_severity(&self) -> f32 { self.severity.unwrap_or_else(|| kind_severity(&self.kind)) }
+    pub fn rank(&self) -> u8 { rank_for(self.effective_severity()) }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -62,6 +91,8 @@ impl Book {
             if o.present {
                 if f.evidence != o.evidence || f.title != o.title {
                     f.history.push(Event { at: o.at, note: format!("Evidence updated; previous observation: {}\n{}", f.title, f.evidence) });
+                    // new evidence, so any earlier severity no longer applies
+                    f.severity = None;
                 }
                 f.title = o.title;
                 f.evidence = o.evidence;
@@ -72,7 +103,7 @@ impl Book {
             let id = self.findings.iter().map(|f| f.id).max().unwrap_or(0) + 1;
             let system = std::path::Path::new(&o.host).parent().unwrap_or(std::path::Path::new("/")).to_string_lossy().into_owned();
             self.findings.push(Finding { id, key: o.key, world: o.world, host: o.host, system, kind: o.kind, title: o.title, evidence: o.evidence,
-                first: o.at, last: o.at, present: true, state: State::Open, history: vec![Event { at: o.at, note: "Discovered".into() }], missions: vec![] });
+                first: o.at, last: o.at, present: true, state: State::Open, history: vec![Event { at: o.at, note: "Discovered".into() }], missions: vec![], severity: None });
         }
     }
     pub fn set_state(&mut self, id: u64, state: State, at: i64) {
@@ -153,6 +184,46 @@ mod tests {
         b.observe(o);
         assert_eq!(b.findings[0].evidence, "New evidence");
         assert!(b.findings[0].history.iter().any(|e| e.note.contains("Fix login")));
+    }
+    #[test]
+    fn old_books_without_severity_still_load() {
+        let old = r#"{"findings":[{"id":1,"key":"report:x","world":"/w","host":"/w","system":"/","kind":"Report","title":"t","evidence":"e",
+            "first":1,"last":1,"present":true,"state":"open","history":[]}]}"#;
+        let book: Book = serde_json::from_str(old).unwrap();
+        assert_eq!(book.findings[0].severity, None);
+        assert_eq!(book.findings[0].effective_severity(), 1.0);
+        // unset severity is not written, so books stay readable by older builds
+        assert!(!serde_json::to_string(&book).unwrap().contains("severity"));
+        let mut scored = book.clone();
+        scored.findings[0].severity = Some(2.4);
+        let back: Book = serde_json::from_str(&serde_json::to_string(&scored).unwrap()).unwrap();
+        assert_eq!(back.findings[0].severity, Some(2.4));
+    }
+    #[test]
+    fn severity_ranks_the_attention_list_and_kinds_keep_todays_order() {
+        // the kind map reproduces the old fixed rank 4 for everything that reaches the list
+        for kind in ["Git", "Moon", "Report", "Whatever"] { assert_eq!(rank_for(kind_severity(kind)), 4, "{kind}"); }
+        assert_eq!([0.0, 1.0, 2.0, 3.0].map(rank_for), [5, 4, 3, 2]);
+        assert_eq!([0.4, 0.6, 1.49, 2.51, 9.0, -3.0].map(rank_for), [5, 4, 4, 2, 2, 5], "between levels rounds to the nearest; out of range is clamped");
+        assert_eq!(rank_for(f32::NAN), 4);
+        let mut b = Book::default();
+        b.observe(observation(10, true));
+        assert_eq!(b.findings[0].kind, "CI");
+        assert_eq!(b.findings[0].rank(), 3, "CI falls back to its kind");
+        b.findings[0].severity = Some(2.9);
+        assert_eq!(b.findings[0].rank(), 2, "a score wins over the kind");
+    }
+    #[test]
+    fn new_evidence_clears_a_stale_severity() {
+        let mut b = Book::default();
+        b.observe(observation(10, true));
+        b.findings[0].severity = Some(3.0);
+        b.observe(observation(20, true));
+        assert_eq!(b.findings[0].severity, Some(3.0), "same evidence keeps it");
+        let mut o = observation(30, true);
+        o.evidence = "Something else".into();
+        b.observe(o);
+        assert_eq!(b.findings[0].severity, None);
     }
     #[test]
     fn worlds_do_not_share_findings() {

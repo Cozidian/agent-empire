@@ -615,6 +615,8 @@ pub struct App {
     pub sectors: crate::sector::Book,
     pub sector_focus: Option<u64>,
     pub anomalies: crate::anomaly::Book,
+    /// Fills in report severities in the background when Jev is on.
+    pub severity: crate::severity::Scorer,
     pub anomaly_filter: crate::anomaly::Filter,
     pub anomaly_detail: usize,
     pub anomaly_error: String,
@@ -878,6 +880,7 @@ impl App {
             sectors: Default::default(),
             sector_focus: None,
             anomalies: Default::default(),
+            severity: crate::severity::Scorer::new(),
             anomaly_filter: Default::default(),
             anomaly_detail: 0,
             anomaly_error: String::new(),
@@ -1924,7 +1927,7 @@ impl App {
             }
         }
         for f in self.anomalies.findings.iter().filter(|f| f.state == crate::anomaly::State::Open && f.kind != "CI") {
-            rows.push(Attention { id: format!("anomaly:{}", f.id), world: f.world.clone(), kind: "Anomaly", title: f.title.clone(), detail: f.evidence.clone(), target: AttentionTarget::Anomaly(f.id), rank: 4 });
+            rows.push(Attention { id: format!("anomaly:{}", f.id), world: f.world.clone(), kind: "Anomaly", title: f.title.clone(), detail: f.evidence.clone(), target: AttentionTarget::Anomaly(f.id), rank: f.rank() });
         }
         rows.sort_by(|a, b| (a.rank, &a.world, &a.id).cmp(&(b.rank, &b.world, &b.id)));
         rows
@@ -1956,6 +1959,15 @@ impl App {
                 if self.anomaly_error != msg { self.say(Ev::Error, msg.clone(), RED); }
                 self.anomaly_error = msg;
             }
+        }
+    }
+
+    /// Reports get a severity from Jev, a couple at a time, without waiting on it.
+    fn score_reports(&mut self) {
+        if !self.severity.enabled { return; }
+        let scores = self.severity.step(&self.anomalies.findings, crate::severity::ask_jev);
+        if !scores.is_empty() {
+            self.edit_anomalies(|book| crate::severity::apply(book, &scores));
         }
     }
 
@@ -2432,6 +2444,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         if let Some(rx) = &app.discovering && let Ok(projects) = rx.try_recv() {
             app.sectors = app.workspace.sectors(&projects); app.projects = projects; app.discovering = None; app.fitted = false;
         }
+        app.score_reports();
         let mut cues = Vec::new();
         for m in std::mem::take(&mut pending).into_iter().chain(client.rx.try_iter()) {
             match m {
@@ -4877,6 +4890,26 @@ mod anomaly_tests {
         key(&mut app, &w, &l, KeyCode::Char('o'));
         assert_eq!(app.anomalies.findings[0].state, State::Open);
         assert!(text(&mut app, &w, 80, 24).contains("ANOMALIES"));
+    }
+
+    #[test]
+    fn a_reports_severity_orders_the_attention_list_and_unscored_ones_rank_as_before() {
+        let (mut app, w, _l) = fixture();
+        for (i, title) in ["quiet note", "disk is full", "unscored"].iter().enumerate() {
+            app.anomalies.observe(Observation { key: format!("report:{i}"), world: "/alpha/api".into(), host: "/alpha/api".into(), kind: "Report".into(),
+                title: (*title).into(), evidence: "e".into(), at: 100, present: true });
+        }
+        let id = |app: &App, title: &str| app.anomalies.findings.iter().find(|f| f.title == title).unwrap().id;
+        let (quiet, full) = (id(&app, "quiet note"), id(&app, "disk is full"));
+        for f in &mut app.anomalies.findings {
+            if f.id == quiet { f.severity = Some(0.2); }
+            if f.id == full { f.severity = Some(2.8); }
+        }
+        let rows = app.attention(&w);
+        let rank = |t: &str| rows.iter().find(|r| r.title == t).map(|r| r.rank).unwrap();
+        assert_eq!((rank("disk is full"), rank("unscored"), rank("Unresolved merge conflicts"), rank("quiet note")), (2, 4, 4, 5));
+        let order: Vec<&str> = rows.iter().filter(|r| r.kind == "Anomaly").map(|r| r.title.as_str()).collect();
+        assert_eq!(order, ["disk is full", "Unresolved merge conflicts", "unscored", "quiet note"]);
     }
 
     #[test]
