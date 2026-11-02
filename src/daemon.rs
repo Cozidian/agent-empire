@@ -293,7 +293,10 @@ impl Agent {
             options = vec![Choice { key: "y\r".into(), label: "Yes".into() }, Choice { key: "n\r".into(), label: "No".into() }];
         }
         let question = lines[qi].clone();
-        Some(Ask { question, context, options })
+        let mut ask = Ask { question, context, options, risk: None };
+        // advice only: a badge for the player. Nothing here ever answers, and launches still never skip permissions
+        ask.risk = crate::triage::assess(&ask, &crate::game::base_name(&self.cwd), &self.kind);
+        Some(ask)
     }
 
     /// A path as the agent named it, made absolute against its world.
@@ -1577,6 +1580,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             Some(a) => {
                 let mut g = a.lock().unwrap();
                 let before = g.question();
+                if let Some(ask) = g.ask() { crate::triage::record_choice(&ask, &key); }
                 g.answered = before.clone();
                 if g.hook == Some(Status::Blocked) {
                     g.hook = None;

@@ -1499,6 +1499,15 @@ fn transmission(fb: &mut Fb, app: &App, l: &Lay, t: f32) {
         body.push((trunc(c, inner), DIM));
     }
     body.push((trunc(&q.question, inner), TEXT));
+    if let Some(risk) = &q.risk {
+        // Advisor's read (or the denylist's): advice for you, never an answer
+        let c = match risk.level {
+            crate::proto::RiskLevel::Calm => v3(0.45, 0.9, 0.55),
+            crate::proto::RiskLevel::Care => v3(1.0, 0.8, 0.3),
+            crate::proto::RiskLevel::NeedsYou => Status::Blocked.color(),
+        };
+        body.push((trunc(&format!("⚑ {}", risk.line()), inner), c));
+    }
     body.push((String::new(), DIM));
     let height = body.len() as i32 + q.options.len().min(9) as i32 + 3;
     let x = (cw - width) / 2;
