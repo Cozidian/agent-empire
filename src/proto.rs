@@ -10,7 +10,7 @@ use std::time::Duration;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Req {
     Ping,
-    CampaignReport { token: String, report: crate::expedition::Report },
+    CampaignReport { token: String, report: serde_json::Value },
     List,
     /// The agent list, for onlookers (status bars) that shouldn't count as a galaxy being open.
     Peek,
@@ -95,6 +95,9 @@ pub struct AgentView {
     pub kind: String,
     pub cwd: String,
     pub title: String,
+    /// Recent terminal output for a handoff; older daemons omit it.
+    #[serde(default)]
+    pub output: String,
     /// The last prompt it was given (typed in comms, a mission, a fleet order).
     #[serde(default)]
     pub task: String,

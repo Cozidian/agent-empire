@@ -119,6 +119,7 @@ impl Role {
     }
 
     /// Whether launching this species read-only is enforced, not just asked for.
+    #[cfg(test)]
     pub fn enforced(self, kind: &str) -> bool {
         self == Role::Scout && matches!(kind, "claude" | "codex" | "grok")
     }

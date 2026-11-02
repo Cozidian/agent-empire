@@ -2,7 +2,7 @@
 //! terminal (text cells).
 
 use crate::game::*;
-use crate::role::{ROLES, Role};
+use crate::role::Role;
 use crate::gfx::*;
 use crate::sound::Sound;
 use crate::structure::KINDS;
@@ -23,6 +23,7 @@ const TERM_BG: V3 = v3(0.043, 0.059, 0.102);
 
 pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Option<&Sound>) {
     fb.clear_text();
+    if let Mode::Workspace { key, sel } = &app.mode { workspace(fb, app, w, key, *sel, l, t); return; }
     if let Mode::Planet(v) = &app.mode {
         planet_view(fb, app, w, v, l, t);
         return;
@@ -40,7 +41,6 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     }
     build_bg(app, fb, l);
     fb.px.copy_from_slice(&app.bg);
-    hyperlane_map(fb, app, w, l);
     galaxy(fb, app, w, l, t);
     bloom(fb, 0.5, 0.7);
     labels(fb, app, w, l, t);
@@ -63,10 +63,14 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         }
     }
     match &app.mode {
+        Mode::Root(text) => {
+            let (x, y, width, height) = centered(l, 76, 9);
+            frame_box(fb, x, y, width, height, "HOME · PROJECT ROOT", v3(0.5, 0.85, 1.0));
+            seg(fb, x + 3, y + 2, "Git repositories become planets; folders become sectors.", width - 6, DIM, Some(BOX));
+            field(fb, x + 3, y + 4, width - 6, text, TEXT, t);
+            seg(fb, x + 3, y + 7, "Enter discover · Esc cancel", width - 6, DIM, Some(BOX));
+        }
         Mode::Commander => commander(fb, app, w, l),
-        Mode::Sectors => sectors(fb, app, w, l, t),
-        Mode::Hyperlanes => hyperlanes(fb, app, w, l, t),
-        Mode::Campaigns => campaigns(fb, app, w, l, t),
         Mode::Anomalies { id, typing } => anomalies(fb, app, l, *id, *typing),
         Mode::Trade { sel } => trade_overview(fb, app, w, l, *sel, t),
         Mode::Situation { id, typing } => situation(fb, app, w, l, *id, *typing, t),
@@ -74,18 +78,11 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
         Mode::Deploy { planet, kind } => deploy(fb, app, planet, *kind, l),
         Mode::Confirm { id } => confirm(fb, app, *id, l),
         Mode::Ship { id, sel } => ship_card(fb, app, *id, *sel, l, t),
-        Mode::ShipRefit { id, sel, confirm } => ship_refit(fb, app, *id, *sel, *confirm, l),
         Mode::Help => help(fb, l),
-        Mode::Brief { planet, text, kind, launch, role, to, attachments, sending, ship } => brief(fb, app, planet, text, *kind, (*launch, *role, *to), attachments, *sending, ship, l, t),
-        Mode::Refit(v) => refit(fb, app, v, l, t),
-        Mode::Shipyard(v) => shipyard(fb, app, v, l, t),
-        Mode::Fleet { target, text } => fleet_order(fb, app, w, target, text, l, t),
-        Mode::Moon { planet, branch, kind } => moon(fb, app, planet, branch, *kind, l, t),
+        Mode::Brief { planet, text, kind, launch, attachments, sending } => brief(fb, app, planet, text, *kind, *launch, attachments, *sending, l, t),
         Mode::Actions { planet, sel } => actions(fb, app, planet, *sel, l),
         Mode::Build { planet, sel } => build_menu(fb, app, planet, *sel, l),
         Mode::Log { world, sel, open } => mission_log(fb, app, world, *sel, open, l, t),
-        Mode::Dock { moon } => dock(fb, app, moon, l),
-        Mode::Chat { id, text, attachments, sending } => chat(fb, app, *id, text, attachments, *sending, l, t),
         _ => {}
     }
     if !app.online {
@@ -339,6 +336,14 @@ fn ship(fb: &mut Fb, a: &Agent, (x, y): (f32, f32), z: f32, t: f32) {
     }
     let s = z.clamp(0.7, 2.2) * grow;
     let col = a.status.color();
+    if a.kind == "shell" {
+        let c = kind_color("shell");
+        fb.line(x - 3.0 * s, y - 2.0 * s, x + 3.0 * s, y - 2.0 * s, c, c);
+        fb.line(x - 3.0 * s, y + 2.0 * s, x + 3.0 * s, y + 2.0 * s, c, c);
+        fb.line(x - 3.0 * s, y - 2.0 * s, x - 3.0 * s, y + 2.0 * s, c, c);
+        fb.line(x + 3.0 * s, y - 2.0 * s, x + 3.0 * s, y + 2.0 * s, c, c);
+        fb.splat(x - s, y, v3(0.45, 0.9, 0.7)); return;
+    }
     match a.status {
         Status::Working => {
             orb(fb, x, y, 0.9 * s, col * (0.9 + 0.3 * (t * 6.0 + a.seed * 9.0).sin()));
@@ -388,7 +393,7 @@ fn star(fb: &mut Fb, (x, y): (f32, f32), r: f32, seed: u32, col: V3, t: f32) {
 /// A calm system map at distances where full-size ship effects would overlap.
 fn galaxy_overview(fb: &mut Fb, app: &App, w: &World, l: &Lay) {
     let scr = |p| l.to_screen(&app.cam, p);
-    for &(i, j) in w.lanes.iter().filter(|_| !app.dependencies) {
+    for &(i, j) in w.lanes.iter() {
         let (a, b) = (scr(w.systems[i].wpos), scr(w.systems[j].wpos));
         fb.line(a.0, a.1, b.0, b.1, v3(0.025, 0.055, 0.08), v3(0.025, 0.055, 0.08));
     }
@@ -529,7 +534,6 @@ pub fn sector_labels(app: &App, w: &World, l: &Lay) -> Vec<OverviewLabel> {
         entries.push((true, true, Sel::Planet(p.key.clone()), p.wpos, vec![(p.name.clone(), DIM)]));
     }
     if let Some(pos) = w.station { entries.push((true, true, Sel::GitHub, pos, vec![("GITHUB".into(), DIM)])); }
-    entries.extend(lane_entries(app, w, l));
     place_map_labels(app, l, entries)
 }
 
@@ -570,7 +574,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     let z = cam.z;
     let scr = |p: (f32, f32)| l.to_screen(cam, p);
 
-    for &(i, j) in w.lanes.iter().filter(|_| !app.dependencies) {
+    for &(i, j) in w.lanes.iter() {
         let (a, b) = (scr(w.systems[i].wpos), scr(w.systems[j].wpos));
         fb.line(a.0, a.1, b.0, b.1, v3(0.03, 0.08, 0.11), v3(0.03, 0.08, 0.11));
         let s = fract(t * 0.12 + (i * 7 + j * 3) as f32 * 0.13);
@@ -703,7 +707,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         Some(Sel::Agent(id)) => app.agent(*id).map(|a| (a.wpos, 6.0 * z.clamp(0.7, 2.2) + 2.0)),
         Some(Sel::Planet(k)) => w.planet(k).map(|p| (p.wpos, (p.r * z).max(2.5) + 6.0)),
         Some(Sel::Sys(k)) => w.systems.iter().find(|s| &s.key == k).map(|s| (s.wpos, (8.0 * z).max(2.2) + 8.0)),
-        Some(Sel::Sector(_, _) | Sel::Lane(_)) | None => None,
+        Some(Sel::Sector(_, _)) | None => None,
     };
     if let Some((p, rr)) = target {
         let (x, y) = scr(p);
@@ -942,12 +946,6 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         }
         return;
     }
-    if app.dependencies {
-        for label in sector_labels(app, w, l) {
-            for (i, (text, col)) in label.lines.iter().enumerate() { fb.text(label.col, label.row + i as i32, text, *col); }
-        }
-        return;
-    }
     let cam = &app.cam;
     let z = cam.z;
     let cw = l.cols - l.pw;
@@ -1026,7 +1024,7 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
 fn top_bar(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     fb.panel(0, 0, l.cols, 1, BAR);
-    let title = if app.dependencies { " ◆ EMPIRE · DEPENDENCIES " } else if app.sector_map() { " ◆ AGENT EMPIRE · SECTORS " } else { " ◆ AGENT EMPIRE " };
+    let title = if app.sector_map() { " ◆ AGENT EMPIRE · SECTORS " } else { " ◆ AGENT EMPIRE " };
     for (k, ch) in title.chars().enumerate() {
         fb.put_bg(k as i32, 0, ch, hsv(0.52 + k as f32 * 0.015 - t * 0.04, 0.45, 1.0), Some(BAR));
     }
@@ -1375,18 +1373,12 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         && let Some(s) = w.systems.iter().find(|s| &s.key == k)
     {
         (format!("✶ {} SYSTEM", s.name.to_uppercase()), tilde(&s.key), s.star, system_rows(app, w, s, t))
-    } else if let Some(Sel::Lane(id)) = &app.sel
-        && let Some(lane) = app.hyperlanes.lanes.iter().find(|p| p.id == *id)
-    {
-        (format!("⇢ {}", lane.label), "Source → destination · charted by you".into(), LANE, vec![
-            ("from", vec![(tilde(&lane.from), TEXT)]), ("to", vec![(tilde(&lane.to), TEXT)]), ("inspect", vec![("⏎ details and editing · h hide connections".into(), DIM)]),
-        ])
     } else if let Some(Sel::Sector(id, system)) = &app.sel
         && let Some(g) = app.sectors.sectors.iter().find(|g| g.id == *id)
     {
         let stats = app.sector_stats(g);
         (format!("▱ {} SECTOR", g.name.to_uppercase()), format!("{} · {} worlds across the galaxy", base_name(system), stats.worlds), sector_color(*id), vec![
-            ("fleet", vec![(stats.activity(), TEXT)]), ("work", vec![(stats.work(), DIM)]), ("browse", vec![("⏎ zoom into these worlds · V manage sectors".into(), TEXT)]),
+            ("fleet", vec![(stats.activity(), TEXT)]), ("work", vec![(stats.work(), DIM)]), ("browse", vec![("⏎ zoom into these worlds".into(), TEXT)]),
         ])
     } else if app.sel == Some(Sel::GitHub) {
         let projects = app.trade_rows(w).iter().filter(|r| r.pr.is_none()).count();
@@ -1464,7 +1456,7 @@ pub fn commander_button(app: &App, w: &World) -> String {
     format!(" C commander ({}) ", app.attention(w).len())
 }
 
-fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
+fn footer(fb: &mut Fb, app: &App, _w: &World, l: &Lay, sound: Option<&Sound>) {
     fb.panel(0, l.rows - 1, l.cols, 1, BAR);
     let mute = match sound {
         None => "",
@@ -1477,17 +1469,12 @@ fn footer(fb: &mut Fb, app: &App, w: &World, l: &Lay, sound: Option<&Sound>) {
         Some(_) => "· M music on ",
     };
     let ctx = match &app.sel {
-        Some(Sel::Agent(id)) if app.agent(*id).is_some_and(|a| !a.war.is_empty()) => "⏎ ship card · P give priority · L missions · x decommission · ",
-        Some(Sel::Agent(_)) => "⏎ ship card · t mission · L missions · e deploy here · x decommission · ",
-        Some(Sel::Planet(k)) if app.moon_host(k).is_some() => "⏎ land · t mission · L missions · D dock · e deploy here · ",
-        Some(Sel::Planet(_)) => "⏎ land · r needs · t mission · B build · L missions · b fleet · u moon · e deploy · ",
-        Some(Sel::Sys(_)) => "⏎ zoom in · b fleet order · ",
-        Some(Sel::Sector(_, _)) => "⏎ zoom into sector · ",
-        Some(Sel::Lane(_)) => "⏎ inspect link · f focus · ",
-        Some(Sel::GitHub) => "⏎ projects and pull requests · ",
-        None => "",
+        Some(Sel::Planet(_)) => "Enter project · t task · e agent · ",
+        Some(Sel::Agent(_)) => "Enter terminal · x dismiss · ",
+        Some(Sel::GitHub) => "Enter pull requests · ",
+        _ => "",
     };
-    let s = format!("{}{music}· O campaigns · H links · h overlay · V sectors · A anomalies · {ctx}n colonize · ⇥ next alert · ↑↓ select · wasd/drag pan · ± zoom · z fit{mute} · ? help · q quit", commander_button(app, w));
+    let s = format!("{ctx}H home · n folder · Tab next alert · A anomalies · ? help · q leave {music}{mute}");
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1568,7 +1555,6 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 let shown = if n > room { format!("…{}", path.chars().skip(n + 1 - room).collect::<String>()) } else { path };
                 seg(fb, x, row, &shown, room as i32, DIM * 0.7, Some(bg));
             }
-            Sel::Lane(_) => {}
             Sel::Sector(id, _) => {
                 if let Some(g) = app.sectors.sectors.iter().find(|g| g.id == *id) { seg(fb, c0 + 1, row, &format!("▱ {}", g.name), inner as i32 - 1, sector_color(*id), Some(bg)); }
             }
@@ -1667,10 +1653,10 @@ fn species(fb: &mut Fb, app: &App, x: i32, y: i32, kind: usize) {
     seg(fb, c, y, " ▶", 2, DIM, Some(BOX));
 }
 
-fn colonize(fb: &mut Fb, app: &App, c: &Colonize, l: &Lay, t: f32) {
+fn colonize(fb: &mut Fb, _app: &App, c: &Colonize, l: &Lay, t: f32) {
     let (x, y, w, h) = centered(l, 72, 17);
     let accent = v3(0.45, 0.85, 1.0);
-    frame_box(fb, x, y, w, h, "◆ COLONIZE A NEW WORLD", accent);
+    frame_box(fb, x, y, w, h, "◆ ADD A PROJECT FOLDER", accent);
     seg(fb, x + 3, y + 2, "Type a path: fuzzy matches ignore case. Or name a new folder.", w - 6, DIM, Some(BOX));
     let row = y + 4;
     let x1 = seg(fb, x + 3, row, "› ", 2, accent, Some(BOX));
@@ -1687,7 +1673,7 @@ fn colonize(fb: &mut Fb, app: &App, c: &Colonize, l: &Lay, t: f32) {
     }
     let exists = std::path::Path::new(&expand_path(&c.path.s)).is_dir();
     if c.comps.is_empty() {
-        let (m, col) = if exists { ("an established world — agents will join its orbit", v3(0.4, 0.9, 0.6)) } else { ("✦ uncharted space — this folder will be created", v3(1.0, 0.8, 0.4)) };
+        let (m, col) = if exists { ("an existing folder — add it to your galaxy", v3(0.4, 0.9, 0.6)) } else { ("✦ uncharted space — this folder will be created", v3(1.0, 0.8, 0.4)) };
         seg(fb, x + 5, row + 2, m, w - 8, col, Some(BOX));
     }
     let selected = c.comp_i.saturating_sub(1) % c.comps.len().max(1);
@@ -1696,13 +1682,13 @@ fn colonize(fb: &mut Fb, app: &App, c: &Colonize, l: &Lay, t: f32) {
         let hot = c.comp_i > 0 && (c.comp_i - 1) % c.comps.len() == k;
         seg(fb, x + 5, row + 2 + (k - first) as i32, &trunc(comp, (w - 8) as usize), w - 8, if hot { TEXT } else { DIM }, Some(if hot { SELBG } else { BOX }));
     }
-    species(fb, app, x + 3, y + h - 5, c.kind);
+
     seg(fb, x + 3, y + h - 4, "Ctrl/Alt+Backspace or Ctrl+W: erase path segment", w - 6, DIM, Some(BOX));
     if c.mkdir {
         let m = format!("found new world at {}?  press ⏎ again", c.path.s.trim());
         seg(fb, x + 3, y + h - 3, &trunc(&m, (w - 6) as usize), w - 6, v3(1.0, 0.8, 0.4), Some(BOX));
     }
-    seg(fb, x + 3, y + h - 2, "⏎ launch · Tab/⇧Tab match · ↑↓ species · esc cancel", w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + h - 2, "⏎ add folder · Tab/⇧Tab match · esc cancel", w - 6, DIM, Some(BOX));
 }
 
 fn expand_path(p: &str) -> String {
@@ -1715,7 +1701,7 @@ fn expand_path(p: &str) -> String {
 fn deploy(fb: &mut Fb, app: &App, planet: &str, kind: usize, l: &Lay) {
     let (x, y, w, h) = centered(l, 60, 9);
     let accent = v3(0.45, 0.85, 1.0);
-    frame_box(fb, x, y, w, h, &format!("◆ DEPLOY TO {}", base_name(planet).to_uppercase()), accent);
+    frame_box(fb, x, y, w, h, &format!("◆ HOME → {}", base_name(planet).to_uppercase()), accent);
     seg(fb, x + 3, y + 2, &trunc(&tilde(planet), (w - 6) as usize), w - 6, DIM, Some(BOX));
     species(fb, app, x + 3, y + 4, kind);
     seg(fb, x + 3, y + h - 2, "⏎ deploy · ←→ species · esc cancel", w - 6, DIM, Some(BOX));
@@ -1734,30 +1720,6 @@ fn field(fb: &mut Fb, x: i32, row: i32, width: i32, text: &Line, accent: V3, t: 
         let ch = chars.get(text.cur).copied().unwrap_or(' ');
         fb.put_bg(x1 + (text.cur - start) as i32, row, ch, BOX, Some(accent));
     }
-}
-
-fn fleet_order(fb: &mut Fb, app: &App, w: &World, target: &Sel, text: &Line, l: &Lay, t: f32) {
-    let (x, y, bw, h) = centered(l, 72, 11);
-    let accent = v3(0.45, 0.85, 1.0);
-    let name = match target {
-        Sel::Sys(k) => format!("{} SYSTEM", base_name(k).to_uppercase()),
-        Sel::Planet(k) => base_name(k).to_uppercase(),
-        Sel::Agent(_) | Sel::GitHub | Sel::Sector(_, _) | Sel::Lane(_) => String::new(),
-    };
-    frame_box(fb, x, y, bw, h, &format!("◆ FLEET ORDER · {name}"), accent);
-    let ships = app.fleet(w, target);
-    let free = ships.iter().filter(|a| a.status != Status::Blocked).count();
-    let mut note = format!("Every ship here gets this order: {free} of {}", ships.len());
-    if free < ships.len() {
-        note.push_str(" (the rest are waiting on your answer)");
-    }
-    seg(fb, x + 3, y + 2, &note, bw - 6, DIM, Some(BOX));
-    field(fb, x + 3, y + 4, bw - 6, text, accent, t);
-    let mut cx = x + 3;
-    for a in ships.iter().take(8) {
-        cx = seg(fb, cx, y + 6, &format!("{} {} ", a.status.glyph(t), a.kind), bw - 6 - (cx - x - 3), kind_color(&a.kind), Some(BOX)) + 1;
-    }
-    seg(fb, x + 3, y + h - 2, "⏎ send to the fleet · esc cancel", bw - 6, DIM, Some(BOX));
 }
 
 /// Quick actions: what the world needs, one key each.
@@ -1813,11 +1775,59 @@ impl PlanetLayout {
     }
 }
 
+/// A planet's sessions and everyday actions, with room for its landscape.
+fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, t: f32) {
+    fb.px.fill(PANEL);
+    let home = key == crate::workspace::HOME;
+    let accent = if home { v3(0.5, 0.85, 1.0) } else { v3(0.65, 0.9, 0.75) };
+    fb.panel(0, 0, l.cols, 6, BAR);
+    seg(fb, 2, 0, "‹ Esc galaxy", l.cols - 4, DIM, Some(BAR));
+    seg(fb, 2, 2, &format!("{}  {}", if home { "⌂" } else { "◉" }, if home { "HOME".into() } else { base_name(key) }), l.cols - 4, TEXT, Some(BAR));
+    let summary = if home {
+        let ships = app.agents.iter().filter(|a| a.kind != "shell" && a.dying.is_none()).count();
+        let waiting = app.agents.iter().filter(|a| a.kind != "shell" && a.status.needs_you() && a.dying.is_none()).count();
+        let terminals = app.agents.iter().filter(|a| a.kind == "shell" && a.dying.is_none()).count();
+        format!("{} projects · {ships} ships · {waiting} need you · {terminals} terminals", w.planets.iter().filter(|p| p.key != key).count())
+    } else if let Some(s) = app.survey.worlds.get(key).filter(|s| s.git) {
+        format!("{} · {} changed · ↑{} unpushed · ↓{} behind", s.branch, s.dirty, s.ahead, s.behind)
+    } else { tilde(key) };
+    seg(fb, 2, 4, &summary, l.cols - 4, accent, Some(BAR));
+    let width = if l.cols >= 105 { l.cols * 2 / 3 } else { l.cols };
+    let rows = app.work_rows(w, key);
+    let output = rows.get(sel).and_then(|(_, _, a)| if let WorkAct::Agent(id) = a { app.outputs.get(id) } else { None });
+    if width < l.cols && output.is_some() {
+        seg(fb, width + 2, 7, "LATEST TERMINAL OUTPUT", l.cols - width - 4, accent, None);
+        for (i, line) in wrap(output.unwrap(), (l.cols - width - 4).max(1) as usize).iter().take((l.rows - 12).max(0) as usize).enumerate() {
+            seg(fb, width + 2, 9 + i as i32, line, l.cols - width - 4, TEXT, None);
+        }
+    } else if width < l.cols && let Some(p) = w.planet(key) {
+        let x = (width + (l.cols - width) / 2) as f32 * 2.0;
+        let y = l.rows as f32 * 2.1;
+        let radius = ((l.cols - width) as f32 * 0.75).min(l.rows as f32 * 1.3);
+        sphere(fb, x, y, radius, p, (-1.0, -0.5), t);
+        spires(fb, app, p, (x, y), radius, t);
+        seg(fb, width + 2, l.rows - 6, if home { "Your fleet starts here." } else { "A world of your own." }, l.cols - width - 4, DIM, None);
+    }
+    let page = ((l.rows - 10) / 2).max(1) as usize;
+    let off = sel.saturating_sub(page - 1);
+    for (i, (title, note, _)) in rows.iter().enumerate().skip(off).take(page) {
+        let y = 7 + (i - off) as i32 * 2;
+        let bg = if i == sel { SELBG } else { PANEL };
+        fb.panel(1, y, width - 2, 2, bg);
+        seg(fb, 2, y, &format!("{} {title}", if i == sel { "›" } else { " " }), width - 4, if i == sel { accent } else { TEXT }, Some(bg));
+        seg(fb, 4, y + 1, note, width - 6, DIM, Some(bg));
+    }
+    fb.panel(0, l.rows - 2, l.cols, 2, BAR);
+    seg(fb, 2, l.rows - 2, if home { "↑↓ choose · Enter open · e launch · n folder · r root · R refresh · Esc galaxy" } else { "↑↓ choose · Enter open · t task · e agent · s terminal · a anomalies · x dismiss · H home" }, l.cols - 4, TEXT, Some(BAR));
+    seg(fb, 2, l.rows - 1, "Agents and terminals keep running when you leave.", l.cols - 4, DIM, Some(BAR));
+    if let Some((msg, at)) = &app.toast && t - at < 3.2 { seg(fb, 2, 5, msg, l.cols - 4, accent, Some(BAR)); }
+}
+
 fn planet_view(fb: &mut Fb, app: &App, w: &World, v: &PlanetView, l: &Lay, t: f32) {
     fb.px.fill(PANEL);
     fb.panel(0, 0, l.cols, 4, BAR);
     let accent = KINDS[v.sel].color();
-    seg(fb, 2, 0, "‹ Esc galaxy", l.cols - 4, DIM, Some(BAR));
+    seg(fb, 2, 0, "‹ Esc project", l.cols - 4, DIM, Some(BAR));
     seg(fb, 2, 1, &format!("PLANET  {}", base_name(&v.key)), l.cols - 17, TEXT, Some(BAR));
     seg(fb, 2, 2, &tilde(&v.key), l.cols - 17, DIM, Some(BAR));
     if let Some(p) = w.planet(&v.key) {
@@ -1909,7 +1919,7 @@ fn build_menu(fb: &mut Fb, app: &App, planet: &str, sel: usize, l: &Lay) {
         let detail = built.map_or_else(|| k.about().to_string(), |b| b.files.join("  "));
         seg(fb, x + 8, r + 1, &clip(&detail, (w - 12) as usize), w - 12, DIM, Some(bg));
     }
-    seg(fb, x + 3, y + h - 2, "1-8 / ⏎ draft the order for a builder · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + h - 2, "1-8 / ⏎ draft a planet task · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
 }
 
 /// A world's mission log, grouped by status, world or moon, or fleet order; open missions show in full.
@@ -2050,31 +2060,6 @@ fn wrap(s: &str, w: usize) -> Vec<String> {
     out
 }
 
-fn moon(fb: &mut Fb, app: &App, planet: &str, branch: &Line, kind: usize, l: &Lay, t: f32) {
-    let (x, y, w, h) = centered(l, 72, 12);
-    let accent = v3(0.75, 0.8, 0.9);
-    frame_box(fb, x, y, w, h, &format!("☾ NEW MOON FOR {}", base_name(planet).to_uppercase()), accent);
-    seg(fb, x + 3, y + 2, "A moon is a git worktree on its own branch, with its own agent:", w - 6, DIM, Some(BOX));
-    seg(fb, x + 3, y + 3, "parallel work that can't step on the world's toes. Branch name:", w - 6, DIM, Some(BOX));
-    field(fb, x + 3, y + 5, w - 6, branch, accent, t);
-    species(fb, app, x + 3, y + 7, kind);
-    seg(fb, x + 3, y + h - 2, "⏎ found it · ↑↓ species · esc cancel", w - 6, DIM, Some(BOX));
-}
-
-fn dock(fb: &mut Fb, app: &App, moon: &str, l: &Lay) {
-    let (x, y, w, h) = centered(l, 66, 10);
-    let accent = v3(0.6, 0.85, 1.0);
-    let s = app.survey.worlds.get(moon);
-    let branch = s.map_or(String::new(), |s| s.branch.clone());
-    let host = s.and_then(|s| s.host.clone()).map(|h| base_name(&h)).unwrap_or_default();
-    frame_box(fb, x, y, w, h, &format!("⊕ DOCK MOON {}", branch.to_uppercase()), accent);
-    seg(fb, x + 3, y + 2, &format!("Merge branch {branch} into {host}, then recall the moon's"), w - 6, TEXT, Some(BOX));
-    seg(fb, x + 3, y + 3, "agents and remove its worktree.", w - 6, TEXT, Some(BOX));
-    seg(fb, x + 3, y + 5, "Both need to be committed. A merge conflict is a collision:", w - 6, DIM, Some(BOX));
-    seg(fb, x + 3, y + 6, "the merge is called off and nothing changes.", w - 6, DIM, Some(BOX));
-    seg(fb, x + 3, y + h - 2, "y dock · any other key cancels", w - 6, accent, Some(BOX));
-}
-
 /// Progress of the latest fleet order among these agents.
 fn fleet_row(rows: &mut Rows, app: &App, agents: &[&Agent]) {
     let ids: Vec<u32> = agents.iter().map(|a| a.id).collect();
@@ -2088,37 +2073,21 @@ fn fleet_row(rows: &mut Rows, app: &App, agents: &[&Agent]) {
 #[allow(clippy::too_many_arguments)]
 /// The mission composer's frame, the height of its text, how many images it lists, and the
 /// row its options start on: launch, its role and what that means, a row per ship here, queue.
-fn brief_box(l: &Lay, text: &Line, images: usize, ships: usize) -> ((i32, i32, i32, i32), i32, usize, i32) {
-    let w = 80.min(l.cols - 2);
-    let n = ships as i32;
-    // the text grows to eight lines, then scrolls
-    let lines = (layout(&text.s, w - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 23 - n).max(1));
-    let visible = images.min((l.rows - 20 - n - lines).max(1) as usize);
-    let (x, y, w, h) = centered(l, w, 18 + n + lines + visible as i32);
-    ((x, y, w, h), lines, visible, y + lines + 6 + visible as i32)
+fn brief_box(l: &Lay, text: &Line, images: usize, _ships: usize) -> ((i32, i32, i32, i32), i32, usize, i32) {
+    let width = 80.min(l.cols - 2);
+    let lines = (layout(&text.s, width - 8).last().map_or(0, |p| p.0) + 1).clamp(3, 8).min((l.rows - 12).max(1));
+    let visible = images.min((l.rows - 12 - lines).max(0) as usize);
+    let (x, y, w, h) = centered(l, width, 12 + lines + visible as i32);
+    ((x, y, w, h), lines, visible, y + lines + 5 + visible as i32)
 }
 
 /// Where each role's name sits on the role row: (role index, first column, last column + 1).
-fn role_spans(x: i32) -> Vec<(usize, i32, i32)> {
-    let mut c = x + 13;
-    ROLES.iter().enumerate().map(|(i, r)| {
-        let span = (i, c, c + r.label().chars().count() as i32);
-        c = span.2 + 3;
-        span
-    }).collect()
-}
 
 /// What a click on the mission composer lands on.
 pub enum BriefHit {
     Launch,
     /// Give it to the i-th ship here.
-    Ship(usize),
     Queue,
-    Role(usize),
-    /// The design row: the next design.
-    Design,
-    /// The new ship's orders and skills: refit them.
-    Refit,
 }
 
 pub fn brief_hit(l: &Lay, text: &Line, images: usize, ships: usize, c: i32, r: i32) -> Option<BriefHit> {
@@ -2126,231 +2095,32 @@ pub fn brief_hit(l: &Lay, text: &Line, images: usize, ships: usize, c: i32, r: i
     if c < x || c >= x + w {
         return None;
     }
-    match (r - row) as usize {
-        0 | 2 => Some(BriefHit::Launch),
-        1 => role_spans(x).into_iter().find(|&(_, a, b)| c >= a && c < b).map(|(i, ..)| BriefHit::Role(i)).or(Some(BriefHit::Launch)),
-        3 => Some(BriefHit::Design),
-        4 => Some(BriefHit::Refit),
-        k if (5..5 + ships).contains(&k) => Some(BriefHit::Ship(k - 5)),
-        k if k == 5 + ships => Some(BriefHit::Queue),
+    match r - row {
+        0 => Some(BriefHit::Queue),
+        1 => Some(BriefHit::Launch),
         _ => None,
     }
 }
 
 /// What Advisor suggests for the mission, under its text.
-fn advisor_line(fb: &mut Fb, app: &App, (x, y, w): (i32, i32, i32), t: f32) {
-    let advisor = &app.advisor;
-    let violet = v3(0.75, 0.65, 1.0);
-    let (msg, col) = if advisor.thinking {
-        ("✦ Advisor is weighing the fleet…".to_string(), violet * (0.5 + 0.3 * (t * 4.0).sin().abs()))
-    } else if let Some(p) = &advisor.pick {
-        let what = match p.ship.and_then(|id| app.agent(id)) {
-            Some(a) => format!("give it to {} #{}", a.kind, a.id),
-            None if p.ship.is_some() => "a ship that has left".into(),
-            None if p.role == Role::None || p.role_conf < ADVISOR_SURE => "launch a new ship".into(),
-            None => format!("launch a new {}", p.role.name()),
-        };
-        let sure = if p.ship_conf >= ADVISOR_SURE { String::new() } else { " · not sure".into() };
-        (format!("✦ Advisor: {what} ({:.0}%){sure}", p.ship_conf * 100.0), violet)
-    } else if let Some(e) = &advisor.err {
-        (format!("✦ Advisor unavailable: {e}"), DIM * 0.8)
-    } else {
-        return;
-    };
-    seg(fb, x, y, &clip(&msg, w as usize), w, col, Some(BOX));
-}
 
 #[allow(clippy::too_many_arguments)]
-fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, (launch, role, to): (bool, usize, Option<u32>), attachments: &[crate::screenshots::Attachment], sending: bool, ship: &Outfit, l: &Lay, t: f32) {
-    let ships = brief_ships(&app.agents, planet);
-    let ((x, y, w, h), lines, visible, r) = brief_box(l, text, attachments.len(), ships.len());
+fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch: bool, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
+    let ((x, y, w, h), lines, visible, r) = brief_box(l, text, attachments.len(), 0);
     let accent = v3(1.0, 0.85, 0.4);
-    frame_box(fb, x, y, w, h, &format!("★ NEW MISSION FOR {}", base_name(planet).to_uppercase()), accent);
+    frame_box(fb, x, y, w, h, &format!("TASK · {}", base_name(planet)), accent);
     seg(fb, x + 3, y + 2, "What should be done here?", w - 6, DIM, Some(BOX));
-    seg(fb, x + 3, y + 4, "› ", 2, accent, Some(BOX));
-    area(fb, (x + 5, y + 4, w - 8, lines), text, accent, t);
-    advisor_line(fb, app, (x + 5, y + lines + 4, w - 8), t);
-    let crew = app.agents.iter().filter(|a| a.cwd == planet && a.dying.is_none()).count();
-    let queue = !launch && to.is_none_or(|id| !ships.contains(&id));
-    let (now, later) = if launch { (TEXT, DIM) } else if queue { (DIM, TEXT) } else { (DIM, DIM) };
-    for (i, image) in attachments.iter().skip(attachments.len() - visible).enumerate() {
-        let prefix = if i == 0 && visible < attachments.len() { format!("▧ {} total · ", attachments.len()) } else { "▧ ".into() };
-        seg(fb, x + 3, y + lines + 5 + i as i32, &clip(&format!("{prefix}{}", image.name), (w - 7).max(1) as usize), w - 6, TEXT * 0.85, Some(BOX));
+    area(fb, (x + 3, y + 4, w - 6, lines), text, accent, t);
+    for (i, image) in attachments.iter().rev().take(visible).enumerate() {
+        seg(fb, x + 3, y + lines + 4 + i as i32, &format!("▧ {} total · {}", attachments.len(), image.name), w - 6, DIM, Some(BOX));
     }
-    // launch: species, then the new ship's role
-    let xx = seg(fb, x + 3, r, if launch { "● " } else { "○ " }, 2, accent, Some(BOX));
-    let xx = seg(fb, xx, r, "launch a new ship with it now", w - 6, now, Some(BOX));
-    if launch {
-        species(fb, app, xx + 3, r, kind);
-    }
-    let picked = ROLES[role];
-    seg(fb, x + 7, r + 1, "role", 4, if launch { DIM } else { DIM * 0.6 }, Some(BOX));
-    for (i, a, _) in role_spans(x) {
-        let rl = ROLES[i];
-        let me = i == role;
-        let col = if !launch { DIM * 0.6 } else if me { rl.color() } else { DIM };
-        let bg = if me && launch { SELBG } else { BOX };
-        seg(fb, a, r + 1, rl.label(), 10, col, Some(bg));
-        if i + 1 < ROLES.len() {
-            seg(fb, a + rl.label().chars().count() as i32, r + 1, " · ", 3, DIM * 0.6, Some(BOX));
-        }
-    }
-    seg(fb, x + w - 6, r + 1, "⇧⇥", 2, DIM * 0.8, Some(BOX));
-    let kind_name = app.kinds.get(kind).map_or("", String::as_str);
-    let about = match picked {
-        Role::Scout if picked.enforced(kind_name) => format!("{} (enforced for {kind_name})", picked.about()),
-        Role::Scout => format!("{} (asked, not enforced, for {kind_name})", picked.about()),
-        _ => picked.about().to_string(),
-    };
-    seg(fb, x + 13, r + 2, &clip(&about, (w - 16) as usize), w - 16, if launch { picked.color() * 0.8 } else { DIM * 0.6 }, Some(BOX));
-    outfit_rows(fb, app, planet, kind_name, ship, (x, r + 3, w), launch);
-    // give it to one ship here: it takes it when it's next free
-    let suggested = app.advisor.pick.as_ref().and_then(|p| p.ship);
-    for (i, &id) in ships.iter().enumerate() {
-        let Some(a) = app.agent(id) else { continue };
-        let row = r + 5 + i as i32;
-        let me = !launch && to == Some(id);
-        let mut c = seg(fb, x + 3, row, if me { "● " } else { "○ " }, 2, accent, Some(BOX));
-        c = seg(fb, c, row, "give it to ", 11, if me { TEXT } else { DIM }, Some(BOX));
-        c = seg(fb, c, row, &format!("{} #{} ", a.kind, a.id), 16, kind_color(&a.kind), Some(BOX));
-        if a.role != Role::None {
-            c = seg(fb, c, row, &format!("{} ", a.role.name()), 10, a.role.color(), Some(BOX));
-        }
-        c = seg(fb, c, row, &format!("{} {} ", a.status.glyph(t), a.status.label()), 12, a.status.color(), Some(BOX));
-        let room = (x + w - 8 - c).max(0);
-        seg(fb, c, row, &clip(&a.title, room as usize), room, DIM, Some(BOX));
-        if suggested == Some(id) {
-            seg(fb, x + w - 7, row, "✦", 1, v3(0.75, 0.65, 1.0), Some(BOX));
-        }
-    }
-    if app.advisor.pick.as_ref().is_some_and(|p| p.ship.is_none()) {
-        seg(fb, x + w - 7, r, "✦", 1, v3(0.75, 0.65, 1.0), Some(BOX));
-    }
-    // queue: the first free agent here takes it
-    let q = r + 5 + ships.len() as i32;
-    let xx = seg(fb, x + 3, q, if queue { "● " } else { "○ " }, 2, accent, Some(BOX));
-    let note = if crew == 0 { "queue it for the next agent here (none yet)".to_string() } else { format!("queue it for the first free one of the {crew} here") };
-    seg(fb, xx, q, &note, w - 8, later, Some(BOX));
-    seg(fb, x + w - 5, r, "⇥", 1, DIM * 0.8, Some(BOX));
-    seg(fb, x + w - 5, q, "⇥", 1, DIM * 0.8, Some(BOX));
-    seg(fb, x + 3, y + h - 4, "Drop image · Ctrl+V clipboard · Ctrl+O attach path · Ctrl+X remove last", w - 6, DIM, Some(BOX));
-    let hint = if sending { "Sending mission…" } else { "⏎ give orders · Alt+⏎ new line · ⇥ launch/queue · ⇧⇥ role · ↑↓ species · ^D design · ^R refit · esc" };
-    seg(fb, x + 3, y + h - 2, hint, w - 6, DIM, Some(BOX));
-}
-
-/// The composer's design row, and the new ship's own orders and skills under it: each skill
-/// marked ✓ if the chosen species can find it from this world, ✗ if it can't.
-fn outfit_rows(fb: &mut Fb, app: &App, planet: &str, kind: &str, ship: &Outfit, (x, r, w): (i32, i32, i32), launch: bool) {
-    let dim = |c: V3| if launch { c } else { DIM * 0.6 };
-    seg(fb, x + 7, r, "design", 6, dim(DIM), Some(BOX));
-    let name = match ship.design.map(|id| app.designs.get(id)) {
-        None => "none".to_string(),
-        Some(Some(d)) => d.name.clone(),
-        Some(None) => "scrapped".to_string(),
-    };
-    seg(fb, x + 15, r, &clip(&name, (w - 26) as usize), w - 26, dim(if ship.design.is_some() { DESIGN } else { DIM }), Some(BOX));
-    seg(fb, x + w - 7, r, "^D", 2, DIM * 0.8, Some(BOX));
-    seg(fb, x + w - 7, r + 1, "^R", 2, DIM * 0.8, Some(BOX));
-    let room = w - 24;
-    if ship.orders.is_empty() && ship.skills.is_empty() {
-        seg(fb, x + 15, r + 1, "no orders or skills of its own", room, DIM * 0.6, Some(BOX));
-        return;
-    }
-    let mut c = x + 15;
-    if !ship.orders.is_empty() {
-        let first = ship.orders.lines().next().unwrap_or("");
-        let more = if ship.orders.lines().count() > 1 { " …" } else { "" };
-        let skills_w = if ship.skills.is_empty() { 0 } else { room / 2 };
-        c = seg(fb, c, r + 1, &clip(&format!("“{first}{more}”"), (room - skills_w) as usize), room - skills_w, dim(TEXT * 0.85), Some(BOX)) + 1;
-    }
-    let home = &app.skill_home;
-    for s in &ship.skills {
-        let ok = crate::design::reachable(kind, s, std::path::Path::new(planet), home);
-        let cell = format!("{}{s}", if ok { "✓" } else { "✗" });
-        let n = cell.chars().count() as i32;
-        if c + n > x + 15 + room { seg(fb, c, r + 1, "…", 1, DIM, Some(BOX)); break; }
-        c = seg(fb, c, r + 1, &cell, n, dim(if ok { v3(0.5, 0.9, 0.6) } else { RED_SKILL }), Some(BOX)) + 1;
-    }
-}
-
-const DESIGN: V3 = v3(0.55, 0.85, 1.0);
-const RED_SKILL: V3 = v3(1.0, 0.45, 0.4);
-
-/// The refit dialog: the new ship's standing orders, and the skills to give it.
-fn refit(fb: &mut Fb, app: &App, v: &RefitView, l: &Lay, t: f32) {
-    let (planet, kind) = match &*v.brief { Mode::Brief { planet, kind, .. } => (planet.as_str(), app.kinds.get(*kind).map_or("", String::as_str)), _ => ("", "") };
-    let rows = (v.skills.len().max(1) as i32).min(l.rows - 16).max(1);
-    let (x, y, w, h) = centered(l, 76.min(l.cols - 2), 15 + rows);
-    frame_box(fb, x, y, w, h, &format!("⚙ REFIT · new {kind} ship"), DESIGN);
-    seg(fb, x + 3, y + 2, "Standing orders, for its whole life (on top of its role)", w - 6, DIM, Some(BOX));
-    let focus = |me: bool| if me { DESIGN } else { DIM };
-    seg(fb, x + 3, y + 3, "› ", 2, focus(v.sel == 0), Some(BOX));
-    area(fb, (x + 5, y + 3, w - 8, 4), &v.orders, DESIGN, if v.sel == 0 { t } else { 0.5 }); // 0.5: a phase with no cursor
-    seg(fb, x + 3, y + 8, &format!("Skills · ✓ {kind} finds it here · ✗ it can't (it still launches)"), w - 6, DIM, Some(BOX));
-    if v.skills.is_empty() {
-        seg(fb, x + 5, y + 9, "no skills in this world or your skill folders", w - 8, DIM * 0.6, Some(BOX));
-    }
-    let off = v.sel.saturating_sub(1).saturating_sub(rows as usize - 1);
-    let home = &app.skill_home;
-    for (i, s) in v.skills.iter().enumerate().skip(off).take(rows as usize) {
-        let row = y + 9 + (i - off) as i32;
-        let me = v.sel == i + 1;
-        let bg = if me { SELBG } else { BOX };
-        if me { fb.panel(x + 1, row, w - 2, 1, bg); }
-        let on = v.picked.contains(s);
-        let ok = crate::design::reachable(kind, s, std::path::Path::new(planet), home);
-        let c = seg(fb, x + 5, row, if on { "[x] " } else { "[ ] " }, 4, if on { DESIGN } else { DIM }, Some(bg));
-        let c = seg(fb, c, row, if ok { "✓ " } else { "✗ " }, 2, if ok { v3(0.5, 0.9, 0.6) } else { RED_SKILL }, Some(bg));
-        seg(fb, c, row, &clip(s, (x + w - 3 - c) as usize), x + w - 3 - c, if on { TEXT } else { DIM }, Some(bg));
-    }
-    let foot = y + h - 4;
-    if let Some(name) = &v.naming {
-        let c = seg(fb, x + 3, foot, "save as design: ", 16, DESIGN, Some(BOX));
-        area(fb, (c, foot, x + w - 3 - c, 1), name, DESIGN, t);
-    } else if !v.error.is_empty() {
-        seg(fb, x + 3, foot, &clip(&v.error, (w - 6) as usize), w - 6, RED_SKILL, Some(BOX));
-    }
-    if !v.error.is_empty() && v.naming.is_some() {
-        seg(fb, x + 3, foot + 1, &clip(&v.error, (w - 6) as usize), w - 6, RED_SKILL, Some(BOX));
-    }
-    let hint = if v.naming.is_some() { "⏎ save (a design of the same name is updated) · esc back" } else { "⏎ done · ⇥ orders/skills · ␣ toggle skill · ^S save as design · esc discard" };
-    seg(fb, x + 3, y + h - 2, hint, w - 6, DIM, Some(BOX));
-}
-
-/// The shipyard: saved designs, renamed or scrapped.
-fn shipyard(fb: &mut Fb, app: &App, v: &YardView, l: &Lay, t: f32) {
-    let list = &app.designs.designs;
-    let rows = (list.len() as i32 * 2).max(3).min(l.rows - 12).max(2);
-    let (x, y, w, h) = centered(l, 84.min(l.cols - 2), 9 + rows);
-    frame_box(fb, x, y, w, h, &format!("⚓ SHIPYARD · {} design{}", list.len(), if list.len() == 1 { "" } else { "s" }), DESIGN);
-    if list.is_empty() {
-        seg(fb, x + 3, y + 2, "No designs yet. In a mission composer, ^R refits the new ship and ^S saves it here.", w - 6, DIM, Some(BOX));
-    }
-    let per = (rows / 2).max(1) as usize;
-    let sel = v.sel.min(list.len().saturating_sub(1));
-    let off = sel.saturating_sub(per - 1);
-    for (i, d) in list.iter().enumerate().skip(off).take(per) {
-        let row = y + 2 + 2 * (i - off) as i32;
-        let me = i == sel;
-        let bg = if me { SELBG } else { BOX };
-        if me { fb.panel(x + 1, row, w - 2, 2, bg); }
-        let role = Role::parse(&d.role);
-        let name = match &v.rename { Some(_) if me => String::new(), _ => d.name.clone() };
-        let mut c = seg(fb, x + 3, row, &clip(&name, 32), 32, DESIGN, Some(bg)) + 1;
-        if let (Some(line), true) = (&v.rename, me) { area(fb, (x + 3, row, 32, 1), line, DESIGN, t); c = x + 36; }
-        c = seg(fb, c, row, &format!("{} ", d.kind), 10, kind_color(&d.kind), Some(bg));
-        if role != Role::None { c = seg(fb, c, row, &format!("{} ", role.name()), 10, role.color(), Some(bg)); }
-        if !d.skills.is_empty() { seg(fb, c, row, &clip(&format!("skills: {}", d.skills.join(", ")), (x + w - 3 - c).max(0) as usize), x + w - 3 - c, DIM, Some(bg)); }
-        let orders = if d.orders.is_empty() { "no orders of its own".to_string() } else { d.orders.replace('\n', " · ") };
-        seg(fb, x + 5, row + 1, &clip(&orders, (w - 8) as usize), w - 8, if d.orders.is_empty() { DIM * 0.6 } else { TEXT * 0.8 }, Some(bg));
-    }
-    if v.remove && let Some(d) = list.get(sel) {
-        seg(fb, x + 3, y + h - 4, &clip(&format!("Scrap {}? Ships already launched from it keep their outfit. y / n", d.name), (w - 6) as usize), w - 6, RED_SKILL, Some(BOX));
-    } else if !v.error.is_empty() {
-        seg(fb, x + 3, y + h - 4, &clip(&v.error, (w - 6) as usize), w - 6, RED_SKILL, Some(BOX));
-    }
-    let hint = if v.rename.is_some() { "⏎ rename · esc cancel" } else { "↑↓ select · r rename · x scrap · esc close · pick a design in a mission composer with ^D" };
-    seg(fb, x + 3, y + h - 2, hint, w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, r, if launch { "○ Next available agent on this planet" } else { "● Next available agent on this planet" }, w - 6, if launch { DIM } else { TEXT }, Some(BOX));
+    seg(fb, x + 3, r + 1, if launch { "● Launch from Home" } else { "○ Launch from Home" }, w - 6, if launch { TEXT } else { DIM }, Some(BOX));
+    if launch { species(fb, app, x + 5, r + 2, kind); }
+    let queue = app.missions.iter().filter(|m| m.cwd == planet && m.state == "queued").count();
+    seg(fb, x + 3, r + 3, &format!("{queue} queued · working agents finish before taking another task"), w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + h - 3, "Ctrl+V image · Ctrl+O attach path · Ctrl+X remove image", w - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + h - 2, if sending { "Sending…" } else { "Enter send · Alt+Enter newline · Tab destination · ↑↓ species · Esc" }, w - 6, DIM, Some(BOX));
 }
 
 /// Where each character of `s` lands when wrapped to `width` columns, as (row, column),
@@ -2485,105 +2255,6 @@ pub fn refit_label(r: &crate::proto::RefitState) -> (String, V3) {
     }
 }
 
-/// Refitting a deployed ship: pick a design, see what changes, confirm.
-fn ship_refit(fb: &mut Fb, app: &App, id: u32, sel: usize, confirm: bool, l: &Lay) {
-    let Some(a) = app.agent(id) else { return };
-    let list = &app.designs.designs;
-    let shown = list.len().clamp(1, 6) as i32;
-    let (x, y, w, h) = centered(l, 84, shown + 17);
-    let iw = w - 6;
-    frame_box(fb, x, y, w, h, &format!("⚒ REFIT · {} · {}", a.kind.to_uppercase(), base_name(&a.cwd).to_uppercase()), DESIGN);
-    seg(fb, x + 3, y + 2, &format!("aboard   {}", outfit_line(a.role, &a.spec)), iw, TEXT, Some(BOX));
-    let mut r = y + 3;
-    if let Some(rf) = &a.refit {
-        let (label, col) = refit_label(rf);
-        seg(fb, x + 3, r, &clip(&format!("refit    {label}"), iw as usize), iw, col, Some(BOX));
-    }
-    r += 2;
-    if list.is_empty() {
-        seg(fb, x + 3, r, "No designs in the shipyard yet: save one from a mission composer with ^S.", iw, DIM, Some(BOX));
-        seg(fb, x + 3, y + h - 2, "esc back", iw, DIM, Some(BOX));
-        return;
-    }
-    let top = sel.saturating_sub(shown as usize - 1);
-    for (i, d) in list.iter().enumerate().skip(top).take(shown as usize) {
-        let bg = if i == sel { SELBG } else { BOX };
-        fb.panel(x + 2, r, w - 4, 1, bg);
-        let role = Role::parse(&d.role);
-        seg(fb, x + 3, r, &clip(&format!(" {} · {} · prefers {}", d.name, role.label(), d.kind), (iw - 2) as usize), iw - 2, if i == sel { TEXT } else { DIM * 1.2 }, Some(bg));
-        r += 1;
-    }
-    r = y + 6 + shown;
-    let Some((role, spec)) = app.refit_outfit(sel) else { return };
-    let row = |fb: &mut Fb, r: i32, k: &str, v: &str, col: V3| {
-        seg(fb, x + 3, r, k, 9, DIM * 0.9, Some(BOX));
-        seg(fb, x + 13, r, &clip(v, (iw - 10) as usize), iw - 10, col, Some(BOX));
-    };
-    let (gain, lose, same) = (v3(0.5, 0.9, 0.6), v3(1.0, 0.55, 0.45), DIM);
-    if role == a.role {
-        row(fb, r, "role", &format!("{} (unchanged)", a.role.label()), same);
-    } else {
-        row(fb, r, "role", &format!("{} → {}", a.role.label(), role.label()), TEXT);
-    }
-    let first = |s: &str| { let f = s.trim().lines().next().unwrap_or("").to_string(); if s.trim().lines().count() > 1 { format!("“{f} …”") } else { format!("“{f}”") } };
-    match (a.spec.orders.trim().is_empty(), spec.orders.trim().is_empty()) {
-        (true, true) => row(fb, r + 1, "orders", "none (unchanged)", same),
-        _ if a.spec.orders.trim() == spec.orders.trim() => row(fb, r + 1, "orders", &format!("{} (unchanged)", first(&spec.orders)), same),
-        (false, true) => row(fb, r + 1, "orders", &format!("− {} (dropped)", first(&a.spec.orders)), lose),
-        (true, false) => row(fb, r + 1, "orders", &format!("+ {}", first(&spec.orders)), gain),
-        (false, false) => {
-            row(fb, r + 1, "orders", &format!("− {}", first(&a.spec.orders)), lose);
-            row(fb, r + 2, "", &format!("+ {}", first(&spec.orders)), gain);
-        }
-    }
-    // skills: + gained, − dropped, = kept; ✓/✗ whether this species can find it from here
-    let r2 = r + 3;
-    seg(fb, x + 3, r2, "skills", 9, DIM * 0.9, Some(BOX));
-    let mut c = x + 13;
-    let home = &app.skill_home;
-    let mut cells: Vec<(String, V3)> = Vec::new();
-    for s in &spec.skills {
-        let ok = crate::design::reachable(&a.kind, s, std::path::Path::new(&a.cwd), home);
-        let mark = if a.spec.skills.contains(s) { "=" } else { "+" };
-        cells.push((format!("{mark}{}{s}", if ok { "✓" } else { "✗" }), if ok { gain } else { RED_SKILL }));
-    }
-    for s in a.spec.skills.iter().filter(|s| !spec.skills.contains(s)) {
-        cells.push((format!("−{s}"), lose));
-    }
-    if cells.is_empty() {
-        seg(fb, c, r2, "none (unchanged)", iw - 10, same, Some(BOX));
-    }
-    for (cell, col) in cells {
-        let n = cell.chars().count() as i32;
-        if c + n > x + w - 3 { seg(fb, c, r2, "…", 1, DIM, Some(BOX)); break; }
-        c = seg(fb, c, r2, &cell, n, col, Some(BOX)) + 1;
-    }
-    // a scout's read-only launch, where the species enforces one
-    let enforced = matches!(a.kind.as_str(), "claude" | "codex" | "grok");
-    let ro = match (a.role == Role::Scout, role == Role::Scout) {
-        (false, true) if enforced => Some(("gains a read-only launch (scout)", gain)),
-        (true, false) if enforced => Some(("loses its read-only launch: it may edit files again", lose)),
-        _ => None,
-    };
-    if let Some((s, col)) = ro { row(fb, r2 + 1, "access", s, col); }
-    let notice = if !resumes(&a.kind) {
-        (format!("⊘ {} can't resume a session, so this ship can't be refitted in place.", a.kind), v3(0.65, 0.65, 0.7))
-    } else {
-        (format!("Restarts on its own session when idle: {} relaunches with the new flags and resumes its conversation; until then the old outfit stays active.", a.kind), v3(1.0, 0.75, 0.3))
-    };
-    let nr = r2 + 3;
-    for (i, part) in wrap(&notice.0, iw as usize).iter().take(2).enumerate() {
-        seg(fb, x + 3, nr + i as i32, part, iw, notice.1, Some(BOX));
-    }
-    if confirm {
-        fb.panel(x + 2, y + h - 2, w - 4, 1, SELBG);
-        seg(fb, x + 3, y + h - 2, &format!("Refit as {}? y refit when idle · any other key back", spec.design), iw, v3(1.0, 0.75, 0.3), Some(SELBG));
-    } else {
-        let cancel = if a.refit.is_some() { " · c cancel refit" } else { "" };
-        seg(fb, x + 3, y + h - 2, &format!("↑↓ design · ⏎ refit…{cancel} · esc back"), iw, DIM, Some(BOX));
-    }
-}
-
 fn confirm(fb: &mut Fb, app: &App, id: u32, l: &Lay) {
     let (x, y, w, h) = centered(l, 60, 8);
     let accent = v3(1.0, 0.4, 0.3);
@@ -2597,41 +2268,26 @@ fn confirm(fb: &mut Fb, app: &App, id: u32, l: &Lay) {
 fn help(fb: &mut Fb, l: &Lay) {
     let lines = [
         ("GALAXY", ""),
-        ("↑↓ / j k", "select in the outliner"),
-        ("⏎ / click twice", "planet: land and browse buildings; ship: open its card"),
-        ("ON A PLANET", "↑↓ select · Tab pane · B build · PgUp/Dn read · Esc leave"),
-        ("⇥", "next agent that needs you"),
-        ("C", "commander: your attention queue across all systems"),
-        ("A", "anomalies: findings, investigations and history across systems"),
-        ("V", "sectors: group worlds, inspect activity and focus the map"),
-        ("H / h", "hyperlanes: name connections / toggle dependency overlay"),
-        ("O", "campaigns: goals, approved plans, automatic missions on moons"),
-        ("Y", "shipyard: saved ship designs (^D picks one in a mission, ^R refits)"),
-        ("n", "colonize: launch an agent in a folder (new or existing)"),
-        ("e", "deploy another agent to the selected world"),
-        ("x", "decommission the agent · card: r refits it"),
-        ("r", "what the selected world needs, with quick actions"),
-        ("B", "structures: AGENTS.md, skills, MCP… build or renovate"),
-        ("t / L", "give a world a mission / its mission log"),
-        ("S", "situation log: filter it, read an entry in full"),
-        ("b", "fleet order: one order to every agent in a system or world"),
-        ("u / D", "found a moon (git worktree) / dock it back"),
-        ("P", "give an agent priority in a border conflict"),
-        ("X", "forget a dormant world"),
-        ("1-9", "answer the incoming transmission"),
-        ("wasd / drag", "pan        ± / wheel  systems → sectors → planets"),
-        ("z / f", "fit galaxy / focus selection"),
-        ("o", "outliner (wheel scrolls)    m  mute alerts    M  mute music"),
-        ("q", "leave (agents keep running in the daemon)"),
-        ("", ""),
-        ("CHAT", ""),
-        ("⏎", "send what you wrote (nothing written: Enter)"),
-        ("1-9 / ↑↓", "answer a waiting agent's question"),
-        ("⇥", "full-screen terminal        esc  close"),
-        ("", ""),
-        ("FULL SCREEN", ""),
-        ("any key", "goes straight to the agent"),
-        ("Ctrl-] / F12", "back to the galaxy"),
+        ("Enter / double click", "open project or native agent terminal"),
+        ("H / n", "home planet / add a folder"),
+        ("Tab / C", "next agent needing you / all attention"),
+        ("A", "anomalies: investigate, dismiss or resolve"),
+        ("e / t", "launch agent / give planet a task"),
+        ("L / S", "planet task history / situation log"),
+        ("wasd / drag", "pan · ± / wheel zoom · z fit · f focus"),
+        ("o / m / M", "outliner / alert sounds / music"),
+        ("q", "leave; agents and terminals keep running"),
+        ("PROJECT", ""),
+        ("Enter / ↑↓", "open / select action or session"),
+        ("s / e / t", "new terminal / new agent / quick task"),
+        ("a / x", "anomalies / dismiss selected session"),
+        ("H / Esc", "home / galaxy"),
+        ("TERMINAL", ""),
+        ("Ctrl-] / F12", "return; all other keys go to the terminal"),
+        ("QUICK TASK", ""),
+        ("Enter / Alt+Enter", "send / new line"),
+        ("Tab / ↑↓", "available agent or new ship / species"),
+        ("Ctrl+V", "paste or attach screenshot"),
     ];
     let (x, y, w, h) = centered(l, 66, lines.len() as i32 + 4);
     let accent = v3(0.45, 0.85, 1.0);
@@ -2698,57 +2354,6 @@ fn term(fb: &mut Fb, app: &App, (x, y, iw, ih): (i32, i32, i32, i32), accent: V3
         }
     }
     (s.scroll > 0).then_some(s.scroll)
-}
-
-/// The chat popup, centred over the galaxy.
-pub fn chat_box(l: &Lay) -> (i32, i32, i32, i32) {
-    centered(l, 100.min(l.cols - 6), (l.rows - 6).max(12))
-}
-
-/// The agent's terminal size inside the chat popup: frame, then a rule, the line you
-/// write in and the hints below it.
-fn chat_input_rows(l: &Lay, text: &Line) -> i32 {
-    let (_, _, w, h) = chat_box(l);
-    let rows = layout(&text.s, (w - 4).max(1)).last().map_or(1, |&(_, r)| r + 1);
-    rows.clamp(1, 4.min((h - 7).max(1)))
-}
-
-pub fn chat_terminal(l: &Lay, text: &Line, images: usize) -> (i32, i32, i32, i32) {
-    let (x, y, w, h) = chat_box(l);
-    (x + 1, y + 1, w - 2, (h - 4 - chat_input_rows(l, text) - i32::from(images > 0)).max(1))
-}
-
-fn chat(fb: &mut Fb, app: &App, id: u32, text: &Line, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
-    let a = app.agents.iter().find(|a| a.id == id);
-    let accent = a.map_or(DIM, |a| a.status.color());
-    let (x, y, w, h) = chat_box(l);
-    let title = match a {
-        Some(a) => format!("◆ {} #{} @ {} · {}", a.kind, a.id, base_name(&a.cwd), a.status.label()),
-        None => "◆ COMMS".into(),
-    };
-    frame_box(fb, x, y, w, h, &title, accent);
-    let (_, _, iw, ih) = chat_terminal(l, text, attachments.len());
-    let back = term(fb, app, (x + 1, y + 1, iw, ih), accent, t, false);
-    let rule = y + 1 + ih;
-    seg(fb, x + 1, rule, &"─".repeat(iw as usize), iw, accent * 0.4, Some(BOX));
-    if let Some((_, s)) = &app.screen && s.history > 0 {
-        let thumb = y + 1 + ((ih - 1) as usize * (s.history - s.scroll.min(s.history)) / s.history) as i32;
-        for row in y + 1..y + 1 + ih { fb.put_bg(x + w - 1, row, if row == thumb { '█' } else { '│' }, if row == thumb { TEXT } else { DIM * 0.5 }, Some(BOX)); }
-    }
-    if !attachments.is_empty() {
-        let names = attachments.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ");
-        seg(fb, x + 2, rule + 1, &format!("{} image{} · Ctrl+X remove last · {names}", attachments.len(), if attachments.len() == 1 { "" } else { "s" }), w - 4, accent, Some(BOX));
-    }
-    area(fb, (x + 2, rule + 1 + i32::from(!attachments.is_empty()), w - 4, chat_input_rows(l, text)), text, accent, t);
-    let asking = a.is_some_and(|a| a.status == Status::Blocked);
-    let hint = if let Some((message, _)) = app.toast.as_ref().filter(|(_, at)| t - at < 3.2) {
-        message.clone()
-    } else if sending { "Sending reply…".into() } else { match back {
-        Some(n) => format!("↑ {n} lines back · PgDn / wheel to return · ⇥ full screen · esc close"),
-        None if asking && text.s.is_empty() && attachments.is_empty() => "1-9 / ↑↓ ⏎ answer · Ctrl+V paste · drag copy · esc close".into(),
-        None => "⏎ send · Ctrl+V paste · drag copy · PgUp/Dn scroll · ⇥ expand · esc close".into(),
-    }};
-    seg(fb, x + 2, y + h - 2, &hint, w - 4, DIM, Some(BOX));
 }
 
 // ─────────────────────────────── commander ───────────────────────────────
@@ -2818,78 +2423,7 @@ fn commander(fb: &mut Fb, app: &mut App, world: &World, l: &Lay) {
 
 // ─────────────────────────────── sectors ───────────────────────────────
 
-fn sector_layout(l: &Lay) -> (i32, i32, i32, i32, i32, usize) {
-    let (x, y, w, h) = centered(l, 120, l.rows - 2);
-    (x, y, w, h, (w / 3).clamp(18, 30), (h - 12).max(1) as usize)
-}
-
 #[allow(clippy::too_many_arguments)]
-pub fn sector_hit(l: &Lay, sectors: usize, worlds: usize, si: usize, wi: usize, col: i32, row: i32) -> Option<(bool, usize)> {
-    let (x, y, w, _, left, room) = sector_layout(l);
-    if col < x + 1 || col >= x + w - 1 || row < y + 6 || row >= y + 6 + room as i32 { return None; }
-    let pane = col >= x + left;
-    let off = (if pane { wi } else { si } + 1).saturating_sub(room);
-    let i = off + (row - y - 6) as usize;
-    (i < if pane { worlds } else { sectors }).then_some((pane, i))
-}
-
-fn sectors(fb: &mut Fb, app: &App, world: &World, l: &Lay, t: f32) {
-    let (x, y, w, h, left, room) = sector_layout(l);
-    let accent = v3(0.65, 0.8, 1.0);
-    let view = &app.sector_view;
-    let chosen = app.selected_sector();
-    let si = chosen.and_then(|s| app.sectors.sectors.iter().position(|v| v.id == s.id)).unwrap_or(0);
-    let worlds = app.sector_worlds(world);
-    let wi = worlds.iter().position(|p| p == &view.world).unwrap_or(0);
-    frame_box(fb, x, y, w, h, "▱ SECTORS", accent);
-    if let Some(s) = chosen {
-        let stats = app.sector_stats(s);
-        seg(fb, x + 2, y + 1, &format!("{} · {} worlds (moons included in activity)", s.name, stats.worlds), w - 4, TEXT, Some(BOX));
-        seg(fb, x + 2, y + 2, &stats.activity(), w - 4, TEXT, Some(BOX));
-        seg(fb, x + 2, y + 3, &stats.work(), w - 4, DIM, Some(BOX));
-    } else {
-        seg(fb, x + 2, y + 1, "Group worlds around a product, wherever their folders live.", w - 4, TEXT, Some(BOX));
-        seg(fb, x + 2, y + 2, "n creates a sector. Then select its worlds and press Space.", w - 4, DIM, Some(BOX));
-    }
-    seg(fb, x + 2, y + 5, if view.worlds { "Sectors" } else { "▸ Sectors" }, left - 3, accent, Some(BOX));
-    seg(fb, x + left + 2, y + 5, if view.worlds { "▸ Worlds · [+] member" } else { "Worlds · [+] member" }, w - left - 4, accent, Some(BOX));
-    for r in y + 5..y + h - 6 { fb.put_bg(x + left, r, '│', DIM * 0.3, Some(BOX)); }
-    let off = (si + 1).saturating_sub(room);
-    for (i, s) in app.sectors.sectors.iter().enumerate().skip(off).take(room) {
-        let r = y + 6 + (i - off) as i32;
-        let bg = if i == si { SELBG } else { BOX };
-        fb.panel(x + 1, r, left - 1, 1, bg);
-        seg(fb, x + 2, r, &s.name, left - 3, if i == si { TEXT } else { DIM }, Some(bg));
-    }
-    let off = (wi + 1).saturating_sub(room);
-    for (i, path) in worlds.iter().enumerate().skip(off).take(room) {
-        let r = y + 6 + (i - off) as i32;
-        let bg = if view.worlds && i == wi { SELBG } else { BOX };
-        let member = chosen.is_some_and(|s| s.contains(path, None));
-        let missing = world.planet(path).is_none();
-        let text = format!("[{}] {}{}", if member { "+" } else { " " }, tilde(path), if missing { " (unavailable)" } else { "" });
-        fb.panel(x + left + 1, r, w - left - 2, 1, bg);
-        seg(fb, x + left + 2, r, &text, w - left - 4, if member { TEXT } else { DIM }, Some(bg));
-    }
-    if worlds.is_empty() { seg(fb, x + left + 2, y + 6, "p adds an existing folder", w - left - 4, DIM, Some(BOX)); }
-    if let Some(path) = worlds.get(wi) { seg(fb, x + 2, y + h - 6, &format!("World: {}", tilde(path)), w - 4, DIM, Some(BOX)); }
-    if let Some(edit) = view.edit {
-        if matches!(edit, SectorEdit::Remove) {
-            let name = chosen.map_or("this sector", |s| s.name.as_str());
-            seg(fb, x + 2, y + h - 5, &format!("Dissolve {name}? y confirms. Folders and agents stay in place."), w - 4, v3(1.0, 0.7, 0.4), Some(BOX));
-        } else {
-            let label = if matches!(edit, SectorEdit::Path) { "Folder: " } else { "Name: " };
-            let end = seg(fb, x + 2, y + h - 5, label, 8, TEXT, Some(BOX));
-            field(fb, end, y + h - 5, (x + w - 2 - end).max(2), &view.text, accent, t);
-        }
-    } else {
-        seg(fb, x + 2, y + h - 5, "Membership changes grouping only. Worlds can belong to several sectors.", w - 4, DIM, Some(BOX));
-    }
-    let error = if app.sector_error.is_empty() { &view.error } else { &app.sector_error };
-    seg(fb, x + 2, y + h - 4, error, w - 4, v3(1.0, 0.65, 0.4), Some(BOX));
-    seg(fb, x + 2, y + h - 3, if matches!(view.edit, Some(SectorEdit::Remove)) { "y dissolve · any other key cancels" } else if view.edit.is_some() { "Enter save · Esc cancel" } else { "n new · r rename · x dissolve · p add folder · f map · a anomalies" }, w - 4, accent, Some(BOX));
-    seg(fb, x + 2, y + h - 2, "Tab pane · ↑↓ / wheel select · Space membership · Enter focus · Esc back", w - 4, DIM, Some(BOX));
-}
 
 fn sector_banner(fb: &mut Fb, app: &App, l: &Lay) {
     if let Some(s) = app.focused_sector() {
@@ -3102,374 +2636,4 @@ fn situation(fb: &mut Fb, app: &App, w: &World, l: &Lay, id: u64, typing: bool, 
         "↑↓ select · 0-7 / f kind · w this world · / search · x clear · ⏎ go to · c comms · esc close".into()
     };
     seg(fb, x + 3, y + h - 2, &help, bw - 6, DIM, Some(BOX));
-}
-
-// ─────────────────────────────── hyperlanes ───────────────────────────────
-
-const LANE: V3 = v3(0.45, 0.75, 0.95);
-
-/// A visible curved route in screen pixels; drawing and picking share its geometry.
-pub struct LanePath { pub id: u64, pub points: Vec<(f32, f32)> }
-
-pub fn lane_paths(app: &App, w: &World, l: &Lay) -> Vec<LanePath> {
-    if !app.dependencies { return vec![]; }
-    let mut paths = Vec::new();
-    for lane in &app.hyperlanes.lanes {
-        let (Some(a), Some(b)) = (w.planet(&lane.from), w.planet(&lane.to)) else { continue };
-        let (a, b) = (l.to_screen(&app.cam, a.wpos), l.to_screen(&app.cam, b.wpos));
-        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-        let length = dx.hypot(dy);
-        if length < 12.0 { continue; }
-        let rank = app.hyperlanes.lanes.iter().filter(|p| p.id < lane.id && p.from == lane.from && p.to == lane.to).count();
-        let bend = 12.0 + rank as f32 * 12.0;
-        let c = ((a.0 + b.0) * 0.5 - dy / length * bend, (a.1 + b.1) * 0.5 + dx / length * bend);
-        let pad = (6.0 / length).min(0.3);
-        let points = (0..=24).map(|i| {
-            let t = pad + (1.0 - 2.0 * pad) * i as f32 / 24.0;
-            let u = 1.0 - t;
-            (u * u * a.0 + 2.0 * u * t * c.0 + t * t * b.0, u * u * a.1 + 2.0 * u * t * c.1 + t * t * b.1)
-        }).collect();
-        paths.push(LanePath { id: lane.id, points });
-    }
-    paths
-}
-
-pub fn lane_pick(app: &App, w: &World, l: &Lay, p: (f32, f32)) -> Option<Sel> {
-    lane_paths(app, w, l).into_iter().filter_map(|route| {
-        let d = route.points.windows(2).map(|s| {
-            let (a, b) = (s[0], s[1]);
-            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-            let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / (dx * dx + dy * dy).max(0.001)).clamp(0.0, 1.0);
-            (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
-        }).fold(f32::MAX, f32::min);
-        (d < 3.0).then_some((d, route.id))
-    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, id)| Sel::Lane(id))
-}
-
-fn hyperlane_map(fb: &mut Fb, app: &App, w: &World, l: &Lay) {
-    for route in lane_paths(app, w, l) {
-        let col = LANE * if app.sel == Some(Sel::Lane(route.id)) { 0.95 } else { 0.42 };
-        for s in route.points.windows(2) { fb.line(s[0].0, s[0].1, s[1].0, s[1].1, col, col); }
-        let (a, b) = (route.points[15], route.points[16]);
-        let angle = (b.1 - a.1).atan2(b.0 - a.0);
-        for side in [-0.55, 0.55] {
-            fb.line(b.0, b.1, b.0 - (angle + side).cos() * 6.0, b.1 - (angle + side).sin() * 6.0, col * 1.5, col);
-        }
-    }
-}
-
-fn lane_entries(app: &App, w: &World, l: &Lay) -> Vec<MapEntry> {
-    lane_paths(app, w, l).into_iter().filter_map(|route| {
-        let lane = app.hyperlanes.lanes.iter().find(|p| p.id == route.id)?;
-        let target = Sel::Lane(lane.id);
-        Some((app.sel != Some(target.clone()), false, target, l.to_world(&app.cam, route.points[12]), vec![(lane.label.clone(), LANE)]))
-    }).collect()
-}
-
-pub fn hyperlane_layout(l: &Lay) -> (i32, i32, i32, i32, usize) {
-    let (x, y, w, h) = centered(l, 112, (l.rows - 2).min(28));
-    (x, y, w, h, (h - 14).max(1) as usize)
-}
-
-pub fn hyperlane_hit(l: &Lay, count: usize, at: usize, col: i32, row: i32) -> Option<usize> {
-    let (x, y, w, _, room) = hyperlane_layout(l);
-    let off = (at + 1).saturating_sub(room);
-    if col < x + 2 || col >= x + w - 2 || row < y + 4 || row >= y + 4 + room as i32 { return None; }
-    let i = off + (row - y - 4) as usize;
-    (i < count).then_some(i)
-}
-
-fn hyperlanes(fb: &mut Fb, app: &App, world: &World, l: &Lay, t: f32) {
-    let (x, y, w, h, room) = hyperlane_layout(l);
-    let view = &app.lane_view;
-    let chosen = app.selected_lane();
-    let step = view.edit;
-    let picking = matches!(step, Some(LaneEdit::From | LaneEdit::To));
-    let paths = app.lane_worlds(world);
-    let current = if step == Some(LaneEdit::To) { &view.to } else { &view.from };
-    let at = if picking { paths.iter().position(|p| p == current).unwrap_or(0) }
-        else { chosen.and_then(|p| app.hyperlanes.lanes.iter().position(|l| l.id == p.id)).unwrap_or(0) };
-    let off = (at + 1).saturating_sub(room);
-    frame_box(fb, x, y, w, h, "⇢ HYPERLANES", LANE);
-    let title = match step {
-        Some(LaneEdit::From) => "1 / 3 · Choose the source world",
-        Some(LaneEdit::To) => "2 / 3 · Choose the destination world",
-        Some(LaneEdit::Label) => "3 / 3 · Name the relationship: calls, depends on, publishes to…",
-        Some(LaneEdit::Remove) => "Remove this relationship? Folders and sectors stay intact.",
-        None => "Named relationships · source → destination · charted by you",
-    };
-    seg(fb, x + 2, y + 1, title, w - 4, TEXT, Some(BOX));
-    let hint = if step.is_some() { "Source → relationship → destination · Esc cancels" }
-        else if app.dependencies { "Dependency overlay ON · h hides connections" } else { "Dependency overlay OFF · h shows connections" };
-    seg(fb, x + 2, y + 2, hint, w - 4, DIM, Some(BOX));
-    if picking {
-        for (i, path) in paths.iter().enumerate().skip(off).take(room) {
-            let row = y + 4 + (i - off) as i32;
-            let bg = if i == at { SELBG } else { BOX };
-            fb.panel(x + 1, row, w - 2, 1, bg);
-            seg(fb, x + 2, row, &format!("{}{}", tilde(path), if world.planet(path).is_none() { " (unavailable)" } else { "" }), w - 4, if i == at { TEXT } else { DIM }, Some(bg));
-        }
-        if paths.is_empty() { seg(fb, x + 2, y + 4, "No worlds to choose. Chart another world with n or V first.", w - 4, DIM, Some(BOX)); }
-    } else {
-        for (i, lane) in app.hyperlanes.lanes.iter().enumerate().skip(off).take(room) {
-            let row = y + 4 + (i - off) as i32;
-            let bg = if i == at { SELBG } else { BOX };
-            let missing = world.planet(&lane.from).is_none() || world.planet(&lane.to).is_none();
-            let text = format!("{} — {} → {}{}", base_name(&lane.from), lane.label, base_name(&lane.to), if missing { " (unavailable)" } else { "" });
-            fb.panel(x + 1, row, w - 2, 1, bg);
-            seg(fb, x + 2, row, &text, w - 4, if i == at { TEXT } else { DIM }, Some(bg));
-        }
-        if app.hyperlanes.lanes.is_empty() { seg(fb, x + 2, y + 4, "No hyperlanes yet · n connects two worlds", w - 4, DIM, Some(BOX)); }
-    }
-    let (from, to, label) = if step.is_some() && step != Some(LaneEdit::Remove) { (view.from.as_str(), view.to.as_str(), view.text.s.as_str()) }
-        else { chosen.map_or(("", "", ""), |p| (p.from.as_str(), p.to.as_str(), p.label.as_str())) };
-    seg(fb, x + 2, y + h - 9, &format!("From: {}", tilde(from)), w - 4, TEXT, Some(BOX));
-    seg(fb, x + 2, y + h - 8, &format!("To:   {}", tilde(to)), w - 4, TEXT, Some(BOX));
-    if step == Some(LaneEdit::Label) { field(fb, x + 2, y + h - 7, w - 4, &view.text, LANE, t); }
-    else { seg(fb, x + 2, y + h - 7, &format!("Link: {label}"), w - 4, LANE, Some(BOX)); }
-    let error = if view.error.is_empty() { &app.lane_error } else { &view.error };
-    seg(fb, x + 2, y + h - 5, error, w - 4, v3(1.0, 0.5, 0.4), Some(BOX));
-    let hint = match step {
-        Some(LaneEdit::Remove) => "y remove · any other key cancels",
-        Some(LaneEdit::Label) => "Enter save · Esc cancel draft",
-        Some(_) => "↑↓ / wheel choose · Enter next · Backspace previous · Esc cancel",
-        None => "n new · e edit · r rename · x remove · Enter/f map · h overlay",
-    };
-    seg(fb, x + 2, y + h - 3, hint, w - 4, LANE, Some(BOX));
-    let nav = if step.is_some() { "Unsaved draft · Esc keeps the existing connections" }
-        else { "↑↓ / wheel · PgUp/Dn · Home/End · 1 source · 2 destination · Esc back" };
-    seg(fb, x + 2, y + h - 2, nav, w - 4, DIM, Some(BOX));
-}
-
-// ─────────────────────────────── campaigns ───────────────────────────────
-
-const CAMPAIGN: V3 = v3(0.85, 0.72, 0.45);
-
-pub fn campaign_layout(app: &App, l: &Lay) -> (i32, i32, i32, i32, i32, usize) {
-    let (x, y, w, h) = centered(l, 126, l.rows - 2);
-    let capacity = ((h - 13) / 3).clamp(2, 8) as usize;
-    let count = app.campaigns.campaigns.len().max(app.selected_campaign().map_or(0, |c| c.stages.len())).max(1);
-    let room = if matches!(app.campaign_view.edit, Some(CampaignEdit::World | CampaignEdit::Link)) { capacity } else { capacity.min(count) };
-    (x, y, w, h, (w / 3).max(18), room)
-}
-
-pub fn campaign_hit(app: &App, w: &World, l: &Lay, col: i32, row: i32) -> Option<(bool, usize)> {
-    let (x, y, width, _, left, room) = campaign_layout(app, l);
-    if col < x + 2 || col >= x + width - 2 || row < y + 4 || row >= y + 4 + room as i32 { return None; }
-    let right = col >= x + left;
-    let (at, count) = match app.campaign_view.edit {
-        Some(CampaignEdit::World) => { let worlds = app.campaign_worlds(w); (worlds.iter().position(|p| p == &app.campaign_view.world).unwrap_or(0), worlds.len()) }
-        Some(CampaignEdit::Link) => (app.campaign_view.mission, app.campaign_missions().len()),
-        _ if right => {
-            let c = app.selected_campaign()?;
-            (c.stages.iter().position(|s| Some(s.id) == app.campaign_stage().map(|s| s.id)).unwrap_or(0), c.stages.len())
-        }
-        _ => (app.campaigns.campaigns.iter().position(|c| Some(c.id) == app.selected_campaign().map(|c| c.id)).unwrap_or(0), app.campaigns.campaigns.len()),
-    };
-    let index = (at + 1).saturating_sub(room) + (row - y - 4) as usize;
-    (index < count).then_some((right, index))
-}
-
-fn campaigns(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32) {
-    let (x, y, width, h, left, room) = campaign_layout(app, l);
-    let view = &app.campaign_view;
-    let edit = view.edit;
-    let c = app.selected_campaign();
-    let s = app.campaign_stage();
-    let automatic = c.is_some_and(|c| c.flight.is_some());
-    let archived = c.is_some_and(|c| c.archived);
-    frame_box(fb, x, y, width, h, "⚑ CAMPAIGNS", CAMPAIGN);
-    if matches!(edit, Some(CampaignEdit::Delete(_))) {
-        seg(fb, x + 3, y + 1, "Delete archived campaign?", width - 6, TEXT, Some(BOX));
-        for (i, line) in wrap(&view.text.s, (width - 6).max(1) as usize).iter().take((h - 12).max(1) as usize).enumerate() {
-            seg(fb, x + 3, y + 3 + i as i32, line, width - 6, CAMPAIGN, Some(BOX));
-        }
-        seg(fb, x + 3, y + h - 8, "Permanently removes its stages, history and saved evidence.", width - 6, TEXT, Some(BOX));
-        seg(fb, x + 3, y + h - 7, "Ships, missions, repository files and moons are kept.", width - 6, DIM, Some(BOX));
-        seg(fb, x + 3, y + h - 5, &view.error, width - 6, v3(1.0, 0.5, 0.4), Some(BOX));
-        seg(fb, x + 3, y + h - 3, "y delete · Esc cancel", width - 6, CAMPAIGN, Some(BOX));
-        return;
-    }
-    let heading = match edit {
-        Some(CampaignEdit::Objective) => "Goal · what should this campaign achieve?",
-        Some(CampaignEdit::Criteria) => "Acceptance criteria · optional; Enter skips",
-        Some(CampaignEdit::Scope) => "Scope · repository roots, one per line · campaign work gets its own moons",
-        Some(CampaignEdit::Limits) => "No-go zones · optional instructions: what must stay untouched?",
-        Some(CampaignEdit::Species) => "Planning ship species · Enter launches planning on moons from committed HEAD",
-        Some(CampaignEdit::Approve) => "Approve this plan and run its stages on campaign moons? y start · Esc cancel",
-        Some(CampaignEdit::Reject) => "Reject plan · explain what the planning ship should change",
-        Some(CampaignEdit::Cancel) => "Cancel future dispatch? Current ships and moon changes stay. y confirm · Esc back",
-        Some(CampaignEdit::Retry) => "Retry interrupted work on its existing moon? Inspect it first. y retry · Esc back",
-        Some(CampaignEdit::StageRole) => "Stage role · scout, builder or inspector",
-        Some(CampaignEdit::StageEvidence) => "Stage evidence · what must the ship demonstrate?",
-        Some(CampaignEdit::World) => "Stage · choose its world or worktree moon",
-        Some(CampaignEdit::Task) => "Stage · describe the task; this only plans it",
-        Some(CampaignEdit::Handoff) => "Handoff · findings, changes, evidence, and unresolved questions",
-        Some(CampaignEdit::Verify) => "Verification · record what you checked, its results and evidence",
-        Some(CampaignEdit::Link) => "Link an existing mission to this stage (no order is sent)",
-        Some(CampaignEdit::Complete) => "Accept this campaign against its objective and criteria? y confirm · other keys cancel",
-        None | Some(CampaignEdit::Delete(_)) => "Plan missions, talk to ships, and review their results",
-    };
-    seg(fb, x + 2, y + 1, heading, width - 4, TEXT, Some(BOX));
-    let typing = edit.is_some() && !matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link | CampaignEdit::Complete | CampaignEdit::Approve | CampaignEdit::Cancel | CampaignEdit::Retry));
-    if typing {
-        area(fb, (x + 3, y + 3, width - 6, (h - 9).max(1)), &view.text, CAMPAIGN, t);
-    } else {
-        let picking = matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link));
-        if picking {
-            let (rows, at): (Vec<String>, usize) = if edit == Some(CampaignEdit::World) {
-                let worlds = app.campaign_worlds(w);
-                let at = worlds.iter().position(|p| p == &view.world).unwrap_or(0);
-                (worlds.iter().map(|p| format!("{}{}", tilde(p), if w.planet(p).is_none() { " (unavailable)" } else { "" })).collect(), at)
-            } else {
-                (app.campaign_missions().iter().map(|m| format!("#{} · {} · {} · {}", m.id, m.state, tilde(&m.cwd), clip(&m.text, 60))).collect(), view.mission)
-            };
-            let off = (at + 1).saturating_sub(room);
-            for (i, row) in rows.iter().enumerate().skip(off).take(room) {
-                let bg = if i == at { SELBG } else { BOX };
-                fb.panel(x + 1, y + 4 + (i - off) as i32, width - 2, 1, bg);
-                seg(fb, x + 2, y + 4 + (i - off) as i32, row, width - 4, TEXT, Some(bg));
-            }
-            if rows.is_empty() { seg(fb, x + 2, y + 4, "Nothing available yet; Esc returns to the campaign.", width - 4, DIM, Some(BOX)); }
-        } else {
-            seg(fb, x + 2, y + 3, if view.stages { "Campaigns" } else { "▸ Campaigns" }, left - 3, CAMPAIGN, Some(BOX));
-            seg(fb, x + left + 2, y + 3, if view.stages { "▸ Stages · in handoff order" } else { "Stages · in handoff order" }, width - left - 4, CAMPAIGN, Some(BOX));
-            let ci = c.and_then(|c| app.campaigns.campaigns.iter().position(|p| p.id == c.id)).unwrap_or(0);
-            let off = (ci + 1).saturating_sub(room);
-            for (i, c) in app.campaigns.campaigns.iter().enumerate().skip(off).take(room) {
-                let bg = if i == ci { SELBG } else { BOX };
-                let mark = if c.archived { "·" } else if c.completed.is_some() { "✓" } else { "⚑" };
-                fb.panel(x + 1, y + 4 + (i - off) as i32, left - 1, 1, bg);
-                seg(fb, x + 2, y + 4 + (i - off) as i32, &format!("{mark} {}", c.objective.lines().next().unwrap_or_default()), left - 3, if c.archived { DIM } else { TEXT }, Some(bg));
-            }
-            if let Some(c) = c {
-                let si = s.and_then(|s| c.stages.iter().position(|p| p.id == s.id)).unwrap_or(0);
-                let off = (si + 1).saturating_sub(room);
-                for (i, s) in c.stages.iter().enumerate().skip(off).take(room) {
-                    let bg = if i == si { SELBG } else { BOX };
-                    fb.panel(x + left + 1, y + 4 + (i - off) as i32, width - left - 2, 1, bg);
-                    let waiting = app.campaign_ship(s).is_some_and(|a| a.status == Status::Blocked);
-                    let status = if waiting { "needs input" } else { s.status() };
-                    let col = if waiting { v3(1.0, 0.7, 0.4) } else if s.accepted.is_some() { v3(0.5, 0.85, 0.65) } else { TEXT };
-                    seg(fb, x + left + 2, y + 4 + (i - off) as i32, &format!("{}. {status} · {}", i + 1, clip(&s.task, 80)), width - left - 4, col, Some(bg));
-                }
-                if c.stages.is_empty() { seg(fb, x + left + 2, y + 4, if c.flight.is_some() { "Planning ship will propose the stages" } else { "s plans the first stage" }, width - left - 4, DIM, Some(BOX)); }
-            } else { seg(fb, x + 2, y + 4, "n begins a campaign", left - 3, DIM, Some(BOX)); }
-        }
-        let mut detail = Vec::new();
-        let warm = v3(1.0, 0.7, 0.4);
-        if let Some(c) = c {
-            if let Some(f) = &c.flight {
-                let next = match f.phase.as_str() {
-                    "planning" => "Planning on campaign moons · o open planning ship",
-                    "proposed" => "Plan ready · a approve & run · t edit stage · r request revision",
-                    "running" => "Running approved plan · o open ship · p pause dispatch",
-                    "paused" => "Dispatch paused; current ship keeps working · p resume",
-                    "review" => "Ready for your review · inspect evidence and moons, then c accept",
-                    "accepted" => "Campaign accepted · moons remain available for docking",
-                    "cancelled" => "Dispatch cancelled · ships and moons preserved",
-                    _ => "Campaign needs attention",
-                };
-                detail.push((next.into(), CAMPAIGN));
-                if !f.error.is_empty() { detail.push((f.error.clone(), warm)); }
-                if !f.summary.is_empty() { detail.push((f.summary.clone(), TEXT)); }
-                if let Some(a) = app.campaign_current_ship() {
-                    detail.push((format!("{} #{} · {} · o open ship", a.kind, a.id, a.status.label()), warm));
-                    if let Some(q) = &a.ask { detail.push((q.question.clone(), TEXT)); }
-                }
-                if let Some(j) = c.flight_job() {
-                    if j.state == "awaiting_report" { detail.push(("Awaiting an explicit report · o opens the ship to inspect or answer".into(), warm)); }
-                    if let Some(r) = c.stages.iter().find(|s| s.job.as_ref().is_some_and(|p| p.token == j.token)).and_then(|s| s.outcome.as_ref()) {
-                        if !r.question.is_empty() { detail.push((format!("Question: {} · o to answer", r.question), warm)); }
-                    }
-                }
-                detail.push((String::new(), DIM));
-            }
-            if let Some(s) = s {
-                if c.flight.is_none() && let Some(a) = app.campaign_ship(s) {
-                    let waiting = a.status == Status::Blocked;
-                    detail.push((if waiting { format!("Waiting for your input · {} #{} · o open ship", a.kind, a.id) }
-                        else { format!("{} #{} · {} · o open ship", a.kind, a.id, a.status.label()) }, if waiting { warm } else { CAMPAIGN }));
-                    if waiting && let Some(q) = &a.ask { detail.push((q.question.clone(), TEXT)); }
-                    detail.push(("Questions and replies stay in the ship's terminal. Esc returns here.".into(), DIM));
-                    detail.push((String::new(), DIM));
-                }
-                let i = c.stages.iter().position(|p| p.id == s.id).unwrap_or(0) + 1;
-                detail.push((format!("Stage {i} · {}", s.status()), CAMPAIGN));
-                detail.push((tilde(&s.world), DIM));
-                detail.push((s.task.clone(), TEXT));
-                if c.flight.is_some() {
-                    detail.push((format!("Role: {} · Expected evidence: {}", s.role, s.expected), DIM));
-                    if let Some(r) = &s.outcome && !r.question.is_empty() { detail.push((format!("Question: {} · o opens the ship", r.question), warm)); }
-                    if let Some(j) = &s.job && j.state == "awaiting_report" { detail.push(("Ship finished a turn without a result report · o to inspect or answer".into(), warm)); }
-                }
-                if c.flight.is_none() && s.missions.is_empty() { detail.push(("m draft a mission · l link existing work".into(), warm)); }
-                for linked in &s.missions {
-                    let m = &linked.mission;
-                    detail.push((format!("Mission #{} · {} · ship {}{}", m.id, m.state, m.agent.map_or("—".into(), |id| id.to_string()),
-                        if linked.available { "" } else { " · saved snapshot; unavailable" }), DIM));
-                }
-                detail.push((String::new(), DIM));
-            }
-            detail.push((format!("Objective · {}", if c.archived { "archived" } else if c.completed.is_some() { "accepted" } else { "active" }), CAMPAIGN));
-            detail.push((c.objective.clone(), TEXT));
-            detail.push((String::new(), DIM));
-            detail.push(("Acceptance criteria".into(), CAMPAIGN));
-            detail.push((if c.criteria.is_empty() { "Not specified; the plan may propose criteria".into() } else { c.criteria.clone() }, TEXT));
-            if let Some(f) = &c.flight {
-                detail.push((String::new(), DIM)); detail.push(("Scope and no-go zones".into(), CAMPAIGN));
-                detail.push((f.worlds.iter().map(|p| tilde(p)).collect::<Vec<_>>().join("\n"), TEXT));
-                detail.push((if f.limits.is_empty() { "No additional restrictions specified".into() } else { f.limits.clone() }, TEXT));
-                detail.push(("Scope restrictions are instructions; native harness permissions still apply.".into(), DIM));
-                for moon in &f.moons { detail.push((format!("Moon: {} · {}", tilde(&moon.path), moon.branch), DIM)); }
-            }
-            if let Some(s) = s {
-                detail.push((String::new(), DIM));
-                detail.push((if c.flight.is_some() { "Handoff from ship" } else { "Handoff · h edit" }.into(), CAMPAIGN));
-                detail.push((if s.handoff.is_empty() { if c.flight.is_some() { "The ship will report its findings here.".into() } else { "No handoff yet. Record findings and decisions after reviewing the ship's work.".into() } } else { s.handoff.clone() },
-                    if s.handoff.is_empty() { DIM } else { TEXT }));
-                detail.push((String::new(), DIM));
-                detail.push((if c.flight.is_some() { "Evidence reported by ship · final acceptance is yours" } else { "Verification · v record evidence · a accept stage" }.into(), CAMPAIGN));
-                detail.push((if s.verification.is_empty() { "Not verified. A finished agent turn still needs your review.".into() } else { s.verification.clone() },
-                    if s.verification.is_empty() { DIM } else { TEXT }));
-                if view.details {
-                    detail.push((String::new(), DIM));
-                    detail.push(("Stage history (newest first)".into(), CAMPAIGN));
-                    detail.extend(s.history.iter().rev().map(|n| (format!("{} ago · {}: {}", ago((survey::now().max(0) as u64).saturating_sub(n.at) as f32), n.kind, n.text), DIM)));
-                    for m in &s.missions {
-                        detail.push((String::new(), DIM));
-                        detail.push((format!("Saved mission #{} · {}", m.mission.id, tilde(&m.mission.cwd)), CAMPAIGN));
-                        detail.push((m.mission.text.clone(), TEXT));
-                    }
-                }
-            }
-            detail.push((String::new(), DIM));
-            if view.details {
-                detail.push(("Campaign history (newest first)".into(), CAMPAIGN));
-                detail.extend(c.history.iter().rev().map(|n| (format!("{} ago · {}: {}", ago((survey::now().max(0) as u64).saturating_sub(n.at) as f32), n.kind, n.text), DIM)));
-            } else { detail.push(("d shows history and saved mission prompts".into(), DIM)); }
-        }
-        let read_width = (width - 6).clamp(1, 96);
-        let lines: Vec<_> = detail.iter().flat_map(|(s, col)| wrap(if s.is_empty() { "\n" } else { s }, read_width as usize).into_iter().map(move |line| (line, *col))).collect();
-        let dy = y + 6 + room as i32;
-        let height = (y + h - 6 - dy).max(1) as usize;
-        app.campaign_view.scroll = app.campaign_view.scroll.min(lines.len().saturating_sub(height));
-        for (i, (line, col)) in lines.iter().skip(app.campaign_view.scroll).take(height).enumerate() { seg(fb, x + 3, dy + i as i32, line, read_width, *col, Some(BOX)); }
-        if lines.len() > height {
-            let label = format!("{}–{} / {} · PgUp/Dn", app.campaign_view.scroll + 1, (app.campaign_view.scroll + height).min(lines.len()), lines.len());
-            seg(fb, x + 3, y + h - 6, &label, width - 6, DIM, Some(BOX));
-        }
-    }
-    let error = if app.campaign_view.error.is_empty() { &app.campaign_error } else { &app.campaign_view.error };
-    seg(fb, x + 2, y + h - 5, error, width - 4, v3(1.0, 0.5, 0.4), Some(BOX));
-    let controls = if typing { "Enter save/next · Shift+Enter or Ctrl+J newline · ↑↓ cursor · Esc cancel" }
-        else if matches!(edit, Some(CampaignEdit::World | CampaignEdit::Link)) { "↑↓ / wheel choose · Home/End · Enter select · Esc cancel" }
-        else if archived { "Del delete archived campaign · x restore · n goal · N manual" }
-        else if automatic { "n goal · a approve · t edit stage · s add · Del remove · r revise" }
-        else { "n goal · N manual · e objective · s stage · t edit · m draft · l link" };
-    seg(fb, x + 2, y + h - 3, controls, width - 4, CAMPAIGN, Some(BOX));
-    if !typing { seg(fb, x + 2, y + h - 2, if archived { "Deleting the campaign keeps its ships, missions and moons." }
-        else if automatic { "o open ship · p pause/resume/retry · c accept · x cancel/archive" }
-        else { "h handoff · v verify · a accept stage · r reopen · c finish · x archive" }, width - 4, CAMPAIGN, Some(BOX)); }
-    seg(fb, x + 2, y + h - 4, "o open ship · d history · Enter log · Tab pane · PgUp/Dn · Esc back", width - 4, DIM, Some(BOX));
 }
