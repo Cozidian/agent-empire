@@ -11,26 +11,38 @@ cargo build --release
 
 ## Home and your projects
 
-Press **H** to visit **Home**. Choose **Configure project root** and enter the folder containing
-your projects, for example `/home/code` or `~/code`. Empire discovers Git repositories beneath
-that folder and makes them planets. Their parent folders determine the sectors. Discovery runs
+Press **V** to manage **sectors and folders**, or choose **Manage sectors and folders** on
+**Home** (`H`, then `r`). Press **n** in the manager to add a sector root: a folder containing
+projects, for example `~/code`, `~/work`, or `/mnt/projects`. Add as many roots as you need;
+each addition keeps the existing roots. **Tab** completes the path. Empire discovers Git repositories beneath
+these folders and makes them planets. Their parent folders determine the sectors. Discovery runs
 in the background, stops inside repositories, and skips hidden directories, symlink directories,
 `node_modules`, `target`, and `vendor`. Git worktrees with a `.git` file are recognized too.
 
 If no root has been saved, Empire uses `/home/code` or `~/code` when one exists. **R on Home**
-rescans the root. A scan reads directory entries; it does not pull, clone or modify repositories.
+rescans all roots. A scan reads directory entries; it does not pull, clone or modify repositories.
 
-**n** adds a folder manually, including folders outside the root and folders without Git.
+**n on the galaxy or Home** adds a single planet manually, including folders outside the roots
+and folders without Git. To discover several projects under a folder, use **V**, then **n** instead.
 A missing folder is created only after a second Enter. Adding a planet does not launch an agent.
-Manually added folders and the root are saved in `$XDG_STATE_HOME/empire/workspace.json`
+In the sector manager, select a root or manually added planet and press **x/Delete** to remove it.
+On Home, **x/Delete** removes the selected project; on the galaxy, **Delete** removes the selected
+planet. This only removes it from the map: files, repositories, agents and terminals are kept.
+Worlds with sessions stay visible until those sessions are dismissed. Removed projects stay hidden
+from discovery and history; adding their folder again restores them. Removing a root keeps projects
+covered by another root or added individually. Adding a root again restores its hidden projects.
+An empty root stays listed in the manager until it contains Git projects to show on the map.
+
+Manually added folders, roots and hidden projects are saved in `$XDG_STATE_HOME/empire/workspace.json`
 (normally `~/.local/state/empire/workspace.json`). Existing projects from Empire's history and
-running sessions remain visible. Discovered projects stay charted without requiring an agent.
+running sessions remain visible unless explicitly removed as described above. Discovered projects stay
+charted without requiring an agent.
 
 Home puts projects needing you first, with clear input/check labels and their latest question or task.
 Other projects use compact rows grouped by parent folder; only nonzero ship and terminal counts
 are shown. The selected project's full path stays in the footer. Folder headings are not selectable.
 Choose a project to open its workspace, or press **e** on its Home row to launch a ship.
-**r on Home** edits the project root. New ships depart from Home and settle into the project's
+**r on Home** manages sector roots and folders. New ships depart from Home and settle into the project's
 orbit; they remain there between tasks until you dismiss them.
 
 ## Working on a planet
@@ -46,14 +58,17 @@ Enter or double-click a planet to open its workspace:
   as you need for `git pull`, development servers, logs and manual testing. Shells never take
   agent tasks or generate agent permission/completion alerts.
 - **Agents** and **Terminals** have separate sections. Every terminal has a stable number and
-  shows its current title. Select one and press **Enter** to reopen it; **F12** or **Ctrl-]**
+  a fixed `Terminal #…` label. Shell keystrokes and window titles never become task labels or
+  list previews, including input entered at password prompts. Select one and press **Enter** to reopen it; **F12** or **Ctrl-]**
   returns with that session selected. **s** opens another terminal. **x** closes the selected
   session after confirmation and keeps you on the project. Closing a shell stops its running
   commands too; cancelling leaves it running.
 - **Anomalies** (`a`): inspect detected problems and reported discoveries on this planet.
 - **Project resources**: browse `AGENTS.md`, `CLAUDE.md`, skills, subagents, commands, hooks, MCP
-  configuration and other agents' instruction files; each kind found stands as a spire on the
-  planet. **Enter** or **e** opens the selected file in your editor (`$VISUAL`, `$EDITOR`, else
+  configuration and other agents' instruction files. These buildings appear as small, warm
+  city-light clusters on the planet's night side, fading out at distant zoom. More kinds of
+  resources fill out the settlements; building names and files stay in the resource view.
+  **Enter** or **e** opens the selected file in your editor (`$VISUAL`, `$EDITOR`, else
   nvim, vim, vi or nano) as a full terminal; quit the editor to come straight back with the
   file re-read, or step out with **F12** and pick it up again later (it's listed as an Editor
   under Terminals). On an empty plot, **Enter** or **n** lays a short first draft (`AGENTS.md`,
@@ -126,12 +141,29 @@ The station uses your installed `gh` and its existing authentication. It refresh
 your open PRs and 100 other open PRs per project every 150 seconds, and marks stale cached results
 when GitHub is unavailable. Unpushed commits still appear as freighters travelling to the station.
 
+Planets with open pull requests show a fixed **◇ PR N** marker beside their map name and in the
+outliner, including planets without agents. It counts both your PRs and other people's PRs.
+**!** in red means your PRs have failing checks; **↗** in amber means a non-draft PR requests your
+review. Failing checks take priority if both apply. A quiet blue marker means open PRs with neither
+signal; passing checks alone do not imply a PR is ready to merge. **?** marks unavailable or cached
+data (including a successful check more than 7½ minutes old); a checked repository with no open PRs
+has no marker. These signals use symbols as well as colour and do not blink or orbit.
+
+Click the marker or select a planet and press **p** to open only that repository's PRs. **Tab**
+still switches all/review/mine within that repository. **p** also works on a selected Home project
+and inside its workspace, which has a **Pull requests** action. **Esc** returns to where you opened
+the list. The GitHub station still opens the global overview. Worktrees share their parent planet's
+count, so their planned space-station markers remain distinct and do not duplicate PR counts.
+
 ## Galaxy controls and atmosphere
 
 | Key | Action |
 | --- | --- |
 | Enter / double-click | Open planet workspace or native agent terminal |
 | H / n | Home / add a project folder |
+| V | Manage sectors and folders: n adds a root, x/Delete removes an entry |
+| Delete | Remove selected planet from the map; keep files and sessions |
+| p / click ◇ PR | Open the selected planet's repository PRs |
 | e / t | Launch an agent / give the selected planet a task |
 | Tab / C | Next agent needing you / attention list |
 | 1-9 / h | Answer / hail (open comms with) the incoming transmission |
@@ -159,6 +191,8 @@ on the fly and never repeats: slow, hopeful chord changes in a drifting key, wit
 that move between pads, strings and a wordless choir. Echoing arpeggios, soft chimes and an
 improvised lead melody join once each section settles. Home and the project
 workspace show larger planetary portraits when there is enough room.
+Muting music fades it out, then skips inaudible synthesis while the score's clock keeps moving;
+unmuting fades back into the current passage. Alert sounds remain independent.
 
 Campaigns, expeditions, ship designs/refits, prescribed launch roles, fleet orders, manual
 hyperlane/sector editors and worktree creation/merging are retired from the workspace. Existing
@@ -196,6 +230,27 @@ ln -s "$PWD/target/release/empire" "$HOME/.local/bin/empire"
 
 ## Development
 
+For a long-run performance trace, open the galaxy with:
+
+```sh
+EMPIRE_PERF_DIR=/tmp/empire-perf empire
+```
+
+This opt-in recorder writes a separate `ui-PID-TIMESTAMP.jsonl` file per launch, with a sample
+every 10 seconds and a final partial sample on normal exit. It records CPU usage (100% = one core),
+resident/peak memory, busy threads, frame rate, and frame timings grouped by view and terminal size.
+`mean_ms` and `max_ms` contain update, draw, and terminal-presentation wall times in that order;
+they exclude frame pacing and are not CPU times. The last-frame context includes zoom, object
+counts and audio settings. No terminal contents, prompts or project paths are logged.
+Logging stops at 8 MiB per launch, or on a write error, with a toast; it never overwrites earlier logs.
+Omit `EMPIRE_PERF_DIR` to disable tracing. After building a new version, close and reopen only the
+galaxy to enable it; the daemon and agent sessions can stay running.
+
+The glow pass runs serially to avoid waking rendering workers every frame; graphics and the
+30 FPS target are unchanged. Repeatable component benchmarks (run separately) are available with
+`cargo test bloom_cpu_cost -- --ignored --nocapture` and
+`cargo test muted_music_cpu_cost -- --ignored --nocapture`.
+
 Single Rust binary crate. `game.rs` handles the model/input, `draw.rs` renders it, `workspace.rs`
 discovers projects, `daemon.rs` owns terminals, `proto.rs`/`client.rs` connect them, `survey.rs`
 reads Git/GitHub status, and `anomaly.rs` stores findings. Graphics and sound are procedural.
@@ -222,7 +277,8 @@ worlds at portrait and map sizes. **Space** switches between the polished render
 starts agents or audio, or reads/writes workspace state.
 
 The polished renderer is the default in the galaxy and planetary portraits. The comparison keeps
-the same procedural world identities and terminal resolution for both looks.
+the same procedural world identities and terminal resolution for both looks. The example worlds
+have five building kinds, showing city lights at portrait and map sizes.
 
 For reproducible 140×48 terminal captures, use `empire graphics --snapshot` and
 `empire graphics --snapshot --classic` (ANSI output, fixed animation time).

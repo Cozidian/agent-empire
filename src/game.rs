@@ -487,6 +487,7 @@ pub enum Mode {
     Galaxy,
     Workspace { key: String, sel: usize },
     Root(Line),
+    Folders { sel: usize },
     /// On a world's surface, browsing its buildings and their files.
     Planet(PlanetView),
     Commander,
@@ -531,6 +532,20 @@ pub enum LogSort {
 pub struct TradeRow {
     pub path: String,
     pub pr: Option<survey::Pr>,
+}
+
+/// A world's open pull requests and the ones needing its owner.
+#[derive(Debug, PartialEq)]
+pub struct PrSignal { pub total: usize, pub reviews: usize, pub failed: usize, pub stale: bool }
+impl PrSignal {
+    pub fn label(&self) -> String {
+        if self.total == 0 { return "◇ PR ?".into(); }
+        format!("◇ PR {}{}", self.total, if self.stale { " ?" } else if self.failed > 0 { " !" } else if self.reviews > 0 { " ↗" } else { "" })
+    }
+    pub fn color(&self) -> V3 {
+        if self.stale { v3(0.55, 0.62, 0.7) } else if self.failed > 0 { v3(1.0, 0.45, 0.4) }
+        else if self.reviews > 0 { v3(1.0, 0.78, 0.4) } else { v3(0.55, 0.75, 0.9) }
+    }
 }
 
 /// A ready-to-send mission for a pull request: review someone else's, fix or finish your own.
@@ -647,6 +662,8 @@ pub struct App {
     pub missions: Vec<Mission>,
     pub log_sort: LogSort,
     pub trade_view: TradeView,
+    pub trade_world: Option<String>,
+    trade_return: Option<String>,
     pub prestige: Prestige,
     /// Worlds that just levelled up, waiting for their fanfare on the map.
     pub fanfares: Vec<String>,
@@ -813,6 +830,31 @@ impl Lay {
 // ──────────────────────────────── app ──────────────────────────────────
 
 impl App {
+    pub fn pr_signal(&self, p: &Planet) -> Option<PrSignal> {
+        if p.host.is_some() { return None; }
+        let s = self.survey.worlds.get(&p.key).filter(|s| s.github)?;
+        let total = s.prs.iter().chain(&s.others).map(|p| p.number).collect::<HashSet<_>>().len();
+        let stale = s.prs_error.is_some() || s.prs_checked.is_none_or(|at| survey::now() - at > 450);
+        if total == 0 && !stale { return None; }
+        Some(PrSignal { total, reviews: s.others.iter().filter(|p| p.asks_you && !p.draft).count(), failed: s.prs.iter().filter(|p| p.ci == "fail").count(), stale })
+    }
+
+    pub fn trade_visible_rows(&self, w: &World) -> Vec<TradeRow> {
+        self.trade_rows(w).into_iter().filter(|r| self.trade_world.as_ref().is_none_or(|p| &r.path == p)).collect()
+    }
+
+    fn open_prs(&mut self, key: &str, t: f32) {
+        let key = self.moon_host(key).unwrap_or_else(|| key.into());
+        if !self.survey.worlds.get(&key).is_some_and(|s| s.github) { self.toast("No GitHub repository found for this planet", t); return; }
+        self.trade_return = if let Mode::Workspace { key, .. } = &self.mode { Some(key.clone()) } else { None };
+        self.trade_world = Some(key); self.trade_view = TradeView::All;
+        self.mode = Mode::Trade { sel: 0 };
+    }
+
+    fn open_station(&mut self) {
+        self.trade_world = None; self.trade_return = None; self.mode = Mode::Trade { sel: 0 };
+    }
+
     /// Projects currently in this galaxy; worktrees share their host's PRs.
     pub fn trade_rows(&self, w: &World) -> Vec<TradeRow> {
         let mut projects: Vec<_> = w.planets.iter().filter(|p| p.host.is_none())
@@ -829,6 +871,7 @@ impl App {
             // yours, then reviews asked of you, then the rest; failing checks first in each
             let mine = |p: &survey::Pr| s.prs.iter().any(|m| m.number == p.number);
             prs.sort_by_key(|p| (if mine(p) { 0 } else if p.asks_you { 1 } else { 2 }, match p.ci { "fail" => 0, "pending" => 1, "pass" => 2, _ => 3 }, p.number));
+            let mut seen = HashSet::new(); prs.retain(|p| seen.insert(p.number));
             rows.extend(prs.into_iter().map(|pr| TradeRow { path: path.clone(), pr: Some(pr) }));
         }
         rows
@@ -836,7 +879,7 @@ impl App {
 
     /// Open the mission composer for a station row: a fitting brief for a PR, a blank one for a project.
     fn trade_mission(&mut self, w: &World, index: usize) {
-        let Some(row) = self.trade_rows(w).into_iter().nth(index) else { return };
+        let Some(row) = self.trade_visible_rows(w).into_iter().nth(index) else { return };
         let mine = row.pr.as_ref().is_some_and(|pr| self.survey.worlds.get(&row.path).is_some_and(|s| s.prs.iter().any(|m| m.number == pr.number)));
         let mut text = Line::default();
         if let Some(pr) = &row.pr {
@@ -848,7 +891,7 @@ impl App {
     }
 
     fn open_trade_row(&mut self, w: &World, index: usize, client: &Client, t: f32) {
-        if let Some(row) = self.trade_rows(w).get(index) {
+        if let Some(row) = self.trade_visible_rows(w).get(index) {
             if let Some(pr) = &row.pr {
                 client.open_pr(row.path.clone(), pr.number);
                 self.toast(format!("opening PR #{} in browser", pr.number), t);
@@ -903,6 +946,7 @@ impl App {
             log_off: 0,
             log_sort: LogSort::Status,
             trade_view: TradeView::All,
+            trade_world: None, trade_return: None,
             pick: None,
             survey: survey::Snapshot::default(),
             missions: Vec::new(),
@@ -1195,8 +1239,8 @@ impl App {
     }
 
     fn apply(&mut self, list: Vec<AgentView>, t: f32, cues: &mut Vec<Cue>) {
-        self.outputs.retain(|id, _| list.iter().any(|v| v.id == *id));
-        for v in &list { if !v.output.is_empty() { self.outputs.insert(v.id, v.output.clone()); } else if v.status == "working" { self.outputs.remove(&v.id); } }
+        self.outputs.retain(|id, _| list.iter().any(|v| v.id == *id && v.kind != "shell"));
+        for v in list.iter().filter(|v| v.kind != "shell") { if !v.output.is_empty() { self.outputs.insert(v.id, v.output.clone()); } else if v.status == "working" { self.outputs.remove(&v.id); } }
         self.online = true;
         let first = !self.loaded;
         self.loaded = true;
@@ -1207,8 +1251,10 @@ impl App {
         for v in &list {
             let st = Status::parse(&v.status);
             // what it was last asked to do; the window title often stays on its first prompt
-            let title = if v.task.is_empty() { clean_title(&v.title) } else { v.task.clone() };
+            let title = if v.kind == "shell" { format!("Terminal #{}", v.id) }
+                else if v.task.is_empty() { clean_title(&v.title) } else { v.task.clone() };
             if let Some(i) = self.agents.iter().position(|a| a.id == v.id && a.dying.is_none()) {
+                if v.kind == "shell" { self.agents[i].title = title.clone(); }
                 let old = self.agents[i].status;
                 if old != st {
                     let a = &self.agents[i];
@@ -1384,7 +1430,7 @@ impl App {
             let _ = std::fs::create_dir_all(crate::daemon::dirs_state());
             let _ = std::fs::write(history_file(), serde_json::to_string(&self.history).unwrap_or_default());
         }
-        let mut past: Vec<(&String, &u64)> = self.history.iter().filter(|(k, _)| !pmap.contains_key(*k)).collect();
+        let mut past: Vec<(&String, &u64)> = self.history.iter().filter(|(k, _)| !pmap.contains_key(*k) && !self.workspace.hidden.contains(k)).collect();
         past.sort_by_key(|(_, t)| std::cmp::Reverse(**t));
         let past: Vec<String> = past.into_iter().take(HISTORY_WORLDS).map(|(k, _)| k.clone()).filter(|k| Path::new(k).is_dir()).collect();
         for k in past {
@@ -1394,7 +1440,7 @@ impl App {
         }
         // sector members remain charted even without ships or a recent history entry
         for key in self.sectors.sectors.iter().flat_map(|s| s.worlds.iter()) {
-            if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
+            if Path::new(key).is_dir() && !self.workspace.hidden.contains(key) { pmap.entry(key.clone()).or_default(); }
         }
         // worktrees are moons of the world they were split from (which shows up even if empty)
         let host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
@@ -1753,7 +1799,7 @@ impl App {
     /// Enter on the current selection.
     fn activate(&mut self, w: &World, l: &Lay, client: &Client) {
         match self.sel.clone() {
-            Some(Sel::GitHub) => self.mode = Mode::Trade { sel: 0 },
+            Some(Sel::GitHub) => self.open_station(),
             Some(Sel::Agent(id)) => self.open_comms(id, client, l),
             Some(Sel::Planet(k)) => self.mode = Mode::Workspace { key: k, sel: 0 },
             Some(Sel::Sector(id, k)) => {
@@ -2422,6 +2468,10 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
     let mut surveyed = Instant::now() - Duration::from_secs(10);
     // messages picked up while waiting for the next frame
     let mut pending: Vec<Msg> = Vec::new();
+    let mut perf = match crate::perf::Trace::from_env() {
+        Ok(t) => t,
+        Err(e) => { app.toast(format!("Performance log unavailable: {e}"), 0.0); None }
+    };
 
     loop {
         let now = Instant::now();
@@ -2607,8 +2657,21 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         app.cam.y = mixf(app.cam.y, app.cam.ty, k);
         app.cam.z = mixf(app.cam.z, app.cam.tz, k);
 
+        let draw_at = perf.as_ref().map(|_| Instant::now());
         draw::frame(&mut fb, &mut app, &world, &lay, t, sound);
+        let present_at = perf.as_ref().map(|_| Instant::now());
         out.present(&fb, o)?;
+        if let (Some(trace), Some(d), Some(p)) = (&mut perf, draw_at, present_at) {
+            let ms = [(d - now).as_secs_f64() * 1000.0, (p - d).as_secs_f64() * 1000.0, p.elapsed().as_secs_f64() * 1000.0];
+            if let Err(e) = trace.frame(&app.mode, (fb.cols, fb.rows), ms, || serde_json::json!({
+                "zoom": app.cam.z, "planets": world.planets.len(), "agents": app.agents.len(), "effects": app.fx.len(),
+                "audio": sound.is_some(), "muted": sound.is_some_and(|s| s.muted.load(Relaxed)),
+                "music_muted": sound.is_some_and(|s| s.music_muted.load(Relaxed))
+            })) {
+                perf = None;
+                app.toast(format!("Performance log stopped: {e}"), t);
+            }
+        }
 
         let deadline = now + budget;
         if app.talking_to().is_none() {
@@ -2750,7 +2813,7 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event, t: f32) {
 
 /// The ordinary actions available on a planet.
 #[derive(Clone)]
-pub enum WorkAct { Project(String), Agent(u32), Launch, Terminal, Task, Files, Edit(Kind, String), Anomalies, Root, Add, Refresh }
+pub enum WorkAct { Project(String), Agent(u32), Launch, Terminal, Task, Files, Edit(Kind, String), Anomalies, Pulls, Root, Add, Refresh }
 
 impl App {
     fn has_agent(&self, key: &str) -> bool { self.agents.iter().any(|a| a.cwd == key && a.kind != "shell" && a.dying.is_none() && a.status != Status::Exited) }
@@ -2766,11 +2829,13 @@ impl App {
         let result = path.canonicalize().map_err(|e| e.to_string()).and_then(|p| {
             let key = p.to_string_lossy().into_owned();
             let mut c = self.workspace.clone();
+            c.hidden.retain(|p| p != &key);
             if !c.folders.contains(&key) { c.folders.push(key.clone()); }
             if !cfg!(test) { c.save().map_err(|e| e.to_string())?; }
             self.workspace = c;
             self.projects.push(key.clone()); self.projects.sort(); self.projects.dedup();
             self.sectors = self.workspace.sectors(&self.projects);
+            self.discover();
             self.sel = Some(Sel::Planet(key.clone())); self.mode = Mode::Workspace { key, sel: 0 };
             Ok(())
         });
@@ -2781,13 +2846,32 @@ impl App {
         self.agents.iter().filter(|a| a.cwd == key && a.kind != "shell" && a.dying.is_none() && a.status.needs_you()).min_by_key(|a| (a.status, a.id))
     }
 
+    fn remove_source(&mut self, root: bool, key: &str, t: f32) {
+        if key == crate::workspace::HOME { return; }
+        let mut c = self.workspace.clone();
+        if root {
+            if c.root == key { c.root.clear(); }
+            c.roots.retain(|p| p != key);
+            for p in self.projects.iter().chain(self.history.keys()).chain(self.agents.iter().map(|a| &a.cwd)) {
+                if Path::new(p).starts_with(key) && !c.includes(p) && !c.hidden.contains(p) { c.hidden.push(p.clone()); }
+            }
+        } else { c.hide(key); }
+        if !cfg!(test) && let Err(e) = c.save() { self.toast(format!("Cannot save workspace: {e}"), t); return; }
+        self.workspace = c;
+        self.projects.retain(|p| !self.workspace.hidden.contains(p));
+        self.sectors = self.workspace.sectors(&self.projects);
+        self.sector_focus = None; self.fitted = false;
+        self.discover();
+        self.toast("Removed from the map; files and sessions kept", t);
+    }
+
     pub fn work_group(&self, key: &str, action: &WorkAct) -> String {
         if key != crate::workspace::HOME {
             return match action {
                 WorkAct::Agent(id) if self.agent(*id).is_some_and(|a| a.kind == "shell") => "TERMINALS",
                 WorkAct::Agent(_) => "AGENTS",
                 WorkAct::Edit(..) | WorkAct::Files => "RESOURCES",
-                WorkAct::Anomalies => "PROJECT",
+                WorkAct::Anomalies | WorkAct::Pulls => "PROJECT",
                 _ => "WORK",
             }.into();
         }
@@ -2802,9 +2886,9 @@ impl App {
     pub fn work_rows(&self, w: &World, key: &str) -> Vec<(String, String, WorkAct)> {
         let mut rows = vec![];
         if key == crate::workspace::HOME {
-            rows.push(("Configure project root".into(), if self.workspace.root.is_empty() { "Choose the folder containing your projects".into() } else { self.workspace.root.clone() }, WorkAct::Root));
+            rows.push(("Manage sectors and folders".into(), "Add sector roots or remove folders from the map".into(), WorkAct::Root));
             rows.push(("Add a folder".into(), "Any existing or new project folder".into(), WorkAct::Add));
-            rows.push(("Refresh projects".into(), if self.discovering.is_some() { "Discovering repositories…".into() } else { "Discover Git projects under your root".into() }, WorkAct::Refresh));
+            rows.push(("Refresh projects".into(), if self.discovering.is_some() { "Discovering repositories…".into() } else { "Discover Git projects under all sector roots".into() }, WorkAct::Refresh));
             let mut planets: Vec<_> = w.planets.iter().filter(|p| p.key != crate::workspace::HOME).collect();
             planets.sort_by_key(|p| (self.home_need(&p.key).map_or(2, |a| if a.status == Status::Blocked { 0 } else { 1 }), parent(&p.key), p.name.to_lowercase()));
             for p in planets {
@@ -2848,6 +2932,10 @@ impl App {
             });
             let count = self.anomalies.findings.iter().filter(|f| f.world == key && f.state.active()).count();
             rows.push((format!("Anomalies · {count}"), "Detected problems and reported discoveries".into(), WorkAct::Anomalies));
+            let host = self.moon_host(key).unwrap_or_else(|| key.into());
+            if self.survey.worlds.get(&host).is_some_and(|s| s.github) {
+                rows.push(("Pull requests".into(), "Open this repository's PRs · p".into(), WorkAct::Pulls));
+            }
         }
         rows
     }
@@ -2870,27 +2958,69 @@ impl App {
                 self.open_anomalies(); self.anomaly_filter.world = Some(key.into());
                 self.mode = Mode::Anomalies { id: self.anomaly_rows().first().map_or(0, |f| f.id), typing: false };
             }
-            WorkAct::Root => { let mut text = Line::default(); text.set(self.workspace.root.clone()); self.mode = Mode::Root(text); }
+            WorkAct::Root => self.mode = Mode::Folders { sel: 0 },
             WorkAct::Add => { let mut path = Line::default(); path.set(if self.workspace.root.is_empty() { format!("{}/", home().display()) } else { format!("{}/", self.workspace.root) }); let comps = complete(&path.s); self.mode = Mode::Colonize(Colonize { path, kind: 0, comps, comp_i: 0, mkdir: false }); }
             WorkAct::Refresh => self.discover(),
+            WorkAct::Pulls => self.open_prs(key, t),
         }
     }
 }
 
 fn workspace_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Event, t: f32) {
+    if let Mode::Folders { sel } = app.mode {
+        let sources = app.workspace.sources();
+        let mut sel = sel.min(sources.len().saturating_sub(1));
+        let layout = draw::FoldersLayout::new(sel, l);
+        match ev {
+            Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Esc | KeyCode::Char('q' | 'V') => { app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 }; return; }
+                KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(sources.len().saturating_sub(1)),
+                KeyCode::Home => sel = 0,
+                KeyCode::End => sel = sources.len().saturating_sub(1),
+                KeyCode::PageUp => sel = sel.saturating_sub(layout.page),
+                KeyCode::PageDown => sel = (sel + layout.page).min(sources.len().saturating_sub(1)),
+                KeyCode::Enter | KeyCode::Char('n') => { app.mode = Mode::Root(Line::default()); return; }
+                KeyCode::Delete | KeyCode::Char('x') => if let Some((root, key)) = sources.get(sel) { app.remove_source(*root, key, t); },
+                _ => {}
+            },
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::ScrollUp => sel = sel.saturating_sub(1),
+                MouseEventKind::ScrollDown => sel = (sel + 1).min(sources.len().saturating_sub(1)),
+                MouseEventKind::Up(MouseButton::Left) if m.row as i32 >= 6 && (m.row as i32) < l.rows - 3 => {
+                    let at = layout.start + (m.row as usize - 6) / 2;
+                    if at < sources.len() && at < layout.start + layout.page { sel = at; }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        app.mode = Mode::Folders { sel: sel.min(app.workspace.sources().len().saturating_sub(1)) }; return;
+    }
     if let Mode::Root(text) = &mut app.mode {
         match ev {
             Event::Paste(p) => text.paste_lines(p),
             Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
-                KeyCode::Esc => app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 },
+                KeyCode::Esc => app.mode = Mode::Folders { sel: 0 },
+                KeyCode::Tab => if let Some(p) = complete(&text.s).first() { text.set(p.clone()); },
                 KeyCode::Enter => {
+                    if text.s.trim().is_empty() { app.toast("Enter a sector root folder", t); return; }
                     let path = expand(text.s.trim());
-                    if !path.is_dir() { app.toast("Choose an existing project root folder", t); return; }
+                    if !path.is_dir() { app.toast("Choose an existing sector root folder", t); return; }
                     let Ok(path) = path.canonicalize() else { app.toast("Cannot read that folder", t); return };
-                    let mut c = app.workspace.clone(); c.root = path.to_string_lossy().into_owned();
+                    let key = path.to_string_lossy().into_owned();
+                    let mut c = app.workspace.clone();
+                    if !c.discovery_roots().contains(&key.as_str()) {
+                        if c.root.is_empty() { c.root = key.clone(); } else { c.roots.push(key.clone()); }
+                    }
+                    c.hidden.retain(|p| !Path::new(p).starts_with(&key));
                     let result = if cfg!(test) { Ok(()) } else { c.save() };
                     match result {
-                        Ok(()) => { app.workspace = c; app.discover(); app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 }; }
+                        Ok(()) => {
+                            app.workspace = c; app.discover();
+                            let sel = app.workspace.sources().iter().position(|(root, p)| *root && p == &key).unwrap_or(0);
+                            app.mode = Mode::Folders { sel };
+                        }
                         Err(e) => app.toast(format!("Cannot save workspace: {e}"), t),
                     }
                 }
@@ -2918,6 +3048,10 @@ fn workspace_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
             KeyCode::End => sel = rows.len().saturating_sub(1),
             KeyCode::Enter => action = rows.get(sel).map(|r| r.2.clone()),
             KeyCode::Char('n') => action = Some(WorkAct::Add),
+            KeyCode::Char('p') if key == crate::workspace::HOME => {
+                if let Some((_, _, WorkAct::Project(project))) = rows.get(sel) { app.open_prs(project, t); return; }
+            }
+            KeyCode::Char('p') => action = Some(WorkAct::Pulls),
             KeyCode::Char('R') => action = Some(WorkAct::Refresh),
             KeyCode::Char('H') => action = Some(WorkAct::Project(crate::workspace::HOME.into())),
             KeyCode::Char('t') if key != crate::workspace::HOME => action = Some(WorkAct::Task),
@@ -2925,10 +3059,15 @@ fn workspace_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
                 if let Some((_, _, WorkAct::Project(project))) = rows.get(sel) { app.work_action(WorkAct::Launch, project, client, l, t); return; }
             }
             KeyCode::Char('e') => action = Some(WorkAct::Launch),
+            KeyCode::Char('V') => action = Some(WorkAct::Root),
             KeyCode::Char('r') if key == crate::workspace::HOME => action = Some(WorkAct::Root),
             KeyCode::Char('s') if key != crate::workspace::HOME => action = Some(WorkAct::Terminal),
             KeyCode::Char('a') if key != crate::workspace::HOME => action = Some(WorkAct::Anomalies),
-            KeyCode::Char('x') => if let Some((_, _, WorkAct::Agent(id))) = rows.get(sel) { app.workspace_return = Some(key.clone()); app.mode = Mode::Confirm { id: *id }; return; },
+            KeyCode::Char('x') | KeyCode::Delete => match rows.get(sel).map(|r| &r.2) {
+                Some(WorkAct::Agent(id)) => { app.workspace_return = Some(key.clone()); app.mode = Mode::Confirm { id: *id }; return; }
+                Some(WorkAct::Project(p)) if key == crate::workspace::HOME => app.remove_source(false, p, t),
+                _ => {}
+            },
             _ => {}
         },
         Event::Mouse(m) => match m.kind {
@@ -2958,7 +3097,7 @@ fn handle(
     t: f32,
     drag: &mut Option<((u16, u16), (f32, f32), bool)>,
 ) -> bool {
-    if matches!(app.mode, Mode::Workspace { .. } | Mode::Root(_)) {
+    if matches!(app.mode, Mode::Workspace { .. } | Mode::Root(_) | Mode::Folders { .. }) {
         workspace_input(app, w, l, client, &ev, t); return false;
     }
     if matches!(app.mode, Mode::Planet(_)) {
@@ -3036,13 +3175,16 @@ fn handle(
         return false;
     }
     if let Mode::Trade { sel } = app.mode {
-        let rows = app.trade_rows(w);
+        let rows = app.trade_visible_rows(w);
         let max = rows.len().saturating_sub(1);
         let mut selected = sel.min(max);
         let mut activate = false;
         match &ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
-                KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::Galaxy; return false; }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.trade_world = None;
+                    app.mode = app.trade_return.take().map_or(Mode::Galaxy, |key| Mode::Workspace { key, sel: 0 }); return false;
+                }
                 KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(max),
                 KeyCode::Home => selected = 0,
@@ -3385,7 +3527,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Workspace { .. } | Mode::Root(_) | Mode::Galaxy | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Trade { .. } | Mode::Situation { .. } => {}
+        Mode::Workspace { .. } | Mode::Root(_) | Mode::Folders { .. } | Mode::Galaxy | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
     if app.sel_planet().as_deref() == Some(crate::workspace::HOME) && matches!(k.code, KeyCode::Char('e' | 't' | 'B' | 'L' | 'r')) {
@@ -3409,6 +3551,9 @@ fn handle(
         KeyCode::Char('A') => app.open_anomalies(),
 
         KeyCode::Char('H') => app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 },
+        KeyCode::Char('V') => app.mode = Mode::Folders { sel: 0 },
+        KeyCode::Char('p') => if let Some(key) = app.sel_planet() { app.open_prs(&key, t); },
+        KeyCode::Delete => if let Some(Sel::Planet(key)) = app.sel.clone() { app.remove_source(false, &key, t); },
 
         KeyCode::Char('c') if ctrl => return true,
         KeyCode::Esc => { app.sel = None; app.sector_focus = None; },
@@ -3685,6 +3830,9 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
             if was_drag {
                 return;
             }
+            if let Some(key) = draw::pr_marker_hit(app, w, l, mc as i32, mr as i32, t) {
+                app.sel = Some(Sel::Planet(key.clone())); app.open_prs(&key, t); return;
+            }
             if mr as i32 == l.rows - 1 && (mc as usize) < draw::commander_button(app, w).chars().count() {
                 app.open_commander(w);
                 return;
@@ -3701,7 +3849,7 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
             if let Some(h) = hit {
                 if h == Sel::GitHub {
                     app.sel = Some(h);
-                    app.mode = Mode::Trade { sel: 0 };
+                    app.open_station();
                     return;
                 }
                 if app.sel.as_ref() == Some(&h) {
@@ -4095,6 +4243,110 @@ mod overview_tests {
 #[cfg(test)]
 mod station_tests {
     use super::*;
+
+    #[test]
+    fn planet_pr_marker_counts_unique_prs_and_distinguishes_attention_from_stale_data() {
+        let (mut app, world) = fixture();
+        let p = &world.planets[0];
+        let label = |app: &App| app.pr_signal(p).map(|s| s.label());
+        assert_eq!(label(&app).as_deref(), Some("◇ PR 1"));
+        assert!(app.pr_signal(&world.planets[2]).is_none(), "local folders have no marker");
+        assert!(app.pr_signal(&world.planets[3]).is_none(), "worktree stations share the planet's marker");
+        app.survey.worlds.get_mut("/alpha").unwrap().others = vec![survey::Pr { number: 7, ..Default::default() }, survey::Pr { number: 9, asks_you: true, draft: true, ..Default::default() }];
+        assert_eq!(label(&app).as_deref(), Some("◇ PR 2"), "drafts count but do not request attention");
+        app.survey.worlds.get_mut("/alpha").unwrap().others[1].draft = false;
+        assert_eq!(label(&app).as_deref(), Some("◇ PR 2 ↗"));
+        app.survey.worlds.get_mut("/alpha").unwrap().prs[0].ci = "fail";
+        assert_eq!(label(&app).as_deref(), Some("◇ PR 2 !"));
+        assert_eq!(app.trade_rows(&world).iter().filter(|r| r.path == "/alpha" && r.pr.is_some()).count(), 2);
+        app.survey.worlds.get_mut("/alpha").unwrap().prs_error = Some("offline".into());
+        assert_eq!(label(&app).as_deref(), Some("◇ PR 2 ?"));
+        let s = app.survey.worlds.get_mut("/alpha").unwrap();
+        s.prs_error = None; s.prs_checked = Some(survey::now() - 500);
+        assert_eq!(label(&app).as_deref(), Some("◇ PR 2 ?"));
+        let s = app.survey.worlds.get_mut("/alpha").unwrap();
+        s.prs.clear(); s.others.clear(); s.prs_checked = None;
+        assert_eq!(label(&app).as_deref(), Some("◇ PR ?"));
+        app.survey.worlds.get_mut("/alpha").unwrap().prs_checked = Some(survey::now());
+        assert!(label(&app).is_none(), "the marker disappears when no PRs remain");
+    }
+
+    #[test]
+    fn planet_pr_marker_stays_visible_on_quiet_outliner_rows_and_opens_the_matching_repo() {
+        let (mut app, mut world) = fixture();
+        world.systems.push(System { key: "/".into(), name: "test".into(), wpos: (0.0, 0.0), planets: vec![0, 1, 2], orbits: vec![], star: s3(0.5) });
+        world.planets[0].moons.push(3); world.planets[0].dormant = true;
+        world.planets[0].name = "alpha-with-a-very-long-project-name".into();
+        let client = Client::isolated();
+        for cols in [90, 120, 180] {
+            app.mode = Mode::Galaxy; app.sel = None;
+            let mut fb = Fb::new(cols, 40); let l = Lay::new(&fb, true);
+            draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+            let lines: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r[(l.cols - l.pw) as usize..].iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+            assert_eq!(lines.iter().filter(|s| s.contains("◇ PR")).count(), 2, "no duplicate on the worktree row");
+            let (row, line) = lines.iter().enumerate().find(|(_, s)| s.contains("alpha") && s.contains("◇ PR 1")).expect("quiet planets keep their PR marker even on a narrow outliner");
+            let col = l.cols - l.pw + line.chars().position(|c| c == '◇').unwrap() as i32;
+            mouse(&mut app, &world, &l, &client, event::MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: col as u16, row: row as u16, modifiers: KeyModifiers::NONE }, &mut None, 1.0);
+            assert!(matches!(app.mode, Mode::Trade { .. }));
+            assert!(app.trade_visible_rows(&world).iter().all(|r| r.path == "/alpha"));
+        }
+    }
+
+    #[test]
+    fn planet_pr_marker_keeps_scope_through_tabs_missions_and_workspace_return() {
+        let (mut app, world) = fixture();
+        app.survey.worlds.get_mut("/alpha").unwrap().others = vec![survey::Pr { number: 9, asks_you: true, title: "Review alpha".into(), ..Default::default() }];
+        app.survey.worlds.get_mut("/moon").unwrap().host = Some("/alpha".into());
+        let l = Lay::new(&Fb::new(100, 32), false); let client = Client::isolated();
+        let press = |app: &mut App, key| handle(app, &world, &l, &client, None, Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), 1.0, &mut None);
+        app.mode = Mode::Workspace { key: "/moon".into(), sel: 0 };
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.trade_world.as_deref(), Some("/alpha"));
+        press(&mut app, KeyCode::Tab);
+        let rows = app.trade_visible_rows(&world);
+        assert_eq!(rows.len(), 2); assert_eq!(rows[1].pr.as_ref().unwrap().number, 9);
+        press(&mut app, KeyCode::Down); press(&mut app, KeyCode::Char('t'));
+        assert!(matches!(&app.mode, Mode::Brief { planet, text, .. } if planet == "/alpha" && text.s.starts_with("Review PR #9")));
+        app.mode = Mode::Workspace { key: "/moon".into(), sel: 0 };
+        press(&mut app, KeyCode::Char('p')); press(&mut app, KeyCode::Esc);
+        assert!(matches!(&app.mode, Mode::Workspace { key, .. } if key == "/moon"));
+        assert!(app.trade_world.is_none());
+    }
+
+    #[test]
+    fn planet_pr_marker_opens_only_its_repository_and_returns_to_the_global_station() {
+        let (mut app, world) = fixture();
+        let mut fb = Fb::new(100, 32); let l = Lay::new(&fb, false); let client = Client::isolated();
+        app.sel = Some(Sel::Planet("/alpha".into()));
+        handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)), 1.0, &mut None);
+        assert!(matches!(app.mode, Mode::Trade { .. }));
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("Fix /alpha") && !text.contains("Fix /beta"));
+        handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), 1.0, &mut None);
+        app.sel = Some(Sel::GitHub); app.activate(&world, &l, &client);
+        draw::frame(&mut fb, &mut app, &world, &l, 2.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("Fix /alpha") && text.contains("Fix /beta"));
+    }
+
+    #[test]
+    fn planet_pr_marker_is_visible_and_clickable_beside_the_map_label() {
+        let (mut app, mut world) = fixture();
+        app.cam.z = 1.0; app.cam.x = 0.0; app.cam.y = 0.0;
+        for (i, p) in world.planets.iter_mut().enumerate() { p.wpos = if i == 0 { (0.0, 0.0) } else { (2000.0, 2000.0) }; }
+        app.survey.worlds.get_mut("/alpha").unwrap().others = vec![survey::Pr { number: 9, asks_you: true, ..Default::default() }];
+        let mut fb = Fb::new(100, 32); let l = Lay::new(&fb, false); let client = Client::isolated();
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let lines: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+        let (row, line) = lines.iter().enumerate().find(|(_, s)| s.contains("alpha") && s.contains("◇ PR 2 ↗")).expect("a planet must carry its PR count and review signal");
+        let col = line.chars().position(|c| c == '◇').unwrap();
+        mouse(&mut app, &world, &l, &client, event::MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: col as u16, row: row as u16, modifiers: KeyModifiers::NONE }, &mut None, 1.0);
+        assert!(matches!(app.mode, Mode::Trade { .. }));
+        draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
+        let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("Fix /alpha") && !text.contains("Fix /beta"));
+    }
 
     fn fixture() -> (App, World) {
         let mut app = App::new();
@@ -4994,6 +5246,112 @@ mod workspace_tests {
     use super::*;
 
     #[test]
+    fn shell_metadata_from_older_daemons_never_appears_in_the_ui() {
+        let mut app = App::new();
+        let mut v: AgentView = serde_json::from_value(serde_json::json!({
+            "id": 1, "kind": "shell", "cwd": "/world", "title": "private-test-title",
+            "task": "private-test-task", "output": "private-test-output", "status": "idle", "age": 1.0
+        })).unwrap();
+        app.apply(vec![v.clone()], 1.0, &mut vec![]);
+        assert_eq!(app.agent(1).unwrap().title, "Terminal #1");
+        assert!(!app.outputs.contains_key(&1));
+        // a cached label and preview must also be replaced on the next update
+        app.agents[0].title = "private-test-cached".into(); app.outputs.insert(1, "private-test-preview".into());
+        v.task.clear(); v.title.clear(); v.output.clear();
+        app.apply(vec![v], 2.0, &mut vec![]);
+        assert_eq!(app.agent(1).unwrap().title, "Terminal #1");
+        assert!(!app.outputs.contains_key(&1));
+        let w = app.world(2.0, 0.0); let mut fb = Fb::new(140, 40); let l = Lay::new(&fb, true);
+        for mode in [Mode::Galaxy, Mode::Workspace { key: "/world".into(), sel: 3 }, Mode::Ship { id: 1, sel: 0 }] {
+            app.mode = mode; app.sel = Some(Sel::Agent(1));
+            draw::frame(&mut fb, &mut app, &w, &l, 2.0, None);
+            let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
+            assert!(!text.contains("private-test"));
+            assert!(text.contains("Terminal #1"));
+        }
+    }
+
+    #[test]
+    fn sector_roots_can_be_added_and_removed_without_replacing_other_sources() {
+        let dir = std::env::temp_dir().join(format!("empire-manage-roots-{}", std::process::id()));
+        for p in ["one/team/api/.git", "two/web/.git", "one/kept"] { std::fs::create_dir_all(dir.join(p)).unwrap(); }
+        let first = dir.join("one").to_string_lossy().into_owned();
+        let second = dir.join("two").to_string_lossy().into_owned();
+        let api = dir.join("one/team/api").to_string_lossy().into_owned();
+        let kept = dir.join("one/kept").to_string_lossy().into_owned();
+        let web = dir.join("two/web").to_string_lossy().into_owned();
+        let mut app = App::new(); app.history.clear();
+        let w = app.world(1.0, 0.0); let l = Lay::new(&Fb::new(100, 30), false);
+        let (client, commands) = Client::recording();
+        press(&mut app, &w, &l, &client, KeyCode::Char('V'));
+        for path in [&first, &second, &second] {
+            press(&mut app, &w, &l, &client, KeyCode::Char('n'));
+            handle(&mut app, &w, &l, &client, None, Event::Paste(path.clone()), 1.0, &mut None);
+            press(&mut app, &w, &l, &client, KeyCode::Enter);
+            assert!(matches!(app.mode, Mode::Folders { .. }));
+        }
+        assert_eq!(app.workspace.discovery_roots(), vec![first.as_str(), second.as_str()]);
+        app.projects = app.discovering.take().unwrap().recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(app.projects, vec![api.clone(), web.clone()]);
+        app.workspace.folders.push(kept.clone()); app.projects.push(kept.clone());
+        app.history.insert(api.clone(), 1);
+        app.mode = Mode::Folders { sel: 0 };
+        press(&mut app, &w, &l, &client, KeyCode::Delete);
+        assert_eq!(app.workspace.discovery_roots(), vec![second.as_str()]);
+        assert_eq!(app.workspace.projects(), vec![kept.clone(), web]);
+        assert!(app.world(2.0, 0.0).planet(&api).is_none());
+        assert!(app.world(2.0, 0.0).planet(&kept).is_some());
+        assert!(Path::new(&api).join(".git").exists());
+        let saved = crate::state::edit::<crate::workspace::Config>(&dir.join("workspace.json"), |c| *c = app.workspace.clone()).unwrap();
+        let back: crate::workspace::Config = serde_json::from_slice(&std::fs::read(dir.join("workspace.json")).unwrap()).unwrap();
+        assert!(back == saved && back.hidden.contains(&api));
+        assert!(commands.try_iter().next().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn folder_manager_scrolls_and_clicks_the_rendered_sources() {
+        let mut app = App::new(); app.history.clear();
+        app.workspace.roots = (0..15).map(|i| format!("/work/sector-{i:02}")).collect();
+        let w = app.world(1.0, 0.0); let client = Client::isolated();
+        for (cols, rows) in [(120, 35), (80, 24), (36, 14)] {
+            let mut fb = Fb::new(cols, rows); let l = Lay::new(&fb, false);
+            app.mode = Mode::Folders { sel: 0 };
+            press(&mut app, &w, &l, &client, KeyCode::End);
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let lines: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+            assert!(lines.iter().any(|s| s.contains("sector-14")));
+            assert!(lines.iter().any(|s| s.contains("n sector · x remove")));
+            let layout = draw::FoldersLayout::new(14, &l);
+            handle(&mut app, &w, &l, &client, None, Event::Mouse(event::MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 5, row: 6, modifiers: KeyModifiers::NONE }), 1.0, &mut None);
+            assert!(matches!(app.mode, Mode::Folders { sel } if sel == layout.start));
+        }
+    }
+
+    #[test]
+    fn removing_a_manual_world_keeps_its_files_and_sessions_but_hides_its_history() {
+        let dir = std::env::temp_dir().join(format!("empire-remove-world-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap(); std::fs::write(dir.join("keep.txt"), "keep me").unwrap();
+        let key = dir.to_string_lossy().into_owned();
+        let mut app = App::new(); app.history.clear(); app.add_folder(&dir, 1.0); app.history.insert(key.clone(), 1);
+        let mut ship = ship_card_tests::ship(1, false); ship.cwd = key.clone(); app.agents.push(ship);
+        let w = app.world(1.0, 0.0); let l = Lay::new(&Fb::new(100, 30), false);
+        let (client, commands) = Client::recording();
+        let sel = app.work_rows(&w, crate::workspace::HOME).iter().position(|r| matches!(&r.2, WorkAct::Project(p) if p == &key)).unwrap();
+        app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel };
+        press(&mut app, &w, &l, &client, KeyCode::Delete);
+        assert!(!app.workspace.folders.contains(&key));
+        assert!(commands.try_iter().next().is_none());
+        assert!(app.world(2.0, 0.0).planet(&key).is_some(), "a session must stay reachable");
+        app.agents.clear();
+        assert!(app.world(3.0, 0.0).planet(&key).is_none(), "history must not resurrect a removed planet");
+        assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "keep me");
+        app.add_folder(&dir, 4.0);
+        assert!(app.workspace.projects().contains(&key), "adding the folder again restores it");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn home_groups_quiet_projects_and_mouse_opens_the_rendered_row() {
         let mut app = App::new(); app.history.clear(); app.workspace.root = "/code".into();
         app.projects = vec!["/code/team/zebra".into(), "/code/tools/alpha".into(), "/code/team/api".into(), "/code/tools/review".into()];
@@ -5120,7 +5478,7 @@ mod workspace_tests {
             draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
             let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();
             assert!(text.contains("HOME"));
-            if rows >= 24 { assert!(text.contains("Configure project root")); }
+            if rows >= 24 { assert!(text.contains("Manage sectors and folders")); }
             app.mode = Mode::Workspace { key: "/world".into(), sel: 3 };
             draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
             let text: String = fb.txt.iter().map(|c| c.map_or(' ', |c| c.ch)).collect();

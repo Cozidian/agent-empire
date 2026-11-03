@@ -37,13 +37,13 @@ pub fn graphics_preview(fb: &mut Fb, polished: bool, t: f32) {
         let x = w * (i as f32 + 0.5) / 3.0;
         let p = Planet { key: String::new(), name: name.into(), agents: vec![], terrain: kind, seed, wpos: (x, cy), r: radius,
             host: None, moons: vec![], level: 2, dormant: false, fog: 0.0, last_seen: 0 };
-        sphere_style(fb, x, cy, radius, &p, (-1.0, -0.5), t, polished);
+        sphere_style(fb, x, cy, radius, &p, (-1.0, -0.5), t, polished, 5);
         let row = ((cy + radius) / 4.0) as i32 + 2;
         let col = x as i32 / 2 - name.len() as i32 / 2;
         if fb.cols >= 90 { fb.text(col, row, name, DIM); }
         // the same materials at map scale, where silhouette matters more than detail
-        sphere_style(fb, x - 10.0, h * 0.82, 4.0, &p, (-1.0, -0.5), t, polished);
-        sphere_style(fb, x + 10.0, h * 0.82, 8.0, &p, (-1.0, -0.5), t, polished);
+        sphere_style(fb, x - 10.0, h * 0.82, 4.0, &p, (-1.0, -0.5), t, polished, 5);
+        sphere_style(fb, x + 10.0, h * 0.82, 8.0, &p, (-1.0, -0.5), t, polished, 5);
     }
     if fb.cols >= 90 {
         star(fb, (w / 3.0, h * 0.82), 3.2, 31, v3(1.0, 0.72, 0.42), t);
@@ -59,6 +59,7 @@ pub fn graphics_preview(fb: &mut Fb, polished: bool, t: f32) {
 pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Option<&Sound>) {
     fb.clear_text();
     if let Mode::Workspace { key, sel } = &app.mode { workspace(fb, app, w, key, *sel, l, t); return; }
+    if let Mode::Folders { sel } = app.mode { folders(fb, app, sel, l, t); return; }
     if let Mode::Planet(v) = &app.mode {
         planet_view(fb, app, w, v, l, t);
         return;
@@ -100,10 +101,10 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     match &app.mode {
         Mode::Root(text) => {
             let (x, y, width, height) = centered(l, 76, 9);
-            frame_box(fb, x, y, width, height, "HOME · PROJECT ROOT", v3(0.5, 0.85, 1.0));
-            seg(fb, x + 3, y + 2, "Git repositories become planets; folders become sectors.", width - 6, DIM, Some(BOX));
+            frame_box(fb, x, y, width, height, "ADD SECTOR ROOT", v3(0.5, 0.85, 1.0));
+            seg(fb, x + 3, y + 2, "Folder to scan for Git projects, e.g. ~/work", width - 6, DIM, Some(BOX));
             field(fb, x + 3, y + 4, width - 6, text, TEXT, t);
-            seg(fb, x + 3, y + 7, "Enter discover · Esc cancel", width - 6, DIM, Some(BOX));
+            seg(fb, x + 3, y + 7, "Enter add · Tab complete · Esc cancel", width - 6, DIM, Some(BOX));
         }
         Mode::Commander => commander(fb, app, w, l),
         Mode::Anomalies { id, typing } => anomalies(fb, app, l, *id, *typing),
@@ -255,11 +256,12 @@ fn terrain(kind: u8, lon: f32, lat: f32, seed: f32) -> (V3, V3, V3) {
 }
 
 /// A lit, rotating planet with an atmosphere rim, lit from `light` (toward the star).
-fn sphere(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), t: f32) {
-    sphere_style(fb, cx, cy, r, p, light, t, true);
+fn sphere(fb: &mut Fb, app: &App, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), t: f32) {
+    let buildings = app.survey.worlds.get(&p.key).map_or(0, |g| g.structures.len());
+    sphere_style(fb, cx, cy, r, p, light, t, true, buildings);
 }
 
-fn sphere_style(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), t: f32, polished: bool) {
+fn sphere_style(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, f32), t: f32, polished: bool, buildings: usize) {
     let l = {
         let v = v3(light.0, light.1, 0.55);
         v / (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
@@ -310,21 +312,13 @@ fn sphere_style(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, 
                     c = mix(c * (1.0 - cloud * 0.18), s3(0.06 + fill * 0.05 + diffuse * 0.94), cloud);
                 }
             }
-            // a city world glitters on its night side
-            if p.level >= 2 && day < 0.35 {
-                let cell = ((lon * 16.0).floor() as i32, (dy * 12.0).floor() as i32);
-                let lit = rnd((cell.0 as u32).wrapping_mul(73_856_093) ^ (cell.1 as u32).wrapping_mul(19_349_663) ^ p.seed.to_bits());
-                let density = if p.level >= 3 { 0.45 } else { 0.72 };
-                if lit > density && fract(lon * 16.0) < 0.5 && fract(dy * 12.0) < 0.5 {
-                    c += v3(1.0, 0.75, 0.35) * (0.35 - day) * 2.2;
-                }
-            }
             // a neglected world goes grey and dim under the fog
             let grey = s3((c.x + c.y + c.z) / 3.0);
             let c = mix(c, mix(grey, v3(0.35, 0.3, 0.5) * grey.x * 2.0, 0.5), p.fog) * (1.0 - 0.7 * p.fog);
             fb.px[i] = if polished { mix(fb.px[i], c, smoothstep(-0.5, 0.6, (1.0 - d2.sqrt()) * r)) } else { c };
         }
     }
+    city_lights(fb, p, (cx, cy), r, l, t, buildings);
     // and the nebula closes in around it
     if p.fog > 0.3 {
         let e = r * 2.6 + 6.0;
@@ -344,22 +338,44 @@ fn sphere_style(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, 
     }
 }
 
-/// A world's structures, as spires standing on its upper limb, each with a beacon in its colour.
-fn spires(fb: &mut Fb, app: &App, p: &Planet, (px, py): (f32, f32), r: f32, t: f32) {
-    let Some(built) = app.survey.worlds.get(&p.key).map(|g| &g.structures).filter(|b| !b.is_empty()) else { return };
-    if r < 5.0 || p.fog > 0.6 {
-        return;
+/// Small settlements on a world's night side, carried with its rotating surface.
+fn city_lights(fb: &mut Fb, p: &Planet, (cx, cy): (f32, f32), r: f32, light: V3, t: f32, buildings: usize) {
+    if buildings == 0 || r <= 5.0 || p.fog > 0.6 { return; }
+    let seed = p.seed.to_bits();
+    let (st, ct) = ((rnd(seed ^ 83) - 0.5) * 1.4).sin_cos();
+    let phase = p.seed * TAU + t * 0.04 * (0.5 + p.seed);
+    let zoom = smoothstep(5.0, 11.0, r);
+    // fixed surface sites: adding resources fills settlements without moving existing lights
+    let mut lights: HashMap<usize, f32> = HashMap::new();
+    for i in 0..(18 + buildings.min(8)) {
+        let s = hash(seed ^ (i as u32).wrapping_mul(7919) ^ 401);
+        let lon = rnd(seed ^ 397) * TAU + i as f32 * 2.399963;
+        let lat = (rnd(s ^ 7) - 0.5) * 1.5;
+        for j in 0..(4 + buildings.min(8) / 2 + p.level.min(3) as usize) {
+            let k = hash(s ^ (j as u32).wrapping_mul(3571) ^ 409);
+            let u = lon + (rnd(k ^ 11) - 0.5) * 0.24 - phase;
+            let v = lat + (rnd(k ^ 13) - 0.5) * 0.16;
+            let ring = (1.0 - v * v).sqrt();
+            let (x, z) = (u.sin() * ring, u.cos() * ring);
+            if z <= 0.0 { continue; }
+            let (dx, dy) = (x * ct + v * st, -x * st + v * ct);
+            let (px, py) = ((cx + dx * r).floor() as i32, (cy + dy * r).floor() as i32);
+            let Some(idx) = fb.idx(px, py) else { continue };
+            // evaluate the actual pixel so even a tiny world keeps a clean silhouette
+            let (nx, ny) = ((px as f32 + 0.5 - cx) / r, (py as f32 + 0.5 - cy) / r);
+            let d2 = nx * nx + ny * ny;
+            if d2 >= 1.0 { continue; }
+            let nz = (1.0 - d2).sqrt();
+            let day = nx * light.x + ny * light.y + nz * light.z;
+            let glow = smoothstep(0.32, -0.08, day) * smoothstep(0.04, 0.2, nz) * zoom * (0.65 + rnd(k ^ 17) * 0.35);
+            // overlapping windows stay quiet, particularly at map scale
+            lights.entry(idx).and_modify(|v| *v = v.max(glow)).or_insert(glow);
+        }
     }
-    let n = built.len() as f32;
-    for (i, b) in built.iter().enumerate() {
-        // spread over the top of the planet, from 10 to 2 o'clock
-        let a = -PI / 2.0 + (i as f32 + 0.5 - n / 2.0) * (PI * 0.65 / n.max(3.0));
-        let (dx, dy) = (a.cos(), a.sin());
-        let h = 2.0 + (b.count.min(4) as f32) * 0.8;
-        let col = b.kind.color() * (1.0 - 0.7 * p.fog);
-        fb.line(px + dx * (r - 0.5), py + dy * (r - 0.5), px + dx * (r + h), py + dy * (r + h), col * 0.5, col * 0.8);
-        let pulse = 0.7 + 0.3 * (t * 1.5 + i as f32 * 1.3).sin();
-        fb.splat(px + dx * (r + h + 0.8), py + dy * (r + h + 0.8), col * pulse);
+    for (i, glow) in lights {
+        let c = v3(1.0, 0.72, 0.35) * glow;
+        let grey = s3((c.x + c.y + c.z) / 3.0);
+        fb.px[i] += mix(c, mix(grey, v3(0.35, 0.3, 0.5) * grey.x * 2.0, 0.5), p.fog) * (1.0 - 0.7 * p.fog);
     }
 }
 
@@ -718,8 +734,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         };
         ships(false, fb);
         rings(false, fb);
-        sphere(fb, px, py, r, p, (lx / ll, ly / ll), t);
-        spires(fb, app, p, (px, py), r, t);
+        sphere(fb, app, px, py, r, p, (lx / ll, ly / ll), t);
         if app.focused_sector().is_some_and(|s| app.sector_has(s, &p.key)) { ellipse(fb, px, py, r + 7.0, r + 5.0, v3(0.3, 0.45, 0.7)); }
         rings(true, fb);
         let live = || p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none());
@@ -943,15 +958,16 @@ pub fn trade_hit(l: &Lay, count: usize, selected: usize, col: i32, row: i32) -> 
 }
 
 fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usize, t: f32) {
-    let rows = app.trade_rows(world);
+    let rows = app.trade_visible_rows(world);
     let selected = selected.min(rows.len().saturating_sub(1));
     let (x, y, width, height, offset, room) = trade_layout(l, rows.len(), selected);
     let accent = v3(0.6, 0.8, 1.0);
     let projects = rows.iter().filter(|r| r.pr.is_none()).count();
     let prs = rows.len() - projects;
-    frame_box(fb, x, y, width, height, &format!("◇ GITHUB · {projects} projects · {prs} PRs · {}", app.trade_view.label()), accent);
+    let place = app.trade_world.as_deref().map_or_else(|| format!("{projects} projects"), base_name);
+    frame_box(fb, x, y, width, height, &format!("◇ GITHUB · {place} · {prs} PRs · {}", app.trade_view.label()), accent);
     let views = [TradeView::All, TradeView::Review, TradeView::Mine].map(|v| if v == app.trade_view { format!("[{}]", v.label()) } else { v.label().to_string() }).join("  ");
-    seg(fb, x + 3, y + 2, &format!("Projects in this galaxy · ⇥ {views}"), width - 6, DIM, Some(BOX));
+    seg(fb, x + 3, y + 2, &format!("{} · ⇥ {views}", if app.trade_world.is_some() { "This repository" } else { "Projects in this galaxy" }), width - 6, DIM, Some(BOX));
     if rows.is_empty() {
         seg(fb, x + 3, y + 4, "No GitHub projects in this galaxy yet.", width - 6, TEXT, Some(BOX));
     }
@@ -1001,6 +1017,50 @@ fn trade_overview(fb: &mut Fb, app: &App, world: &World, l: &Lay, selected: usiz
     seg(fb, x + 3, y + height - 2, "↑↓ select · ⇥ view · t mission (review / fix a PR) · ⏎ focus / open PR · esc close", width - 6, DIM, Some(BOX));
 }
 
+struct PlanetLabel {
+    col: i32, row: i32, name: String, parts: Vec<(String, V3)>, signal: Option<PrSignal>,
+}
+impl PlanetLabel {
+    fn marker_col(&self) -> i32 { self.col + self.name.chars().count() as i32 + 1 }
+}
+
+/// One shared label geometry for painting and clicking its PR marker.
+fn planet_label(app: &App, p: &Planet, l: &Lay, t: f32) -> Option<PlanetLabel> {
+    let z = app.cam.z;
+    if z < OVERVIEW_ZOOM || app.sector_map() || (p.r * z < 3.0 && app.sel != Some(Sel::Planet(p.key.clone()))) { return None; }
+    let (px, py) = l.to_screen(&app.cam, p.wpos);
+    let width = l.cols - l.pw;
+    if px < 0.0 || px >= width as f32 * 2.0 { return None; }
+    let row = ((py + (p.r * z).max(2.5) + 7.0) / 4.0) as i32;
+    if row < 1 || row >= l.rows - 1 { return None; }
+    let parts = tally(p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none()), t);
+    let signal = app.pr_signal(p);
+    let extra = parts.iter().map(|(s, _)| s.chars().count().min(8) as i32 + 1).sum::<i32>()
+        + signal.as_ref().map_or(0, |s| s.label().chars().count() as i32 + 1);
+    let room = width - extra - 2;
+    if room < 1 { return None; }
+    let anomalies = app.anomaly_count(&p.key, false);
+    let name = clip(&format!("{}{}{}", if p.host.is_some() { "☾ " } else { "" }, p.name, if anomalies > 0 { format!(" ⟡{anomalies}") } else { String::new() }), room as usize);
+    let len = name.chars().count() as i32 + extra;
+    Some(PlanetLabel { col: ((px / 2.0) as i32 - len / 2).clamp(0, width - len - 1), row, name, parts, signal })
+}
+
+pub fn pr_marker_hit(app: &App, w: &World, l: &Lay, col: i32, row: i32, t: f32) -> Option<String> {
+    if !matches!(app.mode, Mode::Galaxy) { return None; }
+    if l.pw > 0 && col >= l.cols - l.pw {
+        let Sel::Planet(key) = panel_hit(app, w, l, row)? else { return None };
+        let signal = app.pr_signal(w.planet(&key)?)?;
+        let start = l.cols - 1 - signal.label().chars().count() as i32;
+        return (col >= start && col < l.cols - 1).then_some(key);
+    }
+    w.planets.iter().rev().find_map(|p| {
+        let label = planet_label(app, p, l, t)?;
+        let signal = label.signal.as_ref()?;
+        let start = label.marker_col();
+        (row == label.row && col >= start && col < start + signal.label().chars().count() as i32).then(|| p.key.clone())
+    })
+}
+
 fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     if app.cam.z < OVERVIEW_ZOOM || app.sector_map() {
         for label in if app.sector_map() { sector_labels(app, w, l) } else { overview_labels(app, w, l) } {
@@ -1035,20 +1095,12 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
     }
     for p in &w.planets {
         let selected = app.sel.as_ref() == Some(&Sel::Planet(p.key.clone()));
-        if p.r * z < 3.0 && !selected {
-            continue;
-        }
-        let (px, py) = l.to_screen(cam, p.wpos);
-        let parts = tally(p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none()), t);
-        let anomalies = app.anomaly_count(&p.key, false);
-        let name = format!("{}{}{}", if p.host.is_some() { "☾ " } else { "" }, p.name, if anomalies > 0 { format!(" ⟡{anomalies}") } else { String::new() });
-        let len = name.chars().count() as i32 + parts.iter().map(|(s, _)| s.chars().count() as i32 + 1).sum::<i32>();
-        let (mut c, r) = ((px / 2.0) as i32 - len / 2, ((py + (p.r * z).max(2.5) + 7.0) / 4.0) as i32);
-        if !in_view(c, r) || !in_view(c + len, r) {
-            continue;
-        }
-        c = seg(fb, c, r, &name, len + 2, if selected { s3(1.0) } else { TEXT * (1.0 - 0.65 * p.fog) }, None);
-        for (s, col) in parts {
+        let Some(label) = planet_label(app, p, l, t) else { continue };
+        let (px, _) = l.to_screen(cam, p.wpos);
+        let r = label.row;
+        let mut c = seg(fb, label.col, r, &label.name, cw - label.col, if selected { s3(1.0) } else { TEXT * (1.0 - 0.65 * p.fog) }, None);
+        if let Some(signal) = label.signal { c = seg(fb, c + 1, r, &signal.label(), cw - c - 1, signal.color(), None); }
+        for (s, col) in label.parts {
             c = seg(fb, c + 1, r, &s, 8, col, None);
         }
         // what it needs, and its missions, on the line below
@@ -1555,12 +1607,13 @@ fn footer(fb: &mut Fb, app: &App, _w: &World, l: &Lay, sound: Option<&Sound>) {
         Some(_) => "· M music on ",
     };
     let ctx = match &app.sel {
-        Some(Sel::Planet(_)) => "Enter project · t task · e agent · ",
+        Some(Sel::Planet(key)) if key != crate::workspace::HOME => "Enter project · p PRs · Del remove · t task · e agent · ",
+        Some(Sel::Planet(_)) => "Enter home · ",
         Some(Sel::Agent(_)) => "Enter terminal · x dismiss · ",
         Some(Sel::GitHub) => "Enter pull requests · ",
         _ => "",
     };
-    let s = format!("{ctx}H home · n folder · Tab next alert · A anomalies · ? help · q leave {music}{mute}");
+    let s = format!("{ctx}H home · n folder · V sectors · Tab next alert · A anomalies · ? help · q leave {music}{mute}");
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1650,14 +1703,21 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 let tw: usize = parts.iter().map(|(s, _)| s.chars().count() + 1).sum();
                 let (glyph, indent) = if p.host.is_some() { ("☾ ", 3) } else if p.dormant { ("◌ ", 1) } else { ("● ", 1) };
                 let x = seg(fb, c0 + indent, row, glyph, 2, planet_color(p) * (1.0 - 0.6 * p.fog), Some(bg));
+                let signal = app.pr_signal(p);
+                let mut right = x0 + pw - 1;
+                if let Some(signal) = signal {
+                    let text = signal.label(); let len = text.chars().count() as i32;
+                    seg(fb, right - len, row, &text, len, signal.color(), Some(bg));
+                    right -= len + 1;
+                }
                 if p.dormant && p.host.is_none() {
                     let age = ago((survey::now() as u64).saturating_sub(p.last_seen) as f32);
-                    seg(fb, x, row, &pad(&p.name, inner.saturating_sub(4 + age.len())), pw, DIM * (1.1 - 0.5 * p.fog), Some(bg));
-                    seg(fb, x0 + pw - 1 - age.len() as i32, row, &age, 8, DIM * 0.7, Some(bg));
+                    seg(fb, x, row, &p.name, (right - x - age.len() as i32 - 1).max(0), DIM * (1.1 - 0.5 * p.fog), Some(bg));
+                    seg(fb, right - age.len() as i32, row, &age, age.len() as i32, DIM * 0.7, Some(bg));
                     continue;
                 }
-                seg(fb, x, row, &pad(&p.name, inner.saturating_sub(2 + indent as usize + tw)), pw, TEXT, Some(bg));
-                let mut x = x0 + pw - 1 - tw as i32;
+                seg(fb, x, row, &p.name, (right - x - tw as i32 - 1).max(0), TEXT, Some(bg));
+                let mut x = right - tw as i32;
                 for (s, c) in parts {
                     x = seg(fb, x, row, &s, 8, c, Some(bg)) + 1;
                 }
@@ -1861,6 +1921,43 @@ impl PlanetLayout {
     }
 }
 
+/// Scrollable sector roots and manually charted worlds.
+pub struct FoldersLayout { pub start: usize, pub page: usize }
+impl FoldersLayout {
+    pub fn new(sel: usize, l: &Lay) -> Self {
+        let page = ((l.rows - 9) / 2).max(1) as usize;
+        Self { start: sel.saturating_sub(page - 1), page }
+    }
+}
+
+fn folders(fb: &mut Fb, app: &App, sel: usize, l: &Lay, t: f32) {
+    fb.px.fill(PANEL);
+    let accent = v3(0.5, 0.85, 1.0);
+    fb.panel(0, 0, l.cols, 5, BAR);
+    seg(fb, 2, 0, "‹ Esc home", l.cols - 4, DIM, Some(BAR));
+    seg(fb, 2, 2, "SECTORS & FOLDERS", l.cols - 4, TEXT, Some(BAR));
+    seg(fb, 2, 4, "Sector roots discover Git projects below them.", l.cols - 4, accent, Some(BAR));
+    let sources = app.workspace.sources();
+    let sel = sel.min(sources.len().saturating_sub(1));
+    let layout = FoldersLayout::new(sel, l);
+    for (i, (root, path)) in sources.iter().enumerate().skip(layout.start).take(layout.page) {
+        let y = 6 + (i - layout.start) as i32 * 2;
+        let bg = if i == sel { SELBG } else { PANEL };
+        fb.panel(1, y, l.cols - 2, 2, bg);
+        seg(fb, 2, y, if i == sel { "›" } else { " " }, 1, accent, Some(bg));
+        seg(fb, 4, y, &format!("{} · {}", if *root { "Sector root" } else { "Planet" }, base_name(path)), l.cols - 6, TEXT, Some(bg));
+        seg(fb, 4, y + 1, &tilde(path), l.cols - 6, DIM, Some(bg));
+    }
+    if sources.is_empty() { seg(fb, 2, 6, "n adds your first sector root", l.cols - 4, TEXT, None); }
+    seg(fb, 2, l.rows - 3, "Removal keeps files and sessions.", l.cols - 4, DIM, None);
+    fb.panel(0, l.rows - 2, l.cols, 2, BAR);
+    seg(fb, 2, l.rows - 2, "n sector · x remove · Esc home", l.cols - 4, TEXT, Some(BAR));
+    let note = if app.discovering.is_some() { "Discovering repositories…".into() }
+        else { format!("{} roots · {} folders · ↑↓ select", app.workspace.discovery_roots().len(), app.workspace.folders.len()) };
+    seg(fb, 2, l.rows - 1, &note, l.cols - 4, DIM, Some(BAR));
+    if let Some((msg, when)) = &app.toast && t - when < 3.2 { seg(fb, 2, l.rows - 3, msg, l.cols - 4, accent, Some(PANEL)); }
+}
+
 /// Visible workspace rows; headers and notes share the same geometry for drawing and clicks.
 pub struct WorkspaceLayout {
     pub width: i32,
@@ -1927,8 +2024,7 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
         let x = (width + (l.cols - width) / 2) as f32 * 2.0;
         let y = l.rows as f32 * 2.1;
         let radius = ((l.cols - width) as f32 * 0.75).min(l.rows as f32 * 1.3);
-        sphere(fb, x, y, radius, p, (-1.0, -0.5), t);
-        spires(fb, app, p, (x, y), radius, t);
+        sphere(fb, app, x, y, radius, p, (-1.0, -0.5), t);
         seg(fb, width + 2, l.rows - 6, if home { "Your fleet starts here." } else { "A world of your own." }, l.cols - width - 4, DIM, None);
     }
     for (y, heading) in &layout.headings {
@@ -1957,10 +2053,10 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
     }
     fb.panel(0, l.rows - 2, l.cols, 2, BAR);
     let terminal = rows.get(sel).is_some_and(|r| matches!(r.2, WorkAct::Agent(id) if app.agent(id).is_some_and(|a| a.kind == "shell")));
-    seg(fb, 2, l.rows - 2, if home { "↑↓ choose · Enter open · e launch · n folder · r root · R refresh · Esc galaxy" }
+    seg(fb, 2, l.rows - 2, if home { "r sectors · x remove · p PRs · Enter open · n folder · e launch · R refresh · Esc galaxy" }
         else if terminal { "Enter reopen · s new terminal · x close · ↑↓ choose · H home · Esc galaxy" }
         else if rows.get(sel).is_some_and(|r| matches!(r.2, WorkAct::Edit(..))) { "Enter edit in your editor · ↑↓ choose · t task · s terminal · H home · Esc galaxy" }
-        else { "↑↓ choose · Enter open · t task · e agent · s terminal · a anomalies · x dismiss · H home" }, l.cols - 4, TEXT, Some(BAR));
+        else { "↑↓ choose · Enter open · p PRs · t task · e agent · s terminal · a anomalies · x dismiss · H home" }, l.cols - 4, TEXT, Some(BAR));
     let context = rows.get(sel).map(|(_, note, a)| if home { if let WorkAct::Project(p) = a { tilde(p) } else { note.clone() } }
         else if terminal { "F12 / Ctrl-] returns here and keeps the terminal running.".into() } else { note.clone() });
     seg(fb, 2, l.rows - 1, context.as_deref().unwrap_or("Agents and terminals keep running when you leave."), l.cols - 4, DIM, Some(BAR));
@@ -1981,7 +2077,7 @@ fn planet_view(fb: &mut Fb, app: &App, w: &World, v: &PlanetView, l: &Lay, t: f3
         for row in 0..4 {
             for col in (l.cols - 13).max(0)..l.cols { fb.txt[(row * l.cols + col) as usize] = None; }
         }
-        sphere(fb, l.cols as f32 * 2.0 - 15.0, 8.0, 6.0, p, (-1.0, -0.5), t);
+        sphere(fb, app, l.cols as f32 * 2.0 - 15.0, 8.0, 6.0, p, (-1.0, -0.5), t);
     }
     if l.cols < 48 || l.rows < 18 {
         seg(fb, 2, 6, "Enlarge the terminal to browse buildings.", l.cols - 4, TEXT, None);
@@ -2005,8 +2101,7 @@ fn planet_view(fb: &mut Fb, app: &App, w: &World, v: &PlanetView, l: &Lay, t: f3
     if l.rows >= 30 {
         if let Some(p) = w.planet(&v.key) {
             let cy = (l.rows as f32 - 6.0) * 4.0;
-            sphere(fb, g.split as f32, cy, 12.0, p, (-1.0, -0.5), t);
-            spires(fb, app, p, (g.split as f32, cy), 12.0, t);
+            sphere(fb, app, g.split as f32, cy, 12.0, p, (-1.0, -0.5), t);
         }
     }
     let x = g.split + 2;
@@ -2418,10 +2513,14 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("GALAXY", ""),
         ("Enter / double click", "open project or native agent terminal"),
         ("H / n", "home planet / add a folder"),
+        ("V", "sectors and folders: n add root, x remove"),
+        ("Delete", "remove selected planet; keep files and sessions"),
+        ("Home: r / x", "manage sectors / remove selected project"),
         ("Tab / C", "next agent needing you / all attention"),
         ("1-9 / h", "answer / hail an incoming transmission"),
         ("A", "anomalies: investigate, dismiss or resolve"),
         ("e / t", "launch agent / give planet a task"),
+        ("p / click PR marker", "open this planet's pull requests"),
         ("L / S", "planet task history / situation log"),
         ("wasd / drag", "pan · ± / wheel zoom · z fit · f focus"),
         ("o / m / M", "outliner / alert sounds / music"),

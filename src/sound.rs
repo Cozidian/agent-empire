@@ -347,6 +347,11 @@ impl Hall {
         Self { combs: [combs(0), combs(23)], aps: [aps(0), aps(23)] }
     }
 
+    fn clear(&mut self) {
+        for cb in self.combs.iter_mut().flatten() { cb.buf.fill(0.0); cb.store = 0.0; cb.i = 0; }
+        for ap in self.aps.iter_mut().flatten() { ap.buf.fill(0.0); ap.i = 0; }
+    }
+
     fn run(&mut self, l: f32, r: f32) -> (f32, f32) {
         let x = (l + r) * 0.08;
         let mut out = [0.0; 2];
@@ -512,6 +517,11 @@ impl Echo {
     fn new(sr: f32) -> Self {
         let n = (sr * 0.55) as usize;
         Self { buf: [vec![0.0; n], vec![0.0; n]], i: 0, damp: [0.0; 2] }
+    }
+
+    fn clear(&mut self) {
+        for b in &mut self.buf { b.fill(0.0); }
+        self.i = 0; self.damp = [0.0; 2];
     }
 
     fn run(&mut self, x: f32) -> (f32, f32) {
@@ -729,13 +739,17 @@ impl Music {
         self.voices.push(Voice::new(Wave::Lead, 0.0, d + 1.2, hz(n as f32), hz(n as f32), 0.022).att(0.35).rel(d / (d + 1.2)).vib(0.004).send(0.4));
     }
 
-    fn tick(&mut self) -> (f32, f32) {
+    fn clock(&mut self) {
         if self.wait == 0 {
             self.play();
             self.wait = (self.texture.beat * self.sr / 2.0).round() as u64;
         }
         self.wait -= 1;
         self.frame += 1;
+    }
+
+    fn tick(&mut self) -> (f32, f32) {
+        self.clock();
         let sr = self.sr;
         let (mut l, mut r, mut send) = (0.0, 0.0, 0.0);
         for v in &mut self.voices {
@@ -755,7 +769,16 @@ impl Music {
         // A short ramp prevents clicks and silences the reverb too. Keep time
         // moving while muted, so unmuting resumes the current part of the score.
         let step = 1.0 / (self.sr * 0.03);
+        let was_audible = self.gain > 0.0;
         self.gain = (self.gain + if muted { -step } else { step }).clamp(0.0, 1.0);
+        if muted && self.gain == 0.0 {
+            // keep the composition and note ages moving, without synthesizing inaudible samples
+            if was_audible { self.hall.clear(); self.echo.clear(); }
+            self.clock();
+            for v in &mut self.voices { v.t += 1.0 / self.sr; }
+            self.voices.retain(|v| !v.finished());
+            return (0.0, 0.0);
+        }
         let (l, r) = self.tick();
         (l * self.gain, r * self.gain)
     }
@@ -764,6 +787,39 @@ impl Music {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_music_keeps_the_score_clock_without_running_reverb() {
+        let mut music = Music::new(12000.0, 7);
+        let mut reference = Music::new(12000.0, 7);
+        for _ in 0..1200 { music.output(true); reference.output(false); }
+        let hall_at = music.hall.combs[0][0].i;
+        let echo_at = music.echo.i;
+        for _ in 0..12000 * 12 {
+            assert_eq!(music.output(true), (0.0, 0.0));
+            reference.output(false);
+        }
+        assert_eq!((music.frame, music.wait, music.step, music.rng), (reference.frame, reference.wait, reference.step, reference.rng));
+        assert_eq!(music.chord, reference.chord);
+        assert_eq!(music.voices.len(), reference.voices.len());
+        assert_eq!(music.hall.combs[0][0].i, hall_at, "inaudible music must not keep processing the hall");
+        assert_eq!(music.echo.i, echo_at, "inaudible music must not keep processing the echo");
+    }
+
+    #[test]
+    #[ignore = "CPU benchmark; run alone with --ignored --nocapture"]
+    fn muted_music_cpu_cost() {
+        let sr = 48000;
+        let mut music = Music::new(sr as f32, 7);
+        let mut synth = Synth::new(sr as f32);
+        for _ in 0..sr { music.output(false); }
+        let start = std::time::Instant::now();
+        for _ in 0..sr * 30 {
+            std::hint::black_box(music.output(true));
+            std::hint::black_box(synth.tick());
+        }
+        eprintln!("muted music + idle cues: {:.2}% of one core for realtime playback", start.elapsed().as_secs_f64() / 30.0 * 100.0);
+    }
 
     #[test]
     fn music_mute_silences_reverb_and_resumes_without_restarting() {
