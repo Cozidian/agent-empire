@@ -303,13 +303,21 @@ The standalone command never starts or upgrades the Empire daemon.
    work too. **Tab** moves fields. Set a time budget, then **Enter** to review the frozen commit,
    tasks and limits. **Enter** again starts it; **Esc** returns to editing.
 3. Watch snapshot → baseline → proposals → trials → composition → review. The current stage
-   pulses; the experiment trail records completed and failed sessions. **Enter** opens a study,
+   is highlighted; the experiment trail records completed and failed sessions. **Enter** opens a study,
    **v** reads its evidence report, **p** reads its resource patch, and **o** returns to progress.
    **↑↓ / PgUp / PgDn** scroll. **x**, then **y**, cancels with evidence retained.
 4. Review the report and patch. From the patch, **a**, then **y**, applies the proposed resource
    changes to the original project. Every original resource must still match the snapshot;
    conflicts refuse the entire application. No commit, push, or broad rollout happens automatically.
    The saved patch can also be reviewed and transferred manually to another project.
+
+Research screens use a centered reading column, section headings and highlighted selections.
+Brief fields wrap across lines and keep the active cursor in view; **Shift+Tab** moves to the
+previous field and **Ctrl+Enter** reviews the brief. Evidence reports distinguish headings,
+execution references and code; patches mark additions in green and removals in red, retaining
+their `+`/`-` signs. The footer shows complete, contextual actions and the current scroll range
+when content continues below. Adoption and cancellation open a separate, scrollable confirmation
+with the target and consequences; **y** confirms, **n / Esc** returns.
 
 A useful first question: “My agents keep missing layout problems when they finish UI work.
 Investigate a better verification workflow.” Choose a small UI change whose acceptance criteria

@@ -54,9 +54,8 @@ state: `EMPIRE_SOCK=/tmp/empire-dev.sock XDG_STATE_HOME=/tmp/empire-dev ./target
   `help()` and, if it's a galaxy key, the footer hint and the README key table.
 - Errors in the UI are toasts or situation-log entries (`app.say(Ev::…)`), not panics. Shelling out
   (`git`, `gh`) returns `Option`/`Result` and degrades quietly.
-- Tests: plain `#[test]` in the same file. Game tests drive `handle()` with `Client::isolated()`
-  and render with `draw::frame` into an `Fb`, asserting on the text cells. Filesystem tests use
-  a temp dir under `std::env::temp_dir()` and clean up.
+- Tests: same-file `#[test]`; filesystem tests use and clean a `std::env::temp_dir()` directory.
+  For terminal footer changes, use the `terminal-footer-contract` skill.
 - Commit messages: one short, present-tense summary in the game's language
   ("Worktree stations: parallel branches orbiting their world, docked by merge"), body if needed.
 
