@@ -15,7 +15,10 @@ Press **H** to visit **Home**. Choose **Configure project root** and enter the f
 your projects, for example `/home/code` or `~/code`. Empire discovers Git repositories beneath
 that folder and makes them planets. Their parent folders determine the sectors. Discovery runs
 in the background, stops inside repositories, and skips hidden directories, symlink directories,
-`node_modules`, `target`, and `vendor`. Git worktrees with a `.git` file are recognized too.
+`node_modules`, `target`, and `vendor`. Git worktrees with a `.git` file are recognized too; each one is shown as a small space station
+(`▣`) in close orbit around its project planet: a core module, a truss and two solar wings, with
+amber lights while an agent is aboard and dark lights when it has none. It is distinct from the
+ring-shaped GitHub station. Select and open them like any project.
 
 If no root has been saved, Empire uses `/home/code` or `~/code` when one exists. **R on Home**
 rescans the root. A scan reads directory entries; it does not pull, clone or modify repositories.
@@ -162,7 +165,7 @@ Campaigns, expeditions, ship designs/refits, prescribed launch roles, fleet orde
 hyperlane/sector editors and worktree creation/merging are retired from the workspace. Existing
 folders, worktrees and saved records are not deleted. The daemon retains legacy wire fields and
 session outfits so existing agents can survive upgrades. Campaign automation no longer dispatches
-stages. Worktrees you already have can still appear as moons.
+stages. Worktrees you already have still appear as space stations.
 
 ## Persistence and commands
 

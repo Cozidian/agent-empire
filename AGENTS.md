@@ -45,10 +45,10 @@ state: `EMPIRE_SOCK=/tmp/empire-dev.sock XDG_STATE_HOME=/tmp/empire-dev ./target
 - **Not rustfmt-formatted.** Long lines (up to ~200 chars) and one-line `match` arms are the
   house style. Never run `cargo fmt` on the repo; match the surrounding code by hand.
 - Short names (`w`, `p`, `l`, `t`, `fb`, `app`), and short `///` doc comments that say what a
-  thing *is* in the game's own terms ("A moon (git worktree) orbits…"). Comments are sparse,
+  thing *is* in the game's own terms ("A station (git worktree) orbits…"). Comments are sparse,
   lowercase-first inline remarks explaining *why*.
 - Game vocabulary maps to real things; keep it consistent: world/planet = folder, system = parent
-  folder, ship = agent, moon = git worktree, mission = queued prompt, station = GitHub, prestige =
+  folder, ship = agent, station = git worktree (drawn `▣`), mission = queued prompt, GitHub station = GitHub, prestige =
   real progress, structure = AI resource file.
 - A new dialog = a `Mode` variant + a branch in `handle()` + a draw fn in `frame()` + a line in
   `help()` and, if it's a galaxy key, the footer hint and the README key table.
@@ -58,7 +58,7 @@ state: `EMPIRE_SOCK=/tmp/empire-dev.sock XDG_STATE_HOME=/tmp/empire-dev ./target
   and render with `draw::frame` into an `Fb`, asserting on the text cells. Filesystem tests use
   a temp dir under `std::env::temp_dir()` and clean up.
 - Commit messages: one short, present-tense summary in the game's language
-  ("Worktree moons: parallel branches orbiting their world, docked by merge"), body if needed.
+  ("Worktree stations: parallel branches orbiting their world, docked by merge"), body if needed.
 
 ## Don'ts
 

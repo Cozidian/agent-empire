@@ -26,7 +26,7 @@ pub struct World {
     pub commits: u32,
     pub files: u32,
     pub lang: String,
-    /// For a linked worktree (a moon): the main worktree it belongs to.
+    /// For a linked worktree (a station): the main worktree it belongs to.
     pub host: Option<String>,
     /// Has a GitHub remote, so it trades with the station.
     pub github: bool,
