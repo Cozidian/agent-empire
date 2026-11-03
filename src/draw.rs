@@ -345,6 +345,34 @@ fn sphere_style(fb: &mut Fb, cx: f32, cy: f32, r: f32, p: &Planet, light: (f32, 
 }
 
 /// A world's structures, as spires standing on its upper limb, each with a beacon in its colour.
+/// A git worktree: a small modular station with a core, a truss and two solar wings, lit amber while it has a crew.
+/// Not a ring like the GitHub station, and never a sphere.
+fn worktree_station(fb: &mut Fb, x: f32, y: f32, r: f32, p: &Planet, t: f32) {
+    let hull = v3(0.62, 0.68, 0.74);
+    let panel = v3(0.2, 0.45, 0.85);
+    let crewed = !p.dormant;
+    let lamp = if crewed { v3(1.0, 0.78, 0.4) } else { v3(0.28, 0.32, 0.38) };
+    if crewed { circle(fb, x, y, r * 1.4, lamp * 0.04); }
+    // truss, then two solar panels on each side
+    fb.line(x - r * 1.35, y, x + r * 1.35, y, hull * 0.55, hull * 0.55);
+    for side in [-1.0, 1.0] {
+        for k in 0..2 {
+            let px = x + side * r * (0.8 + 0.45 * k as f32);
+            let h = r * 0.6;
+            fb.line(px, y - h, px, y + h, panel * 0.45, panel * 0.85);
+            fb.splat(px + side * 0.7, y, panel * 0.3);
+        }
+        fb.splat(x + side * r * 1.35, y, lamp * 0.9);
+    }
+    // the core module, an antenna and a slow beacon
+    orb(fb, x, y, (r * 0.38).max(1.4), hull);
+    fb.line(x, y - r * 0.4, x, y - r * 0.95, hull * 0.5, hull * 0.5);
+    let beacon = if crewed { 0.45 + 0.55 * (t * 2.0 + p.seed * TAU).sin().abs() } else { 0.25 };
+    fb.splat(x, y - r * 0.95, if crewed { v3(1.0, 0.45, 0.35) * beacon } else { lamp * beacon });
+    fb.splat(x - 0.6, y + 0.4, lamp);
+    fb.splat(x + 0.6, y + 0.4, lamp);
+}
+
 fn spires(fb: &mut Fb, app: &App, p: &Planet, (px, py): (f32, f32), r: f32, t: f32) {
     let Some(built) = app.survey.worlds.get(&p.key).map(|g| &g.structures).filter(|b| !b.is_empty()) else { return };
     if r < 5.0 || p.fog > 0.6 {
@@ -718,8 +746,12 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         };
         ships(false, fb);
         rings(false, fb);
-        sphere(fb, px, py, r, p, (lx / ll, ly / ll), t);
-        spires(fb, app, p, (px, py), r, t);
+        if p.host.is_some() {
+            worktree_station(fb, px, py, r, p, t);
+        } else {
+            sphere(fb, px, py, r, p, (lx / ll, ly / ll), t);
+            spires(fb, app, p, (px, py), r, t);
+        }
         if app.focused_sector().is_some_and(|s| app.sector_has(s, &p.key)) { ellipse(fb, px, py, r + 7.0, r + 5.0, v3(0.3, 0.45, 0.7)); }
         rings(true, fb);
         let live = || p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none());
@@ -1041,7 +1073,7 @@ fn labels(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         let (px, py) = l.to_screen(cam, p.wpos);
         let parts = tally(p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none()), t);
         let anomalies = app.anomaly_count(&p.key, false);
-        let name = format!("{}{}{}", if p.host.is_some() { "☾ " } else { "" }, p.name, if anomalies > 0 { format!(" ⟡{anomalies}") } else { String::new() });
+        let name = format!("{}{}{}", if p.host.is_some() { "▣ " } else { "" }, p.name, if anomalies > 0 { format!(" ⟡{anomalies}") } else { String::new() });
         let len = name.chars().count() as i32 + parts.iter().map(|(s, _)| s.chars().count() as i32 + 1).sum::<i32>();
         let (mut c, r) = ((px / 2.0) as i32 - len / 2, ((py + (p.r * z).max(2.5) + 7.0) / 4.0) as i32);
         if !in_view(c, r) || !in_view(c + len, r) {
@@ -1094,10 +1126,10 @@ fn top_bar(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         fb.put_bg(k as i32, 0, ch, hsv(0.52 + k as f32 * 0.015 - t * 0.04, 0.45, 1.0), Some(BAR));
     }
     let live: Vec<&Agent> = app.agents.iter().filter(|a| a.dying.is_none()).collect();
-    let moons = w.planets.iter().filter(|p| p.host.is_some()).count();
-    let worlds = w.planets.len() - moons;
-    let moons = if moons > 0 { format!(" · {moons} moon{}", if moons == 1 { "" } else { "s" }) } else { String::new() };
-    let stats = [format!(" {} systems · {worlds} worlds{moons} · {} agents  ", w.systems.len(), live.len()),
+    let stations = w.planets.iter().filter(|p| p.host.is_some()).count();
+    let worlds = w.planets.len() - stations;
+    let stations = if stations > 0 { format!(" · {stations} station{}", if stations == 1 { "" } else { "s" }) } else { String::new() };
+    let stats = [format!(" {} systems · {worlds} worlds{stations} · {} agents  ", w.systems.len(), live.len()),
         format!(" {worlds} worlds · {} agents  ", live.len()), format!(" {} agents  ", live.len())];
     let mark = if app.online { "●" } else { "○" };
     let right = if l.cols >= 100 { format!("{mark} daemon  {} ", clock()) }
@@ -1373,7 +1405,7 @@ fn ship_rows(app: &App, w: &World, a: &Agent, t: f32) -> Rows {
     if let Some(p) = w.planet(&a.cwd) {
         home.push((format!("{} ", p.name), planet_color(p)));
         if let Some(h) = p.host {
-            home.push((format!("☾ moon of {} ", w.planets[h].name), DIM));
+            home.push((format!("▣ station of {} ", w.planets[h].name), DIM));
         }
     }
     if let Some(g) = app.survey.worlds.get(&a.cwd).filter(|g| g.git) {
@@ -1432,8 +1464,8 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         (format!("◆ {} #{} · {}", a.kind.to_uppercase(), a.id, base_name(&a.cwd).to_uppercase()), sub, kind_color(&a.kind), ship_rows(app, w, a, t))
     } else if let Some(p) = planet_key.as_deref().and_then(|k| w.planet(k)) {
         if let Some(h) = p.host {
-            let sub = format!("moon of {} · worktree at {}", w.planets[h].name, tilde(&p.key));
-            (format!("☾ {}", p.name.to_uppercase()), sub, planet_color(p), planet_rows(app, w, p, t))
+            let sub = format!("station of {} · worktree at {}", w.planets[h].name, tilde(&p.key));
+            (format!("▣ {}", p.name.to_uppercase()), sub, planet_color(p), planet_rows(app, w, p, t))
         } else {
             let class = CLASSES[p.terrain as usize % CLASSES.len()];
             (format!("◉ {}", p.name.to_uppercase()), format!("{class} world · {}", tilde(&p.key)), planet_color(p), planet_rows(app, w, p, t))
@@ -1631,7 +1663,7 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 let Some(p) = w.planet(key) else { continue };
                 let parts = tally(p.agents.iter().map(|&i| &app.agents[i]).filter(|a| a.dying.is_none()), t);
                 let tw: usize = parts.iter().map(|(s, _)| s.chars().count() + 1).sum();
-                let (glyph, indent) = if p.host.is_some() { ("☾ ", 3) } else if p.dormant { ("◌ ", 1) } else { ("● ", 1) };
+                let (glyph, indent) = if p.host.is_some() { ("▣ ", 3) } else if p.dormant { ("◌ ", 1) } else { ("● ", 1) };
                 let x = seg(fb, c0 + indent, row, glyph, 2, planet_color(p) * (1.0 - 0.6 * p.fog), Some(bg));
                 if p.dormant && p.host.is_none() {
                     let age = ago((survey::now() as u64).saturating_sub(p.last_seen) as f32);
@@ -2052,7 +2084,7 @@ fn build_menu(fb: &mut Fb, app: &App, planet: &str, sel: usize, l: &Lay) {
     seg(fb, x + 3, y + h - 2, "1-8 / ⏎ draft a planet task · ↑↓ choose · esc close", w - 6, DIM, Some(BOX));
 }
 
-/// A world's mission log, grouped by status, world or moon, or fleet order; open missions show in full.
+/// A world's mission log, grouped by status, world or station, or fleet order; open missions show in full.
 fn mission_log(fb: &mut Fb, app: &App, world: &str, sel: usize, open: &HashSet<u32>, l: &Lay, t: f32) {
     let log = app.mission_log(world);
     let accent = v3(1.0, 0.85, 0.4);
@@ -2594,7 +2626,7 @@ fn anomalies(fb: &mut Fb, app: &mut App, l: &Lay, id: u64, typing: bool) {
     let filter = &app.anomaly_filter;
     let place = filter.world.as_deref().or(filter.system.as_deref()).map(tilde).unwrap_or_else(|| "all systems".into());
     let place = filter.sector.as_ref().map_or_else(|| place.clone(), |(name, _)| format!("{name} sector · {place}"));
-    let chips = format!("v {} · f {} · w world / s system: {place}", crate::anomaly::STATES[filter.state], crate::anomaly::KINDS[filter.kind]);
+    let chips = format!("v {} · f {} · w world / s system: {place}", crate::anomaly::STATES[filter.state], crate::anomaly::kind_label(crate::anomaly::KINDS[filter.kind]));
     seg(fb, x + 2, y + 1, &chips, w - 4, DIM, Some(BOX));
     let search = if app.anomaly_error.is_empty() { format!("/ Search: {}{}", filter.query, if typing { "▏" } else { "" }) } else { app.anomaly_error.clone() };
     seg(fb, x + 2, y + 2, &search, w - 4, if typing { TEXT } else { DIM }, Some(BOX));
@@ -2606,13 +2638,13 @@ fn anomalies(fb: &mut Fb, app: &mut App, l: &Lay, id: u64, typing: bool) {
         let r = y + 5 + (i - off) as i32;
         let bg = if i == sel { SELBG } else { BOX };
         fb.panel(x + 1, r, w - 2, 1, bg);
-        let text = format!("{} · {} · {} · #{} {}", f.state.label(), f.kind, base_name(&f.world), f.id, f.title);
+        let text = format!("{} · {} · {} · #{} {}", f.state.label(), crate::anomaly::kind_label(&f.kind), base_name(&f.world), f.id, f.title);
         seg(fb, x + 2, r, &text, w - 4, if f.state.active() { TEXT } else { DIM }, Some(bg));
     }
     let dy = y + 6 + room as i32;
     let mut detail = Vec::new();
     if let Some(f) = rows.get(sel) {
-        let mut lines = vec![format!("#{} {}", f.id, f.title), format!("World: {}", tilde(&f.world)), format!("System: {} · source: {}", tilde(&f.system), f.kind),
+        let mut lines = vec![format!("#{} {}", f.id, f.title), format!("World: {}", tilde(&f.world)), format!("System: {} · source: {}", tilde(&f.system), crate::anomaly::kind_label(&f.kind)),
             format!("Discovered {} ago · last observed {} ago", ago((survey::now() - f.first).max(0) as f32), ago((survey::now() - f.last).max(0) as f32))];
         lines.extend(f.evidence.lines().map(String::from));
         lines.push("History (newest first):".into());
@@ -2732,7 +2764,7 @@ fn situation(fb: &mut Fb, app: &App, w: &World, l: &Lay, id: u64, typing: bool, 
             Some(p) => {
                 let mut v = vec![(tilde(p), TEXT)];
                 if let Some(h) = app.moon_host(p) {
-                    v.push((format!("  ☾ moon of {}", base_name(&h)), DIM));
+                    v.push((format!("  ▣ station of {}", base_name(&h)), DIM));
                 }
                 if w.planet(p).is_none() {
                     v.push(("  no longer charted".into(), DIM));

@@ -88,14 +88,14 @@ impl LogEntry {
     }
 }
 
-/// The situation log view's filter: one kind of entry, one world (and its moons), some text.
+/// The situation log view's filter: one kind of entry, one world (and its stations), some text.
 #[derive(Default)]
 pub struct SitFilter {
     pub kind: Option<Ev>,
     pub world: Option<String>,
     pub query: String,
 }
-/// Default names for new moons (they become branch names).
+/// Default names for new stations (they become branch names).
 /// Radius of a system's first planetary orbit, and the gap between orbits.
 const ORBIT0: f32 = 70.0;
 const ORBIT_STEP: f32 = 42.0;
@@ -219,7 +219,7 @@ pub struct Planet {
     pub seed: f32,
     pub wpos: (f32, f32),
     pub r: f32,
-    /// A moon (git worktree) orbits this planet instead of a star.
+    /// A station (git worktree) orbits this planet instead of a star.
     pub host: Option<usize>,
     pub moons: Vec<usize>,
     /// Development from prestige: 0 outpost, 1 colony, 2 city world, 3 ecumenopolis.
@@ -503,7 +503,7 @@ pub enum Mode {
     Actions { planet: String, sel: usize },
     /// A world's structures (its AI resources): what stands, and what can be built.
     Build { planet: String, sel: usize },
-    /// A world's missions (its moons' too), grouped by `App::log_sort`; `open` ones show in full.
+    /// A world's missions (its stations' too), grouped by `App::log_sort`; `open` ones show in full.
     Log { world: String, sel: usize, open: HashSet<u32> },
     /// A short task for the planet's next available agent or a new ship.
     Brief { planet: String, text: Line, kind: usize, launch: bool, attachments: Vec<Attachment>, sending: bool },
@@ -1023,7 +1023,7 @@ impl App {
 
     /// Prestige for a world, once per event `id`; a new development level gets a fanfare.
     fn award(&mut self, key: &str, id: String, pts: u32, why: &str, cues: &mut Vec<Cue>) {
-        // moons earn for their world
+        // stations earn for their world
         let key = self.moon_host(key).unwrap_or_else(|| key.to_string());
         if !self.prestige.counted.insert(id) {
             return;
@@ -1066,7 +1066,6 @@ impl App {
         }
     }
 
-    /// The world a selection is a moon of, if it is one.
     /// The ship card's menu; priority only matters in a border conflict.
     pub fn ship_acts(&self, id: u32) -> Vec<ShipAct> {
         let Some(a) = self.agent(id) else { return Vec::new() };
@@ -1396,7 +1395,7 @@ impl App {
         for key in self.sectors.sectors.iter().flat_map(|s| s.worlds.iter()) {
             if Path::new(key).is_dir() { pmap.entry(key.clone()).or_default(); }
         }
-        // worktrees are moons of the world they were split from (which shows up even if empty)
+        // worktrees are stations of the world they were split from (which shows up even if empty)
         let host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
         for h in host_of.values() {
             pmap.entry(h.clone()).or_default();
@@ -1451,7 +1450,7 @@ impl App {
             }
             systems.push(sys);
         }
-        // moons, in close orbit around their worlds
+        // stations, in close orbit around their worlds
         for (mkey, hkey) in &host_of {
             let Some(hi) = planets.iter().position(|p| &p.key == hkey) else { continue };
             let q = planets[hi].moons.len() as f32;
@@ -1476,7 +1475,7 @@ impl App {
             let name = self.survey.worlds.get(mkey).map(|w| w.branch.clone()).filter(|b| !b.is_empty()).unwrap_or_else(|| base_name(mkey));
             let idx = planets.len();
             planets[hi].moons.push(idx);
-            // moons are grey, cratered rock
+            // stations never draw as spheres; the terrain only tints their card accent
             planets.push(Planet { key: mkey.clone(), name, agents: members, terrain: 3, seed, wpos, r, host: Some(hi), moons: Vec::new(), dormant: live == 0, fog: 0.0, last_seen: now, level: 0 });
         }
         let mut lanes = Vec::new();
@@ -1548,7 +1547,7 @@ impl App {
         }
     }
 
-    /// Keep a selected ship or moon associated with its star in the distant overview.
+    /// Keep a selected ship or station associated with its star in the distant overview.
     pub fn selected_system<'a>(&self, w: &'a World) -> Option<&'a System> {
         if let Some(Sel::Sys(k) | Sel::Sector(_, k)) = &self.sel {
             return w.systems.iter().find(|s| &s.key == k);
@@ -1912,7 +1911,7 @@ impl App {
             if queued > 0 && !here.iter().any(|a| a.status != Status::Exited) {
                 rows.push(Attention { id: format!("uncrewed:{}", p.key), world: p.key.clone(), kind: "Unstaffed", title: format!("{queued} queued missions need an agent"), detail: self.missions.iter().filter(|m| m.cwd == p.key && m.state == "queued").map(|m| m.text.as_str()).collect::<Vec<_>>().join("\n\n"), target: AttentionTarget::Deploy, rank: 4 });
             }
-            // Moons share their host's PRs: show each request only once.
+            // Stations share their host's PRs: show each request only once.
             if p.host.is_some() { continue; }
             let Some(s) = self.survey.worlds.get(&p.key) else { continue };
             for (pr, mine) in s.prs.iter().filter(|pr| pr.ci == "fail").map(|pr| (pr, true))
@@ -1971,7 +1970,7 @@ impl App {
                 seen.push(obs("conflicts".into(), "Git", "Unresolved merge conflicts".into(), format!("git status reports unmerged files:\n{}", w.conflicts.join("\n")), at, !w.conflicts.is_empty()));
                 if w.host.is_some() && self.loaded && self.online {
                     let crewed = self.has_agent(path);
-                    seen.push(obs("uncrewed".into(), "Moon", "Worktree moon has no ship".into(), format!("Branch: {}\nHost: {host}\nNo running agent is assigned here. This does not establish that the worktree is abandoned.", w.branch), at, !crewed));
+                    seen.push(obs("uncrewed".into(), "Moon", "Uncrewed station: worktree has no ship".into(), format!("Branch: {}\nHost: {host}\nNo running agent is assigned here. This does not establish that the worktree is abandoned.", w.branch), at, !crewed));
                 }
             }
             if let Some(at) = w.prs_checked.filter(|_| w.prs_error.is_none() && w.host.is_none()) {
@@ -2017,7 +2016,7 @@ impl App {
         let Some(f) = self.anomalies.findings.iter().find(|f| f.id == id) else { return };
         if !Path::new(&f.world).is_dir() { self.toast("this world's folder is unavailable", t); return; }
         let mut text = Line::default();
-        text.set(format!("{} Investigate: {}\n\nWorld: {}\nSource: {}\nObserved evidence:\n{}\n\nInvestigate read-only. Verify whether this still holds and report supporting evidence, possible causes and a concrete next step. Do not fix, commit, merge, push or delete anything. Report uncertainty explicitly.\n\nInclude any additional findings in your reply with their world, evidence and uncertainty. This finding already exists; report its outcome in your reply.", f.tag(), f.title, f.world, f.kind, f.evidence));
+        text.set(format!("{} Investigate: {}\n\nWorld: {}\nSource: {}\nObserved evidence:\n{}\n\nInvestigate read-only. Verify whether this still holds and report supporting evidence, possible causes and a concrete next step. Do not fix, commit, merge, push or delete anything. Report uncertainty explicitly.\n\nInclude any additional findings in your reply with their world, evidence and uncertainty. This finding already exists; report its outcome in your reply.", f.tag(), f.title, f.world, crate::anomaly::kind_label(&f.kind), f.evidence));
         let planet = f.world.clone();
         self.anomaly_return = Some(id);
         let launch = !self.has_agent(&planet);
@@ -2262,7 +2261,7 @@ const MIN_ZOOM: f32 = 0.02;
 const WHEEL_ZOOM: f32 = 1.07;
 const KEY_ZOOM: f32 = 1.14;
 
-/// One sector's territory within a star system; moons belong to their host marker.
+/// One sector's territory within a star system; stations belong to their host marker.
 pub struct SectorRegion {
     pub id: u64,
     pub system: String,
@@ -3469,7 +3468,7 @@ fn handle(
             None => app.toast("select a world to see its structures and build more", t),
         },
         KeyCode::Char('L') => match app.sel_planet() {
-            // a moon's log is its world's, so the family's work reads together
+            // a station's log is its world's, so the family's work reads together
             Some(p) => app.mode = Mode::Log { world: app.moon_host(&p).unwrap_or(p), sel: 0, open: HashSet::new() },
             None => app.toast("select a world to see its mission log", t),
         },
@@ -3588,7 +3587,7 @@ fn situation_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
                 let i = if k.code == KeyCode::BackTab { (i + n - 1) % n } else { (i + 1) % n };
                 app.sit.kind = i.checked_sub(1).map(|i| Ev::ALL[i]);
             }
-            // just the selected entry's world (and its moons), or every world again
+            // just the selected entry's world (and its stations), or every world again
             KeyCode::Char('w') => {
                 if app.sit.world.take().is_none() {
                     let world = app.log.iter().find(|e| e.id == id).and_then(|e| e.world.clone());
@@ -4079,6 +4078,55 @@ mod overview_tests {
                     || label.row + label.lines.len() as i32 <= other.row || other.row + other.lines.len() as i32 <= label.row);
             }
         }
+    }
+
+    fn screen_text(fb: &Fb) -> String {
+        fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn worktrees_read_as_stations_not_moons_in_labels_and_cards() {
+        let (mut app, w, l) = fixture();
+        let station = w.planets.iter().find(|p| p.key == "/moons/patch").expect("the worktree is charted");
+        assert!(station.host.is_some());
+        app.cam.z = 1.0;
+        app.sel = Some(Sel::Planet("/moons/patch".into()));
+        let mut fb = Fb::new(140, 44);
+        let l2 = Lay::new(&fb, false);
+        draw::frame(&mut fb, &mut app, &w, &l2, 4.0, None);
+        let text = screen_text(&fb);
+        assert!(text.contains("▣"), "stations carry the ▣ glyph");
+        assert!(text.contains("station of api"), "the card names the host world");
+        assert!(!text.contains('☾') && !text.replace("/moons/", "").to_lowercase().contains("moon"), "no moon wording (the fixture path is /moons/patch)");
+        let _ = l;
+    }
+
+    #[test]
+    fn a_worktree_is_drawn_as_a_station_not_a_sphere() {
+        let (mut app, mut w, _) = fixture();
+        app.cam.z = 1.0;
+        let render = |w: &World, app: &mut App| { let mut fb = Fb::new(140, 44); let l = Lay::new(&fb, false); draw::frame(&mut fb, app, w, &l, 4.0, None); fb.px };
+        let with_station = render(&w, &mut app);
+        let i = w.planets.iter().position(|p| p.key == "/moons/patch").unwrap();
+        w.planets[i].host = None;
+        assert_ne!(with_station, render(&w, &mut app), "a host-less planet of the same place draws as a sphere");
+    }
+
+    #[test]
+    fn an_uncrewed_worktree_is_reported_as_an_uncrewed_station_and_saved_moon_findings_still_filter() {
+        let (mut app, _, _) = fixture();
+        app.loaded = true;
+        app.agents.retain(|a| a.cwd != "/moons/patch");
+        app.survey.worlds.get_mut("/moons/patch").unwrap().checked = Some(20);
+        app.refresh_anomalies();
+        let f = app.anomalies.findings.iter().find(|f| f.key == "uncrewed").expect("an uncrewed finding");
+        assert_eq!(f.title, "Uncrewed station: worktree has no ship");
+        assert_eq!(f.kind, "Moon", "the stored kind is unchanged so anomalies.json keeps loading and filtering");
+        assert_eq!(crate::anomaly::kind_label(&f.kind), "Station");
+        assert_eq!(crate::anomaly::kind_label("CI"), "CI");
+        app.anomaly_filter.kind = 3;
+        assert_eq!(crate::anomaly::kind_label(crate::anomaly::KINDS[app.anomaly_filter.kind]), "Station");
+        assert_eq!(app.anomaly_rows().len(), 1);
     }
 
     #[test]
