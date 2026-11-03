@@ -58,6 +58,7 @@ fn memory() -> Value {
 
 fn view(mode: &Mode) -> &'static str {
     match mode {
+        Mode::Research => "research",
         Mode::Galaxy => "galaxy", Mode::Workspace { .. } => "workspace", Mode::Planet(_) => "planet", Mode::Comms(_) => "comms",
         Mode::Root(_) => "root", Mode::Folders { .. } => "folders", Mode::Commander => "commander", Mode::Anomalies { .. } => "anomalies", Mode::Trade { .. } => "trade",
         Mode::Colonize(_) => "colonize", Mode::Deploy { .. } => "deploy", Mode::Confirm { .. } => "confirm", Mode::Ship { .. } => "ship",

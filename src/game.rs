@@ -205,6 +205,7 @@ pub struct Agent {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sel {
     GitHub,
+    Research,
     Sys(String),
     Sector(u64, String),
     Planet(String),
@@ -249,6 +250,13 @@ pub struct World {
     pub station: Option<(f32, f32)>,
 }
 
+pub fn research_pos(w: &World) -> (f32, f32) {
+    if w.systems.is_empty() { return (0.0, -55.0); }
+    let x = w.systems.iter().map(|s| s.wpos.0 - s.orbits.last().copied().unwrap_or(0.0)).fold(f32::MAX, f32::min) - 90.0;
+    let y = w.systems.iter().map(|s| s.wpos.1).sum::<f32>() / w.systems.len() as f32;
+    (x, y)
+}
+
 impl World {
     pub fn planet(&self, key: &str) -> Option<&Planet> {
         self.planets.iter().find(|p| p.key == key)
@@ -277,7 +285,7 @@ pub struct Line {
 
 impl Line {
     /// Paste keeping line breaks, for text that can span lines.
-    fn paste_lines(&mut self, text: &str) {
+    pub(crate) fn paste_lines(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
         let clean: String = text.chars().filter(|&c| c == '\n' || !c.is_control()).collect();
         let byte = self.byte(self.cur);
@@ -314,12 +322,12 @@ impl Line {
     fn len(&self) -> usize {
         self.s.chars().count()
     }
-    fn set(&mut self, s: String) {
+    pub(crate) fn set(&mut self, s: String) {
         self.cur = s.chars().count();
         self.s = s;
     }
     /// Returns true if the text changed.
-    fn key(&mut self, k: &KeyEvent) -> bool {
+    pub(crate) fn key(&mut self, k: &KeyEvent) -> bool {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('u') if ctrl => {
@@ -485,6 +493,7 @@ impl SectorStats {
 
 pub enum Mode {
     Galaxy,
+    Research,
     Workspace { key: String, sel: usize },
     Root(Line),
     Folders { sel: usize },
@@ -609,6 +618,7 @@ pub enum Fx {
 }
 
 pub struct App {
+    pub research: crate::research::View,
     pub workspace: crate::workspace::Config,
     pub projects: Vec<String>,
     pub outputs: HashMap<u32, String>,
@@ -714,7 +724,7 @@ pub fn tilde(p: &str) -> String {
     }
 }
 
-fn expand(p: &str) -> PathBuf {
+pub(crate) fn expand(p: &str) -> PathBuf {
     match p.strip_prefix('~') {
         Some(rest) => home().join(rest.trim_start_matches('/')),
         None => PathBuf::from(p),
@@ -905,6 +915,7 @@ impl App {
 
     fn new() -> Self {
         Self {
+            research: Default::default(),
             workspace: Default::default(), projects: vec![], outputs: HashMap::new(), discovering: None, workspace_return: None,
             agents: Vec::new(),
             online: false,
@@ -1152,7 +1163,7 @@ impl App {
                 .map(|i| &w.planets[i])
                 .collect(),
             Sel::Planet(k) => w.planet(k).into_iter().collect(),
-            Sel::Agent(_) | Sel::GitHub | Sel::Sector(_, _) => Vec::new(),
+            Sel::Agent(_) | Sel::Research | Sel::GitHub | Sel::Sector(_, _) => Vec::new(),
         };
         planets.iter().flat_map(|p| p.agents.iter().map(|&i| &self.agents[i])).filter(|a| a.kind != "shell" && a.dying.is_none() && a.status != Status::Exited).collect()
     }
@@ -1393,6 +1404,7 @@ impl App {
     }
 
     fn tick(&mut self, t: f32, cues: &mut Vec<Cue>) {
+        self.research.poll(false);
         let talking = self.talking_to();
         for a in &mut self.agents {
             let watching = talking == Some(a.id);
@@ -1580,11 +1592,13 @@ impl App {
                 }
             }
         }
+        v.push(Sel::Research);
         v
     }
 
     pub fn sel_pos(&self, w: &World) -> Option<(f32, f32)> {
         match self.sel.as_ref()? {
+            Sel::Research => Some(research_pos(w)),
             Sel::GitHub => w.station,
             Sel::Sector(id, k) => self.sector_regions(w).into_iter().find(|r| r.id == *id && r.system == *k).map(|r| r.center()),
             Sel::Sys(k) => w.systems.iter().find(|s| &s.key == k).map(|s| s.wpos),
@@ -1607,7 +1621,7 @@ impl App {
         match self.sel.as_ref()? {
             Sel::Planet(k) => Some(k.clone()),
             Sel::Agent(id) => self.agent(*id).map(|a| a.cwd.clone()),
-            Sel::Sys(_) | Sel::GitHub | Sel::Sector(_, _) => None,
+            Sel::Sys(_) | Sel::Research | Sel::GitHub | Sel::Sector(_, _) => None,
         }
     }
 
@@ -1625,6 +1639,8 @@ impl App {
             y0 = y0.min(s.wpos.1 - r * 0.55);
             y1 = y1.max(s.wpos.1 + r * 0.55);
         }
+        let (rx, ry) = research_pos(w);
+        x0 = x0.min(rx - 25.0); x1 = x1.max(rx + 25.0); y0 = y0.min(ry - 25.0); y1 = y1.max(ry + 25.0);
         if let Some((x, y)) = w.station {
             (x0, x1, y0, y1) = (x0.min(x - 40.0), x1.max(x + 40.0), y0.min(y - 30.0), y1.max(y + 30.0));
         }
@@ -1798,6 +1814,7 @@ impl App {
     /// Enter on the current selection.
     fn activate(&mut self, w: &World, l: &Lay, client: &Client) {
         match self.sel.clone() {
+            Some(Sel::Research) => self.open_research(),
             Some(Sel::GitHub) => self.open_station(),
             Some(Sel::Agent(id)) => self.open_comms(id, client, l),
             Some(Sel::Planet(k)) => self.mode = Mode::Workspace { key: k, sel: 0 },
@@ -2812,9 +2829,15 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event, t: f32) {
 
 /// The ordinary actions available on a planet.
 #[derive(Clone)]
-pub enum WorkAct { Project(String), Agent(u32), Launch, Terminal, Task, Files, Edit(Kind, String), Anomalies, Pulls, Root, Add, Refresh }
+pub enum WorkAct { Research, Project(String), Agent(u32), Launch, Terminal, Task, Files, Edit(Kind, String), Anomalies, Pulls, Root, Add, Refresh }
 
 impl App {
+    fn open_research(&mut self) {
+        let project = self.sel_planet().filter(|p| p != crate::workspace::HOME);
+        self.research.projects = self.projects.clone();
+        self.research.open(project); self.mode = Mode::Research;
+    }
+
     fn has_agent(&self, key: &str) -> bool { self.agents.iter().any(|a| a.cwd == key && a.kind != "shell" && a.dying.is_none() && a.status != Status::Exited) }
 
     fn discover(&mut self) {
@@ -2936,12 +2959,14 @@ impl App {
                 rows.push(("Pull requests".into(), "Open this repository's PRs · p".into(), WorkAct::Pulls));
             }
         }
+        rows.push(("Research Station".into(), "Investigate better agent workflows · snapshots, trials, evidence".into(), WorkAct::Research));
         rows
     }
 
     fn work_action(&mut self, action: WorkAct, key: &str, client: &Client, l: &Lay, t: f32) {
         self.workspace_return = None; self.planet_return = None; self.commander_return = false;
         match action {
+            WorkAct::Research => self.open_research(),
             WorkAct::Project(key) => { self.sel = Some(Sel::Planet(key.clone())); self.mode = Mode::Workspace { key, sel: 0 }; }
             WorkAct::Agent(id) => { self.workspace_return = Some(key.into()); self.open_comms(id, client, l); }
             WorkAct::Launch => { self.workspace_return = Some(key.into()); self.mode = Mode::Deploy { planet: key.into(), kind: 0 }; }
@@ -3096,6 +3121,9 @@ fn handle(
     t: f32,
     drag: &mut Option<((u16, u16), (f32, f32), bool)>,
 ) -> bool {
+    if matches!(app.mode, Mode::Research) {
+        if app.research.input(&ev) { app.mode = Mode::Galaxy; } return false;
+    }
     if matches!(app.mode, Mode::Workspace { .. } | Mode::Root(_) | Mode::Folders { .. }) {
         workspace_input(app, w, l, client, &ev, t); return false;
     }
@@ -3526,7 +3554,7 @@ fn handle(
             }
             return false;
         }
-        Mode::Workspace { .. } | Mode::Root(_) | Mode::Folders { .. } | Mode::Galaxy | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Trade { .. } | Mode::Situation { .. } => {}
+        Mode::Workspace { .. } | Mode::Root(_) | Mode::Folders { .. } | Mode::Research | Mode::Galaxy | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
     if app.sel_planet().as_deref() == Some(crate::workspace::HOME) && matches!(k.code, KeyCode::Char('e' | 't' | 'B' | 'L' | 'r')) {
@@ -3545,6 +3573,7 @@ fn handle(
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
         KeyCode::Char('q') => return true,
+        KeyCode::Char('R') => app.open_research(),
         KeyCode::Char('C') => app.open_commander(w),
         KeyCode::Char('i') => if let Some(Sel::Agent(id)) = app.sel { app.mode = Mode::Ship { id, sel: 0 }; },
         KeyCode::Char('A') => app.open_anomalies(),
@@ -3846,6 +3875,7 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
             }
             let hit = if in_panel { draw::panel_hit(app, w, l, mr as i32) } else { pick_at(app, w, l, px) };
             if let Some(h) = hit {
+                if h == Sel::Research { app.open_research(); return; }
                 if h == Sel::GitHub {
                     app.sel = Some(h);
                     app.open_station();
@@ -3869,6 +3899,8 @@ fn mouse(app: &mut App, w: &World, l: &Lay, client: &Client, me: event::MouseEve
 /// Pick visible objects and labels at the current map scale; ships lead in close-up.
 fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
     let z = app.cam.z;
+    let (rx, ry) = l.to_screen(&app.cam, research_pos(w));
+    let research_label = px >= rx-12.0 && px < rx+24.0 && py >= ry+16.0 && py < ry+20.0;
     let dist = |p: (f32, f32)| {
         let (sx, sy) = l.to_screen(&app.cam, p);
         ((sx - px).powi(2) + (sy - py).powi(2)).sqrt()
@@ -3877,8 +3909,9 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
     if z < OVERVIEW_ZOOM && !app.sector_map() {
         // Only the visible system and station markers are targets at this scale.
         let mut nodes: Vec<_> = w.systems.iter().map(|s| (dist(s.wpos), 8.0, Sel::Sys(s.key.clone()))).collect();
+        nodes.push((dist(research_pos(w)), 12.0, Sel::Research));
         if let Some(p) = w.station { nodes.push((dist(p), 8.0, Sel::GitHub)); }
-        return nearest(nodes).or_else(|| draw::overview_labels(app, w, l).into_iter().find_map(|label| {
+        return nearest(nodes).or_else(|| research_label.then_some(Sel::Research)).or_else(|| draw::overview_labels(app, w, l).into_iter().find_map(|label| {
             let width = label.lines.iter().map(|(s, _)| s.chars().count()).max().unwrap_or(0) as f32;
             (px >= label.col as f32 * 2.0 && px < (label.col as f32 + width) * 2.0
                 && py >= label.row as f32 * 4.0 && py < (label.row as f32 + label.lines.len() as f32) * 4.0).then_some(label.target)
@@ -3887,8 +3920,9 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
     if app.sector_map() {
         let mut nodes: Vec<_> = w.planets.iter().filter(|p| p.host.is_none()).map(|p| (dist(p.wpos), 5.0, Sel::Planet(p.key.clone()))).collect();
         nodes.extend(w.systems.iter().map(|s| (dist(s.wpos), 5.0, Sel::Sys(s.key.clone()))));
+        nodes.push((dist(research_pos(w)), 12.0, Sel::Research));
         if let Some(p) = w.station { nodes.push((dist(p), 8.0, Sel::GitHub)); }
-        return nearest(nodes).or_else(|| draw::sector_labels(app, w, l).into_iter().find_map(|label| {
+        return nearest(nodes).or_else(|| research_label.then_some(Sel::Research)).or_else(|| draw::sector_labels(app, w, l).into_iter().find_map(|label| {
             let width = label.lines.iter().map(|(s, _)| s.chars().count()).max().unwrap_or(0) as f32;
             (px >= label.col as f32 * 2.0 && px < (label.col as f32 + width) * 2.0
                 && py >= label.row as f32 * 4.0 && py < (label.row as f32 + label.lines.len() as f32) * 4.0).then_some(label.target)
@@ -3906,7 +3940,7 @@ fn pick_at(app: &App, w: &World, l: &Lay, (px, py): (f32, f32)) -> Option<Sel> {
         let label_hit = px >= c as f32 * 2.0 && px < (c + label.chars().count() as i32) as f32 * 2.0
             && py >= r as f32 * 4.0 && py < (r + 1) as f32 * 4.0;
         (dist(station) < (13.0 * z).max(5.0) * 2.2 + 3.0 || label_hit).then_some(Sel::GitHub)
-    })
+    }).or_else(|| (dist(research_pos(w)) < 12.0 || research_label).then_some(Sel::Research))
 }
 
 #[cfg(test)]
@@ -5669,5 +5703,23 @@ mod editor_tests {
         let Mode::Planet(v) = &app.mode else { panic!("quitting the editor returns to the world's resources") };
         assert_eq!(v.preview, "# new", "the file is read again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod research_tests {
+    use super::*;
+    #[test] fn research_is_an_independent_destination_at_every_zoom() {
+        let mut app = App::new();
+        let w = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let l = Lay::new(&Fb::new(140, 48), true);
+        assert_eq!(app.rows(&w), vec![Sel::Research]);
+        app.sel = Some(Sel::Research); assert_eq!(app.sel_planet(), None);
+        let pos = research_pos(&w); app.cam.x = pos.0; app.cam.y = pos.1;
+        for z in [0.2, 0.8, 2.0] { app.cam.z = z; let screen = l.to_screen(&app.cam, pos); assert_eq!(pick_at(&app, &w, &l, screen), Some(Sel::Research)); }
+        app.activate(&w, &l, &Client::isolated()); assert!(matches!(app.mode, Mode::Research));
+        let mut fb = Fb::new(140, 48); draw::frame(&mut fb, &mut app, &w, &l, 0.0, None);
+        let text: String = fb.txt.iter().map(|c| c.as_ref().map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("RESEARCH STATION"));
     }
 }

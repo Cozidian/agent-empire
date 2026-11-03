@@ -171,6 +171,7 @@ count, so their space-station markers remain distinct and do not duplicate PR co
 | Tab / C | Next agent needing you / attention list |
 | 1-9 / h | Answer / hail (open comms with) the incoming transmission |
 | A | Anomalies |
+| R | Research Station: experiments, evidence and resource proposals |
 | L / S | Selected planet's task history / situation log |
 | i / x on a ship | Ship information / dismiss with confirmation |
 | ↑↓ / j k | Select in the outliner |
@@ -285,3 +286,77 @@ have five building kinds, showing city lights at portrait and map sizes.
 
 For reproducible 140×48 terminal captures, use `empire graphics --snapshot` and
 `empire graphics --snapshot --classic` (ANSI output, fixed animation time).
+
+## Research Station
+
+**R** on the galaxy map, **Research Station** on Home or a project, or `empire research`
+opens a standalone laboratory. Its teal orbital marker lives outside planetary systems. It is
+independent of worktree stations and the fleet: leaving the screen keeps an experiment running.
+The standalone command never starts or upgrades the Empire daemon.
+
+1. Press **i** once to install the pinned [Google Harness²](https://github.com/google-research/harness2)
+   runtime (or run `empire research setup`). This needs `git`, `uv`, and network access. It uses
+   Python 3.12 in its own environment; your project dependencies are not changed.
+2. Press **n**. Describe the problem, choose a project folder and a commit/ref (default `HEAD`),
+   (**↑↓** in the project field selects a discovered project; typing/pasting a path also works),
+   and enter **1–3 representative tasks**, one per line. **Alt+Enter** adds a task; pasted newlines
+   work too. **Tab** moves fields. Set a time budget, then **Enter** to review the frozen commit,
+   tasks and limits. **Enter** again starts it; **Esc** returns to editing.
+3. Watch snapshot → baseline → proposals → trials → composition → review. The current stage
+   pulses; the experiment trail records completed and failed sessions. **Enter** opens a study,
+   **v** reads its evidence report, **p** reads its resource patch, and **o** returns to progress.
+   **↑↓ / PgUp / PgDn** scroll. **x**, then **y**, cancels with evidence retained.
+4. Review the report and patch. From the patch, **a**, then **y**, applies the proposed resource
+   changes to the original project. Every original resource must still match the snapshot;
+   conflicts refuse the entire application. No commit, push, or broad rollout happens automatically.
+   The saved patch can also be reviewed and transferred manually to another project.
+
+A useful first question: “My agents keep missing layout problems when they finish UI work.
+Investigate a better verification workflow.” Choose a small UI change whose acceptance criteria
+explicitly include narrow and wide layouts, and ensure its dependencies/checks can run offline.
+
+This first version uses Harness²'s **single-step aggregate schedule** and the **native Codex CLI**
+for both task execution and instruction improvement. It uses your existing `codex login` account.
+Each task normally takes eight model sessions (four executions, three resource edits, one
+reflection); the hard ceiling is ten calls per task, 30 minutes by default, and ten minutes per
+session. One experiment runs at a time. Calls are serialized, so this is intentionally a small
+research workflow, not a replacement fleet scheduler.
+
+Trials get separate copies of the chosen Git commit. Uncommitted/untracked files, symlinks,
+`.env`/`.env.*`, `.codex` and `.mcp.json` are excluded. Codex runs with `workspace-write`, network
+access disabled for task commands, escalation denied, and user configuration ignored. Model
+requests still need network access and your account authentication. Global instructions/skills may
+still apply; `environment.json` records the runtime versions and traces retain the observed context. This is a workspace write
+boundary, not a confidentiality sandbox: only use suitable source/tasks. Dependencies are not
+automatically downloaded; tasks that need a local server or browser must have usable tooling.
+Failures and incomplete checks remain evidence, never a silent success.
+
+Editable resources are `AGENTS.md`, `.agents/skills/<name>/SKILL.md`, Python helpers under
+`.agents/skills/<name>/scripts/`, and `scripts/*.py`. Supporting skill documents stay intact. Application changes made during trials stay in the experiment copies. Harness² retains
+experience across tasks **within a study**; studies do not silently share learned resources.
+The final task's selected candidate becomes the proposal. This is model-selected evidence,
+**not an independent proof that the workflow improved**: compare baseline/candidate traces and
+validate on fresh tasks before wider adoption.
+
+Records, snapshots, candidate workspaces, model traces, `REPORT.md`, `proposal.json` and
+`proposal.patch` live under `$XDG_STATE_HOME/empire/research/RUN-ID`. Runtime dependencies live
+under `$XDG_DATA_HOME/empire/research`. Native CLI input/output/cache token counts are recorded;
+**billed cost is unavailable**, rather than reported as zero. Check your account usage for cost.
+For an existing compatible environment, set `EMPIRE_RESEARCH_PYTHON=/path/to/python`.
+
+For scripted starts, `empire research start REQUEST.json` accepts:
+
+```json
+{
+  "problem": "Improve verification of narrow layouts",
+  "project": "/absolute/path/to/project",
+  "revision": "HEAD",
+  "tasks": ["Implement a compact settings panel; check it at 390 and 1280 pixels and report evidence."],
+  "minutes": 30
+}
+```
+
+`empire research --snapshot` renders the empty station offline at 140×48. Python runner tests
+need the research environment: `PATH/TO/research/venv/bin/python -m unittest discover -s research -v`.
+They include the actual Harness² schedule with a clearly marked model test double; no paid model
+calls are made by the unit tests.

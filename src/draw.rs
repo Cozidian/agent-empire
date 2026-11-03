@@ -58,6 +58,7 @@ pub fn graphics_preview(fb: &mut Fb, polished: bool, t: f32) {
 
 pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Option<&Sound>) {
     fb.clear_text();
+    if matches!(app.mode, Mode::Research) { crate::research::draw(fb, &mut app.research, t); return; }
     if let Mode::Workspace { key, sel } = &app.mode { workspace(fb, app, w, key, *sel, l, t); return; }
     if let Mode::Folders { sel } = app.mode { folders(fb, app, sel, l, t); return; }
     if let Mode::Planet(v) = &app.mode {
@@ -78,6 +79,7 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
     build_bg(app, fb, l);
     fb.px.copy_from_slice(&app.bg);
     galaxy(fb, app, w, l, t);
+    research_station(fb, app, w, l, t);
     bloom(fb, 0.5, 0.7);
     labels(fb, app, w, l, t);
     top_bar(fb, app, w, l, t);
@@ -135,6 +137,18 @@ pub fn frame(fb: &mut Fb, app: &mut App, w: &World, l: &Lay, t: f32, sound: Opti
 }
 
 // ─────────────────────────────── galaxy ────────────────────────────────
+
+fn research_station(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
+    let (x, y) = l.to_screen(&app.cam, research_pos(w));
+    if x < 15.0 || x > l.vw - 30.0 || y < l.vy0 + 8.0 || y > l.vy0 + l.vh - 20.0 { return; }
+    let col = v3(0.43, 0.88, 0.79);
+    ellipse(fb, x, y, 11.0, 5.0, col * 0.5);
+    ellipse(fb, x, y, 5.0, 11.0, col * 0.5);
+    orb(fb, x, y, 2.0, col);
+    for i in 0..3 { let a = t * 0.22 + i as f32 * TAU / 3.0; orb(fb, x + a.cos() * 11.0, y + a.sin() * 5.0, 1.3, v3(0.7, 0.58, 0.95)); }
+    if app.sel == Some(Sel::Research) { circle(fb, x, y, 15.0, col * 0.7); }
+    fb.text(x as i32 / 2 - 6, y as i32 / 4 + 4, "RESEARCH", col);
+}
 
 fn build_bg(app: &mut App, fb: &Fb, l: &Lay) {
     let key = (fb.w, fb.h, l.pw);
@@ -814,6 +828,7 @@ fn galaxy(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
 
     // target reticle
     let target = match &app.sel {
+        Some(Sel::Research) => None,
         Some(Sel::GitHub) => w.station.map(|p| (p, (13.0 * z).max(5.0) * 2.2 + 5.0)),
         Some(Sel::Agent(id)) => app.agent(*id).map(|a| (a.wpos, 6.0 * z.clamp(0.7, 2.2) + 2.0)),
         Some(Sel::Planet(k)) => w.planet(k).map(|p| (p.wpos, (p.r * z).max(2.5) + 6.0)),
@@ -1533,6 +1548,8 @@ fn card(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         (format!("▱ {} SECTOR", g.name.to_uppercase()), format!("{} · {} worlds across the galaxy", base_name(system), stats.worlds), sector_color(*id), vec![
             ("fleet", vec![(stats.activity(), TEXT)]), ("work", vec![(stats.work(), DIM)]), ("browse", vec![("⏎ zoom into these worlds".into(), TEXT)]),
         ])
+    } else if app.sel == Some(Sel::Research) {
+        ("◎ RESEARCH STATION".into(), "Improve how your agents work".into(), v3(0.43, 0.88, 0.79), vec![("research", vec![("Snapshots · trials · evidence · resources".into(), TEXT)]), ("open", vec![("Enter or R to enter the laboratory".into(), TEXT)])])
     } else if app.sel == Some(Sel::GitHub) {
         let projects = app.trade_rows(w).iter().filter(|r| r.pr.is_none()).count();
         let rows = vec![
@@ -1642,10 +1659,11 @@ fn footer(fb: &mut Fb, app: &App, _w: &World, l: &Lay, sound: Option<&Sound>) {
         Some(Sel::Planet(key)) if key != crate::workspace::HOME => "Enter project · p PRs · Del remove · t task · e agent · ",
         Some(Sel::Planet(_)) => "Enter home · ",
         Some(Sel::Agent(_)) => "Enter terminal · x dismiss · ",
+        Some(Sel::Research) => "Enter research · ",
         Some(Sel::GitHub) => "Enter pull requests · ",
         _ => "",
     };
-    let s = format!("{ctx}H home · n folder · V sectors · Tab next alert · A anomalies · ? help · q leave {music}{mute}");
+    let s = format!("{ctx}R research · H home · n folder · V sectors · Tab next alert · A anomalies · ? help · q leave {music}{mute}");
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -1711,6 +1729,7 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
         }
         let c0 = x0 + 2;
         match sel {
+            Sel::Research => { seg(fb, c0, row, "◎ RESEARCH STATION", inner as i32, v3(0.43, 0.88, 0.79), Some(bg)); }
             Sel::GitHub => {
                 seg(fb, c0, row, "◇ GITHUB STATION", inner as i32, v3(0.6, 0.8, 1.0), Some(bg));
             }
@@ -2550,6 +2569,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("Home: r / x", "manage sectors / remove selected project"),
         ("Tab / C", "next agent needing you / all attention"),
         ("1-9 / h", "answer / hail an incoming transmission"),
+        ("R", "Research Station: experiments and resource proposals"),
         ("A", "anomalies: investigate, dismiss or resolve"),
         ("e / t", "launch agent / give planet a task"),
         ("p / click PR marker", "open this planet's pull requests"),
