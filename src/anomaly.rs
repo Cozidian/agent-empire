@@ -176,7 +176,11 @@ pub struct Filter {
     pub query: String,
 }
 
+/// Finding kinds as stored in anomalies.json. Worktree findings keep the stored name "Moon"; `kind_label` is what the UI shows.
 pub const KINDS: [&str; 5] = ["all kinds", "CI", "Git", "Moon", "Report"];
+
+/// A kind's name in the UI: worktrees are stations now, but saved findings still say "Moon".
+pub fn kind_label(kind: &str) -> &str { if kind == "Moon" { "Station" } else { kind } }
 pub const STATES: [&str; 7] = ["active", "all statuses", "open", "investigating", "deferred", "dismissed", "resolved"];
 
 impl Filter {

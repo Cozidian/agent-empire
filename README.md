@@ -17,7 +17,10 @@ projects, for example `~/code`, `~/work`, or `/mnt/projects`. Add as many roots 
 each addition keeps the existing roots. **Tab** completes the path. Empire discovers Git repositories beneath
 these folders and makes them planets. Their parent folders determine the sectors. Discovery runs
 in the background, stops inside repositories, and skips hidden directories, symlink directories,
-`node_modules`, `target`, and `vendor`. Git worktrees with a `.git` file are recognized too.
+`node_modules`, `target`, and `vendor`. Git worktrees with a `.git` file are recognized too; each one is shown as a small space station
+(`▣`) in close orbit around its project planet: a core module, a truss and two solar wings, with
+amber lights while an agent is aboard and dark lights when it has none. It is distinct from the
+ring-shaped GitHub station. Select and open them like any project.
 
 If no root has been saved, Empire uses `/home/code` or `~/code` when one exists. **R on Home**
 rescans all roots. A scan reads directory entries; it does not pull, clone or modify repositories.
@@ -153,7 +156,7 @@ Click the marker or select a planet and press **p** to open only that repository
 still switches all/review/mine within that repository. **p** also works on a selected Home project
 and inside its workspace, which has a **Pull requests** action. **Esc** returns to where you opened
 the list. The GitHub station still opens the global overview. Worktrees share their parent planet's
-count, so their planned space-station markers remain distinct and do not duplicate PR counts.
+count, so their space-station markers remain distinct and do not duplicate PR counts.
 
 ## Galaxy controls and atmosphere
 
@@ -198,7 +201,7 @@ Campaigns, expeditions, ship designs/refits, prescribed launch roles, fleet orde
 hyperlane/sector editors and worktree creation/merging are retired from the workspace. Existing
 folders, worktrees and saved records are not deleted. The daemon retains legacy wire fields and
 session outfits so existing agents can survive upgrades. Campaign automation no longer dispatches
-stages. Worktrees you already have can still appear as moons.
+stages. Worktrees you already have still appear as space stations.
 
 ## Persistence and commands
 
