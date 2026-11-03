@@ -181,6 +181,7 @@ impl Agent {
     /// Remember a prompt as what it's working on: its first line, unless it's a slash
     /// command or too short to be one (a menu pick, a y/n).
     fn note_task(&mut self, text: &str) {
+        if self.kind == "shell" { self.task.clear(); self.typed.clear(); return; }
         let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
         if line.chars().count() >= 3 && !line.starts_with('/') {
             self.task = line.to_string();
@@ -189,6 +190,8 @@ impl Agent {
 
     /// Follow keystrokes from comms, so a prompt typed there becomes the task once it's sent.
     fn keys(&mut self, data: &str) {
+        // shells may be reading passwords with echo off; never turn their input into metadata
+        if self.kind == "shell" { self.task.clear(); self.typed.clear(); return; }
         let mut cs = data.chars().peekable();
         while let Some(c) = cs.next() {
             match c {
@@ -411,13 +414,13 @@ impl Agent {
             id: self.id,
             kind: self.kind.clone(),
             cwd: self.cwd.clone(),
-            title: self.parser.callbacks().title.clone(),
+            title: self.title(),
             output: if self.kind != "shell" && matches!(self.status, Status::Done | Status::Blocked | Status::Idle) {
                 let text = self.parser.screen().contents();
                 let lines: Vec<_> = text.lines().filter(|s| !s.trim().is_empty()).collect();
                 lines.iter().skip(lines.len().saturating_sub(18)).copied().collect::<Vec<_>>().join("\n").chars().take(4000).collect()
             } else { String::new() },
-            task: self.task.clone(),
+            task: if self.kind == "shell" { String::new() } else { self.task.clone() },
             role: self.role.name().into(),
             design: self.spec.design.clone(),
             status: self.status.name().into(),
@@ -433,6 +436,10 @@ impl Agent {
     }
 
     fn refit_is(&self, state: &str) -> bool { self.refit.as_ref().is_some_and(|r| r.state == state) }
+
+    fn title(&self) -> String {
+        if self.kind == "shell" { format!("Terminal #{}", self.id) } else { self.parser.callbacks().title.clone() }
+    }
 
     /// The screen changed: wake anyone waiting to see it.
     fn touch(&mut self) {
@@ -807,8 +814,8 @@ fn upgrade(hub: &Shared) -> io::Result<()> {
             rows: rows.get(),
             cols: cols.get(),
             screen,
-            title: g.parser.callbacks().title.clone(),
-            task: g.task.clone(),
+            title: g.title(),
+            task: if g.kind == "shell" { String::new() } else { g.task.clone() },
             role: g.role.name().into(),
             spec: g.spec.clone(),
             status: g.status.name().into(),
@@ -839,14 +846,14 @@ fn adopt(hub: &Shared, file: &str) -> anyhow::Result<()> {
         unsafe { libc::fcntl(h.fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         let mut a = new_agent(h.id, &h.kind, &h.cwd, Pty { master, pid: h.pid }, h.rows.max(2), h.cols.max(2));
         a.parser.process(h.screen.as_bytes());
-        a.parser.callbacks_mut().title = h.title;
+        a.parser.callbacks_mut().title = if h.kind == "shell" { a.title() } else { h.title };
         a.parser.callbacks_mut().replies.clear();
         a.status = Status::parse(&h.status);
         a.told = a.status;
         a.since = now.checked_sub(Duration::from_secs_f32(h.age)).unwrap_or(now);
         a.started = now.checked_sub(Duration::from_secs(60)).unwrap_or(now); // long past booting
         a.turns = h.turns;
-        a.task = h.task;
+        if h.kind != "shell" { a.task = h.task; }
         a.role = Role::parse(&h.role);
         a.spec = h.spec;
         a.report = h.report;
@@ -1971,6 +1978,42 @@ pub fn ensure_running() -> io::Result<()> {
 pub fn dirs_state() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
     std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| home.join(".local/state")).join("empire")
+}
+
+#[cfg(test)]
+mod shell_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn shell_input_reaches_the_terminal_without_becoming_metadata() {
+        let hub = Shared::default();
+        let (tx, mut rx) = UnixStream::pair().unwrap(); rx.set_nonblocking(true).unwrap();
+        let a = Arc::new(Mutex::new(new_agent(1, "shell", "/world", Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80)));
+        hub.lock().unwrap().agents.insert(1, a.clone());
+        for input in ["sudo example\r", "private-", "test-input", "\r", "\x1b[200~pasted-test-input\x1b[201~", "\r"] {
+            assert!(matches!(handle(&hub, Req::Input { id: 1, data: input.into() }), Resp::Ok));
+            let mut bytes = vec![0; input.len()]; rx.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, input.as_bytes());
+            let g = a.lock().unwrap();
+            assert!(g.typed.is_empty(), "shell keystrokes must not be retained, even before Enter");
+            assert!(g.task.is_empty(), "shell input must never become a task");
+        }
+        a.lock().unwrap().note_task("another-private-test-input");
+        assert!(a.lock().unwrap().task.is_empty());
+    }
+
+    #[test]
+    fn shell_views_omit_stale_tasks_and_terminal_titles() {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let mut a = new_agent(1, "shell", "/world", Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80);
+        a.task = "private-test-task".into(); a.typed = "private-test-pending".into();
+        a.parser.process(b"\x1b]0;private-test-title\x07");
+        let v = a.view(Instant::now());
+        assert!(v.task.is_empty() && v.title == "Terminal #1" && v.output.is_empty());
+        assert!(!serde_json::to_string(&v).unwrap().contains("private-test"));
+        a.keys("x");
+        assert!(a.task.is_empty() && a.typed.is_empty());
+    }
 }
 
 #[cfg(test)]
