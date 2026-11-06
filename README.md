@@ -29,8 +29,8 @@ rescans all roots. A scan reads directory entries; it does not pull, clone or mo
 and folders without Git. To discover several projects under a folder, use **V**, then **n** instead.
 A missing folder is created only after a second Enter. Adding a planet does not launch an agent.
 In the sector manager, select a root or manually added planet and press **x/Delete** to remove it.
-On Home, **x/Delete** removes the selected project; on the galaxy, **Delete** removes the selected
-planet. This only removes it from the map: files, repositories, agents and terminals are kept.
+On Home, **x/Delete** removes the selected project; on the galaxy, **x** (or **Delete**) removes the
+selected planet. This only removes it from the map: files, repositories, agents and terminals are kept.
 Worlds with sessions stay visible until those sessions are dismissed. Removed projects stay hidden
 from discovery and history; adding their folder again restores them. Removing a root keeps projects
 covered by another root or added individually. Adding a root again restores its hidden projects.
@@ -57,13 +57,13 @@ Enter or double-click a planet to open its workspace:
   With no live agents, the composer defaults to launching a new ship. **Tab** switches between
   an available agent and a new ship; **↑↓** chooses Claude, Codex or Grok when launching.
 - **Launch an agent from Home** (`e`): choose a species and open its native terminal.
-- **Open another terminal** (`s`): start your normal shell in the project folder. Open as many
+- **Open another terminal** (`b`): start your normal shell in the project folder. Open as many
   as you need for `git pull`, development servers, logs and manual testing. Shells never take
   agent tasks or generate agent permission/completion alerts.
 - **Agents** and **Terminals** have separate sections. Every terminal has a stable number and
   a fixed `Terminal #…` label. Shell keystrokes and window titles never become task labels or
   list previews, including input entered at password prompts. Select one and press **Enter** to reopen it; **F12** or **Ctrl-]**
-  returns with that session selected. **s** opens another terminal. **x** closes the selected
+  returns with that session selected. **b** opens another terminal. **x** closes the selected
   session after confirmation and keeps you on the project. Closing a shell stops its running
   commands too; cancelling leaves it running.
 - **Anomalies** (`a`): inspect detected problems and reported discoveries on this planet.
@@ -77,7 +77,8 @@ Enter or double-click a planet to open its workspace:
   under Terminals). On an empty plot, **Enter** or **n** lays a short first draft (`AGENTS.md`,
   `CLAUDE.md`, `.claude/skills/new-skill/SKILL.md`, `.mcp.json`…) and opens it; **n** on a kind
   that holds many adds another. Existing files are never overwritten. **B** instead briefs a
-  ship to build or renovate it, as an ordinary task you can inspect before sending.
+  ship to build or renovate it, as an ordinary task you can inspect before sending. **b** opens a
+  terminal in the project, **c** opens comms with its lead ship, and **Ctrl+R** re-reads the files.
 
 The project header shows branch, changed files and ahead/behind counts. Agent rows show their
 current task or question. On wider terminals, selecting an agent with a handoff shows its actual
@@ -111,7 +112,7 @@ implementation or testing succeeded. You remain in charge of testing, committing
 Ships and planets highlight agents needing an answer or ready for you to check. **Tab** on the
 galaxy selects the next agent needing you; **C** opens the attention list across projects.
 Permission questions remain incoming transmissions, with the command the agent wants to run shown
-in full and highlighted; number keys answer the displayed choices and **h** hails the ship.
+in full and highlighted; number keys answer the displayed choices and **c** opens comms with the ship.
 When the galaxy is closed, desktop notifications report questions and completed longer turns.
 
 **A** opens anomalies across the galaxy; a planet's **a** action filters to that project.
@@ -121,9 +122,10 @@ its source and evidence. Reported findings are labelled as not independently ver
 
 Select a finding and press **t** to prepare an investigation as an ordinary planet task. Its
 brief asks for read-only investigation; the agent retains its native permissions. Review and edit
-before sending. **i** dismisses, **r** resolves, **o** reopens. Automatic findings resolve only
+before sending. **x** dismisses, **d** defers, **r** resolves, **o** reopens. Automatic findings resolve only
 when a fresh survey confirms recovery. A finished investigation does not prove resolution.
-Use **v** to include resolved/dismissed history, **f** to filter kinds, and **/** to search.
+Use **v** to include resolved/dismissed history, **f** to filter kinds, **/** to search and
+**Backspace** to reset the filters.
 
 Record a discovery without starting the daemon:
 
@@ -163,19 +165,17 @@ count, so their space-station markers remain distinct and do not duplicate PR co
 | Key | Action |
 | --- | --- |
 | Enter / double-click | Open planet workspace or native agent terminal |
+| t / b / e | Give the selected planet a task / open a new terminal there / launch an agent |
+| c / 1-9 | Comms with the incoming transmission (else the selected ship) / answer it |
+| x | Dismiss the selected ship (with confirmation) / remove the selected planet from the map |
+| i | Ship information |
+| Tab / C | Next agent needing you / attention list |
 | H / n | Home / add a project folder |
 | V | Manage sectors and folders: n adds a root, x/Delete removes an entry |
-| Delete | Remove selected planet from the map; keep files and sessions |
 | p / click ◇ PR | Open the selected planet's repository PRs |
-| e / t | Launch an agent / give the selected planet a task |
-| b | Open a new terminal (shell) on the selected planet or ship's world |
-| Tab / C | Next agent needing you / attention list |
-| 1-9 / h | Answer / hail (open comms with) the incoming transmission |
-| A | Anomalies |
-| R | Research Station: experiments, evidence and resource proposals |
+| R / A | Research Station: experiments, evidence and resource proposals / anomalies |
 | L / S | Selected planet's task history / situation log |
-| i / x on a ship | Ship information / dismiss with confirmation |
-| ↑↓ / j k | Select in the outliner |
+| ↑↓ / j k / g G | Select in the outliner / first / last |
 | wasd / drag | Pan |
 | ± / wheel | Zoom between systems, sectors and planets |
 | z / f | Fit galaxy / focus selection |

@@ -2105,8 +2105,8 @@ fn anomaly_input(app: &mut App, w: &World, l: &Lay, ev: &Event, id: u64, mut typ
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => { app.mode = Mode::Galaxy; return; }
             KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(ids.len().saturating_sub(1)),
-            KeyCode::Home => sel = 0,
-            KeyCode::End => sel = ids.len().saturating_sub(1),
+            KeyCode::Home | KeyCode::Char('g') => sel = 0,
+            KeyCode::End | KeyCode::Char('G') => sel = ids.len().saturating_sub(1),
             KeyCode::PageUp => app.anomaly_detail = app.anomaly_detail.saturating_sub(4),
             KeyCode::PageDown => app.anomaly_detail = app.anomaly_detail.saturating_add(4),
             KeyCode::Char('/') => typing = true,
@@ -2122,9 +2122,9 @@ fn anomaly_input(app: &mut App, w: &World, l: &Lay, ev: &Event, id: u64, mut typ
                     app.anomaly_filter.system = ids.get(sel).and_then(|id| app.anomalies.findings.iter().find(|f| f.id == *id)).map(|f| f.system.clone());
                 }
             }
-            KeyCode::Char('x') => app.anomaly_filter = Filter::default(),
+            KeyCode::Backspace => app.anomaly_filter = Filter::default(),
             KeyCode::Enter => action = Some('l'),
-            KeyCode::Char(c @ ('t' | 'd' | 'i' | 'r' | 'o')) => action = Some(c),
+            KeyCode::Char(c @ ('t' | 'd' | 'x' | 'r' | 'o')) => action = Some(c),
             _ => {}
         },
         Event::Mouse(m) => match m.kind {
@@ -2158,7 +2158,7 @@ fn anomaly_input(app: &mut App, w: &World, l: &Lay, ev: &Event, id: u64, mut typ
             app.mode = Mode::Galaxy;
         }
         Some(c) => {
-            let state = match c { 'd' => State::Deferred, 'i' => State::Dismissed, 'r' => State::Resolved, _ => State::Open };
+            let state = match c { 'd' => State::Deferred, 'x' => State::Dismissed, 'r' => State::Resolved, _ => State::Open };
             app.edit_anomalies(|b| b.set_state(selected, state, survey::now()));
             app.anomaly_detail = 0;
         }
@@ -2200,8 +2200,8 @@ fn commander_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => { app.mode = Mode::Galaxy; return; }
             KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => sel = (sel + 1).min(rows.len().saturating_sub(1)),
-            KeyCode::Home => sel = 0,
-            KeyCode::End => sel = rows.len().saturating_sub(1),
+            KeyCode::Home | KeyCode::Char('g') => sel = 0,
+            KeyCode::End | KeyCode::Char('G') => sel = rows.len().saturating_sub(1),
             KeyCode::PageUp => app.commander_detail = app.commander_detail.saturating_sub(4),
             KeyCode::PageDown => app.commander_detail = app.commander_detail.saturating_add(4),
             KeyCode::Enter => open = true,
@@ -2737,8 +2737,7 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event, t: f32) {
     let before = (v.sel, v.file);
     let mut delta: isize = 0;
     let mut edge = None;
-    let mut build = false;
-    let mut comms = false;
+    let (mut build, mut comms, mut shell) = (false, false, false);
     // write the selected file in your editor; lay a new one first when asked or when the plot is empty
     let (mut write, mut found) = (false, false);
     match ev {
@@ -2750,15 +2749,16 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event, t: f32) {
             KeyCode::Down | KeyCode::Char('j') => delta = 1,
             KeyCode::PageUp => { v.focus = 2; delta = -(g.preview_rows as isize); }
             KeyCode::PageDown => { v.focus = 2; delta = g.preview_rows as isize; }
-            KeyCode::Home => edge = Some(false),
-            KeyCode::End => edge = Some(true),
+            KeyCode::Home | KeyCode::Char('g') => edge = Some(false),
+            KeyCode::End | KeyCode::Char('G') => edge = Some(true),
             KeyCode::Char(d @ '1'..='8') => { v.sel = d as usize - '1' as usize; v.focus = 0; }
             KeyCode::Enter if v.focus == 0 && !v.files().is_empty() => v.focus = 1,
             KeyCode::Enter | KeyCode::Char('e') => write = true,
             KeyCode::Char('n') => found = true,
-            KeyCode::Char('B' | 'b') => build = true,
+            KeyCode::Char('B') => build = true,
+            KeyCode::Char('b') => shell = true,
             KeyCode::Char('c') => comms = true,
-            KeyCode::Char('R') => v.refresh(),
+            KeyCode::Char('r' | 'R') if k.modifiers.contains(KeyModifiers::CONTROL) => v.refresh(),
             _ => {}
         },
         Event::Mouse(me) => {
@@ -2816,6 +2816,11 @@ fn planet_input(app: &mut App, l: &Lay, client: &Client, ev: &Event, t: f32) {
         app.survey.worlds.entry(key.clone()).or_default().structures = v.built.clone();
         app.planet_return = Some(v);
         app.construct(&key, kind);
+    } else if shell {
+        // back here once you leave the terminal
+        let key = v.key.clone();
+        app.planet_return = Some(v);
+        app.spawn("shell", Path::new(&key), client, t);
     } else if comms {
         if let Some(id) = app.lead_agent(&v.key) {
             app.planet_return = Some(v);
@@ -3000,8 +3005,8 @@ fn workspace_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
                 KeyCode::Esc | KeyCode::Char('q' | 'V') => { app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 }; return; }
                 KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(sources.len().saturating_sub(1)),
-                KeyCode::Home => sel = 0,
-                KeyCode::End => sel = sources.len().saturating_sub(1),
+                KeyCode::Home | KeyCode::Char('g') => sel = 0,
+                KeyCode::End | KeyCode::Char('G') => sel = sources.len().saturating_sub(1),
                 KeyCode::PageUp => sel = sel.saturating_sub(layout.page),
                 KeyCode::PageDown => sel = (sel + layout.page).min(sources.len().saturating_sub(1)),
                 KeyCode::Enter | KeyCode::Char('n') => { app.mode = Mode::Root(Line::default()); return; }
@@ -3068,24 +3073,29 @@ fn workspace_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
             KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(rows.len().saturating_sub(1)),
             KeyCode::PageUp => sel = sel.saturating_sub(page),
             KeyCode::PageDown => sel = (sel + page).min(rows.len().saturating_sub(1)),
-            KeyCode::Home => sel = 0,
-            KeyCode::End => sel = rows.len().saturating_sub(1),
+            KeyCode::Home | KeyCode::Char('g') => sel = 0,
+            KeyCode::End | KeyCode::Char('G') => sel = rows.len().saturating_sub(1),
             KeyCode::Enter => action = rows.get(sel).map(|r| r.2.clone()),
             KeyCode::Char('n') => action = Some(WorkAct::Add),
             KeyCode::Char('p') if key == crate::workspace::HOME => {
                 if let Some((_, _, WorkAct::Project(project))) = rows.get(sel) { app.open_prs(project, t); return; }
             }
             KeyCode::Char('p') => action = Some(WorkAct::Pulls),
-            KeyCode::Char('R') => action = Some(WorkAct::Refresh),
+            KeyCode::Char('r' | 'R') if k.modifiers.contains(KeyModifiers::CONTROL) => action = Some(WorkAct::Refresh),
+            KeyCode::Char('R') => action = Some(WorkAct::Research),
             KeyCode::Char('H') => action = Some(WorkAct::Project(crate::workspace::HOME.into())),
-            KeyCode::Char('t') if key != crate::workspace::HOME => action = Some(WorkAct::Task),
+            // on Home, the per-world keys act on the selected project
+            KeyCode::Char(c @ ('t' | 'b')) if key == crate::workspace::HOME => {
+                if let Some((_, _, WorkAct::Project(project))) = rows.get(sel) { app.work_action(if c == 't' { WorkAct::Task } else { WorkAct::Terminal }, project, client, l, t); return; }
+            }
+            KeyCode::Char('t') => action = Some(WorkAct::Task),
             KeyCode::Char('e') if key == crate::workspace::HOME => {
                 if let Some((_, _, WorkAct::Project(project))) = rows.get(sel) { app.work_action(WorkAct::Launch, project, client, l, t); return; }
             }
             KeyCode::Char('e') => action = Some(WorkAct::Launch),
             KeyCode::Char('V') => action = Some(WorkAct::Root),
             KeyCode::Char('r') if key == crate::workspace::HOME => action = Some(WorkAct::Root),
-            KeyCode::Char('s') if key != crate::workspace::HOME => action = Some(WorkAct::Terminal),
+            KeyCode::Char('b') => action = Some(WorkAct::Terminal),
             KeyCode::Char('a') if key != crate::workspace::HOME => action = Some(WorkAct::Anomalies),
             KeyCode::Char('x') | KeyCode::Delete => match rows.get(sel).map(|r| &r.2) {
                 Some(WorkAct::Agent(id)) => { app.workspace_return = Some(key.clone()); app.mode = Mode::Confirm { id: *id }; return; }
@@ -3214,8 +3224,8 @@ fn handle(
                 }
                 KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(max),
-                KeyCode::Home => selected = 0,
-                KeyCode::End => selected = max,
+                KeyCode::Home | KeyCode::Char('g') => selected = 0,
+                KeyCode::End | KeyCode::Char('G') => selected = max,
                 KeyCode::PageUp => selected = selected.saturating_sub((l.rows - 10).max(1) as usize),
                 KeyCode::PageDown => selected = (selected + (l.rows - 10).max(1) as usize).min(max),
                 KeyCode::Enter => activate = true,
@@ -3389,6 +3399,8 @@ fn handle(
                 KeyCode::Esc | KeyCode::Char('L') | KeyCode::Char('q') => app.mode = Mode::Galaxy,
                 KeyCode::Up | KeyCode::Char('k') => s = s.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => s = (s + 1).min(log.len().saturating_sub(1)),
+                KeyCode::Home | KeyCode::Char('g') => s = 0,
+                KeyCode::End | KeyCode::Char('G') => s = log.len().saturating_sub(1),
                 // strike it: a queued mission is called off, a finished one leaves the log
                 KeyCode::Char('x') | KeyCode::Delete => {
                     if let Some((id, _)) = log.get(s) {
@@ -3557,7 +3569,7 @@ fn handle(
         Mode::Workspace { .. } | Mode::Root(_) | Mode::Folders { .. } | Mode::Research | Mode::Galaxy | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
-    if app.sel_planet().as_deref() == Some(crate::workspace::HOME) && matches!(k.code, KeyCode::Char('e' | 't' | 'b' | 'B' | 'L' | 'r')) {
+    if app.sel_planet().as_deref() == Some(crate::workspace::HOME) && matches!(k.code, KeyCode::Char('e' | 't' | 'b' | 'B' | 'L' | 'r' | 'x')) {
         app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 }; return false;
     }
     // ── galaxy
@@ -3589,12 +3601,12 @@ fn handle(
         KeyCode::Up | KeyCode::Char('k') => pick(app, cur.map_or(0, |c| c.saturating_sub(1))),
         KeyCode::Home | KeyCode::Char('g') => pick(app, 0),
         KeyCode::End | KeyCode::Char('G') => pick(app, rows.len().saturating_sub(1)),
-        // hail the transmission on screen: its own key, so Enter keeps landing on whatever is selected
-        KeyCode::Char('h') if let Some(id) = app.transmission().map(|a| a.id) => {
-            app.sel = Some(Sel::Agent(id));
-            app.open_comms(id, client, l);
-        }
-        KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char(' ') => app.activate(w, l, client),
+        // comms: the transmission on screen first, so Enter keeps landing on whatever is selected
+        KeyCode::Char('c') => match app.transmission().map(|a| a.id).or(match app.sel { Some(Sel::Agent(id)) if app.agent(id).is_some() => Some(id), _ => None }) {
+            Some(id) => { app.sel = Some(Sel::Agent(id)); app.open_comms(id, client, l); }
+            None => app.toast("select a ship to open comms", t),
+        },
+        KeyCode::Enter | KeyCode::Char(' ') => app.activate(w, l, client),
         KeyCode::Tab => {
             let alerts: Vec<u32> = rows
                 .iter()
@@ -3668,9 +3680,10 @@ fn handle(
             Some(planet) => app.mode = Mode::Deploy { planet, kind: 0 },
             None => app.toast("select a planet first, or press n to colonize a new one", t),
         },
-        KeyCode::Char('x') => match app.sel {
+        KeyCode::Char('x') => match app.sel.clone() {
             Some(Sel::Agent(id)) if app.agent(id).is_some() => app.mode = Mode::Confirm { id },
-            _ => app.toast("select an agent to decommission", t),
+            Some(Sel::Planet(key)) => app.remove_source(false, &key, t),
+            _ => app.toast("select a ship to decommission or a planet to remove", t),
         },
         KeyCode::Char('w') => app.cam.ty -= pan,
         KeyCode::Char('s') => app.cam.ty += pan,
@@ -3770,7 +3783,7 @@ fn situation_input(app: &mut App, w: &World, l: &Lay, client: &Client, ev: &Even
                     }
                 }
             }
-            KeyCode::Char('x') | KeyCode::Backspace => app.sit = SitFilter::default(),
+            KeyCode::Backspace => app.sit = SitFilter::default(),
             KeyCode::Enter => go = true,
             KeyCode::Char('c') => comms = true,
             _ => {}
@@ -4843,7 +4856,7 @@ mod situation_tests {
         // w narrows to its world
         key(&mut app, &world, &l, KeyCode::Char('w'));
         assert_eq!(shown(&app), ["first alert"]);
-        key(&mut app, &world, &l, KeyCode::Char('x'));
+        key(&mut app, &world, &l, KeyCode::Backspace);
         key(&mut app, &world, &l, KeyCode::Char('/'));
         for c in "miss".chars() {
             key(&mut app, &world, &l, KeyCode::Char(c));
@@ -4985,7 +4998,7 @@ mod structure_tests {
     }
 
     #[test]
-    fn a_transmission_shows_the_whole_command_and_h_hails_its_ship() {
+    fn a_transmission_shows_the_whole_command_and_c_opens_its_comms() {
         let mut app = App::new();
         let mut ship = ship_card_tests::ship(1, false);
         ship.status = Status::Blocked;
@@ -5002,10 +5015,10 @@ mod structure_tests {
         let l = Lay::new(&fb, false);
         draw::frame(&mut fb, &mut app, &world, &l, 1.0, None);
         let text: String = fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("h hail"), "{text}");
+        assert!(text.contains("c comms"), "{text}");
         assert!(text.contains("--snapshot"), "the end of the command is on screen:\n{text}");
         app.sel = Some(Sel::Planet("/somewhere".into()));
-        handle(&mut app, &world, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)), 1.0, &mut None);
+        handle(&mut app, &world, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)), 1.0, &mut None);
         assert!(matches!(app.mode, Mode::Comms(_)));
         assert_eq!(app.sel, Some(Sel::Agent(1)));
     }
@@ -5044,7 +5057,7 @@ mod structure_tests {
         press(&mut app, KeyCode::Esc);
         assert!(matches!(&app.mode, Mode::Planet(v) if v.file == 11 && v.sel == 2));
         std::fs::remove_file(dir.join(".agents/skills/skill-11/SKILL.md")).unwrap();
-        press(&mut app, KeyCode::Char('R'));
+        handle(&mut app, &world, &l, &client, None, Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)), 1.0, &mut None);
         assert!(matches!(&app.mode, Mode::Planet(v) if v.files().len() == 11 && v.file == 0 && v.preview.contains("Skill 0, line 0")));
         // the same layout drives mouse targets, even when the galaxy outliner is enabled
         let g = draw::PlanetLayout::new(&l);
@@ -5225,8 +5238,8 @@ mod anomaly_tests {
         assert!(app.anomaly_rows().is_empty());
         key(&mut app, &w, &l, KeyCode::Esc);
         assert!(matches!(app.mode, Mode::Anomalies { .. }));
+        key(&mut app, &w, &l, KeyCode::Backspace);
         key(&mut app, &w, &l, KeyCode::Char('x'));
-        key(&mut app, &w, &l, KeyCode::Char('i'));
         app.refresh_anomalies();
         assert!(app.anomaly_rows().is_empty());
         assert_eq!(app.anomalies.findings[0].state, State::Dismissed);
@@ -5527,6 +5540,42 @@ mod workspace_tests {
     }
 
     #[test]
+    fn b_is_a_new_terminal_and_x_removes_on_every_screen_that_offers_them() {
+        let mut app = App::new();
+        app.agents.push(ship_card_tests::ship(1, false));
+        let w = app.world(1.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 35), false);
+        let (client, commands) = Client::recording();
+        let shells = |c: &std::sync::mpsc::Receiver<Cmd>| c.try_iter().filter_map(|c| match c { Cmd::Spawn { kind, cwd } if kind == "shell" => Some(cwd), _ => None }).collect::<Vec<_>>();
+        // a project, its resources and Home (on the selected project) all open a shell in that world
+        app.mode = Mode::Workspace { key: "/world".into(), sel: 0 };
+        press(&mut app, &w, &l, &client, KeyCode::Char('b'));
+        app.mode = Mode::Planet(PlanetView::new("/world".into()));
+        press(&mut app, &w, &l, &client, KeyCode::Char('b'));
+        assert!(app.planet_return.is_some(), "leaving the terminal comes back to the resources");
+        let dir = std::env::temp_dir().join(format!("empire-home-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.to_string_lossy().into_owned();
+        app.history.clear(); app.add_folder(&dir, 1.0);
+        let hw = app.world(1.0, 0.0);
+        let sel = app.work_rows(&hw, crate::workspace::HOME).iter().position(|r| matches!(&r.2, WorkAct::Project(p) if *p == project)).unwrap();
+        app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel };
+        press(&mut app, &hw, &l, &client, KeyCode::Char('b'));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(shells(&commands), vec!["/world".to_string(), "/world".to_string(), project]);
+        // c with no transmission and no ship selected says so instead of opening something else
+        app.mode = Mode::Galaxy;
+        app.sel = Some(Sel::Planet("/world".into()));
+        press(&mut app, &w, &l, &client, KeyCode::Char('c'));
+        assert!(matches!(app.mode, Mode::Galaxy));
+        press(&mut app, &w, &l, &client, KeyCode::Char('x'));
+        assert!(app.workspace.hidden.iter().any(|p| p == "/world"), "x takes the planet off the map");
+        app.sel = Some(Sel::Agent(1));
+        press(&mut app, &w, &l, &client, KeyCode::Char('x'));
+        assert!(matches!(app.mode, Mode::Confirm { id: 1 }));
+    }
+
+    #[test]
     fn galaxy_footer_keeps_the_open_action_help_and_leave_whole_at_every_width() {
         let mut app = App::new();
         app.agents.push(ship_card_tests::ship(1, false));
@@ -5551,7 +5600,7 @@ mod workspace_tests {
                 }
                 assert!(!foot.contains('…') && hints.iter().all(|h| !h.trim().is_empty()), "{cols} cols, {sel:?}: |{foot}|");
                 if cols >= 80 { assert!(hints.contains(&"Tab next alert"), "{cols} cols, {sel:?}: |{foot}|"); }
-                if cols == 140 && matches!(sel, Some(Sel::Planet(k)) if k == "/world") { assert!(hints.contains(&"b shell"), "|{foot}|"); }
+                if cols == 140 && matches!(sel, Some(Sel::Planet(k)) if k == "/world") { assert!(hints.contains(&"b terminal"), "|{foot}|"); }
             }
         }
     }
@@ -5567,7 +5616,7 @@ mod workspace_tests {
         let (client, commands) = Client::recording();
         for _ in 0..3 {
             app.mode = Mode::Workspace { key: key.clone(), sel: 0 };
-            press(&mut app, &w, &l, &client, KeyCode::Char('s'));
+            press(&mut app, &w, &l, &client, KeyCode::Char('b'));
         }
         let launches = commands.try_iter().filter(|c| matches!(c, Cmd::Spawn { kind, cwd } if kind == "shell" && cwd == &key)).count();
         assert_eq!(launches, 3);

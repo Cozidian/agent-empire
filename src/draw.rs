@@ -1380,7 +1380,7 @@ fn planet_rows(app: &App, w: &World, p: &Planet, t: f32) -> Rows {
     if p.dormant && p.host.is_none() {
         let age = ago((survey::now() as u64).saturating_sub(p.last_seen) as f32);
         let txt = if p.fog > 0.8 { "lost in the nebula" } else if p.fog > 0.5 { "fading" } else { "dormant" };
-        rows.push(("status", vec![(format!("{txt} · quiet for {age}"), v3(0.6, 0.5, 0.85)), ("  e deploy · X forget".into(), DIM)]));
+        rows.push(("status", vec![(format!("{txt} · quiet for {age}"), v3(0.6, 0.5, 0.85)), ("  e deploy · x forget".into(), DIM)]));
     }
     economy(&mut rows, &agents, t);
     let ctx: Vec<(String, V3)> = agents
@@ -1629,7 +1629,7 @@ fn transmission(fb: &mut Fb, app: &App, l: &Lay, t: f32) {
         seg(fb, cx + 1, r, &trunc(&o.label, inner - 4), width - 4 - (cx + 1 - x - 2), TEXT, Some(BOX));
     }
     let more = if waiting > 1 { format!(" · ⇥ next ({} waiting)", waiting - 1) } else { String::new() };
-    let hint = format!(" 1-{} answer · h hail{more} ", q.options.len().min(9));
+    let hint = format!(" 1-{} answer · c comms{more} ", q.options.len().min(9));
     seg(fb, x + width - 2 - hint.chars().count() as i32, y + height - 1, &hint, width, DIM, Some(BOX));
 }
 
@@ -1648,9 +1648,9 @@ fn footer(fb: &mut Fb, app: &App, _w: &World, l: &Lay, sound: Option<&Sound>) {
     let mute = sound.map(|s| if s.muted.load(Relaxed) { "m alerts off" } else { "m alerts on" });
     let music = sound.map(|s| if s.music_muted.load(Relaxed) { "M music off" } else { "M music on" });
     let ctx: &[&str] = match &app.sel {
-        Some(Sel::Planet(key)) if key != crate::workspace::HOME => &["Enter project", "t task", "b shell", "e agent", "p PRs", "Del remove"],
+        Some(Sel::Planet(key)) if key != crate::workspace::HOME => &["Enter project", "t task", "b terminal", "e agent", "p PRs", "x remove"],
         Some(Sel::Planet(_)) => &["Enter home"],
-        Some(Sel::Agent(_)) => &["Enter terminal", "b shell", "x dismiss"],
+        Some(Sel::Agent(_)) => &["Enter terminal", "b terminal", "x dismiss"],
         Some(Sel::Research) => &["Enter research"],
         Some(Sel::GitHub) => &["Enter pull requests"],
         _ => &[],
@@ -2108,10 +2108,10 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
     }
     fb.panel(0, l.rows - 2, l.cols, 2, BAR);
     let terminal = rows.get(sel).is_some_and(|r| matches!(r.2, WorkAct::Agent(id) if app.agent(id).is_some_and(|a| a.kind == "shell")));
-    seg(fb, 2, l.rows - 2, if home { "r sectors · x remove · p PRs · Enter open · n folder · e launch · R refresh · Esc galaxy" }
-        else if terminal { "Enter reopen · s new terminal · x close · ↑↓ choose · H home · Esc galaxy" }
-        else if rows.get(sel).is_some_and(|r| matches!(r.2, WorkAct::Edit(..))) { "Enter edit in your editor · ↑↓ choose · t task · s terminal · H home · Esc galaxy" }
-        else { "↑↓ choose · Enter open · p PRs · t task · e agent · s terminal · a anomalies · x dismiss · H home" }, l.cols - 4, TEXT, Some(BAR));
+    seg(fb, 2, l.rows - 2, if home { "Enter open · t task · b terminal · e agent · p PRs · x remove · n folder · r sectors · ^R refresh · Esc galaxy" }
+        else if terminal { "Enter reopen · b new terminal · x close · ↑↓ choose · H home · Esc galaxy" }
+        else if rows.get(sel).is_some_and(|r| matches!(r.2, WorkAct::Edit(..))) { "Enter edit in your editor · ↑↓ choose · t task · b terminal · H home · Esc galaxy" }
+        else { "↑↓ choose · Enter open · t task · b terminal · e agent · p PRs · a anomalies · x dismiss · H home" }, l.cols - 4, TEXT, Some(BAR));
     let context = rows.get(sel).map(|(_, note, a)| if home { if let WorkAct::Project(p) = a { tilde(p) } else { note.clone() } }
         else if terminal { "F12 / Ctrl-] returns here and keeps the terminal running.".into() } else { note.clone() });
     seg(fb, 2, l.rows - 1, context.as_deref().unwrap_or("Agents and terminals keep running when you leave."), l.cols - 4, DIM, Some(BAR));
@@ -2187,7 +2187,7 @@ fn planet_view(fb: &mut Fb, app: &App, w: &World, v: &PlanetView, l: &Lay, t: f3
     fb.panel(0, l.rows - 2, l.cols, 2, BAR);
     let keys = if l.cols >= 80 { "↑↓ choose · Tab pane · e edit · n new · B brief a ship · 1–8 building · Esc back" } else if l.cols >= 50 { "↑↓ choose · e edit · n new · B brief · Esc back" } else { "e edit · n new · Esc back" };
     seg(fb, 2, l.rows - 2, keys, l.cols - 4, TEXT, Some(BAR));
-    seg(fb, 2, l.rows - 1, "PgUp/Dn read · R refresh · c comms", l.cols - 4, DIM, Some(BAR));
+    seg(fb, 2, l.rows - 1, "PgUp/Dn read · ^R refresh · c comms · b terminal", l.cols - 4, DIM, Some(BAR));
     if let Some((msg, at)) = &app.toast && t - at < 3.2 {
         seg(fb, 2, 3, msg, l.cols - 4, v3(0.6, 0.95, 0.7), Some(BAR));
     }
@@ -2567,28 +2567,25 @@ fn help(fb: &mut Fb, l: &Lay) {
     let lines = [
         ("GALAXY", ""),
         ("Enter / double click", "open project or native agent terminal"),
-        ("H / n", "home planet / add a folder"),
-        ("V", "sectors and folders: n add root, x remove"),
-        ("Delete", "remove selected planet; keep files and sessions"),
-        ("Home: r / x", "manage sectors / remove selected project"),
+        ("t / b / e", "give planet a task / new terminal / launch agent"),
+        ("c / 1-9", "comms with a transmission or ship / answer it"),
+        ("x", "dismiss ship / remove planet (keeps its files)"),
         ("Tab / C", "next agent needing you / all attention"),
-        ("1-9 / h", "answer / hail an incoming transmission"),
-        ("R", "Research Station: experiments and resource proposals"),
-        ("A", "anomalies: investigate, dismiss or resolve"),
-        ("e / t / b", "launch agent / give planet a task / new terminal"),
+        ("H / n / V", "home planet / add a folder / sectors and folders"),
+        ("R / A", "Research Station / anomalies"),
         ("p / click PR marker", "open this planet's pull requests"),
         ("L / S", "planet task history / situation log"),
         ("wasd / drag", "pan · ± / wheel zoom · z fit · f focus"),
         ("o / m / M", "outliner / alert sounds / music"),
         ("q", "leave; agents and terminals keep running"),
         ("PROJECT", ""),
-        ("Enter / ↑↓", "open / select action or session"),
-        ("s / e / t", "new terminal / new agent / quick task"),
-        ("a / x", "anomalies / dismiss selected session"),
-        ("H / Esc", "home / galaxy"),
+        ("Enter / ↑↓ g G", "open / select action or session"),
+        ("t / b / e", "quick task / new terminal / new agent"),
+        ("a / x / Ctrl+R", "anomalies / dismiss session / refresh"),
+        ("H / Esc", "home (r sectors, x remove project) / galaxy"),
         ("PROJECT RESOURCES", ""),
         ("Enter / e", "write the file in your editor ($EDITOR, else nvim)"),
-        ("n / B", "lay a new one to write / brief a ship to build it"),
+        ("n / B / b", "lay a new one / brief a ship to build it / terminal"),
         ("TERMINAL", ""),
         ("Ctrl-] / F12", "return; all other keys go to the terminal"),
         ("QUICK TASK", ""),
@@ -2596,7 +2593,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("Tab / ↑↓", "available agent or new ship / species"),
         ("Ctrl+V", "paste or attach screenshot"),
     ];
-    let (x, y, w, h) = centered(l, 66, lines.len() as i32 + 4);
+    let (x, y, w, h) = centered(l, 78, lines.len() as i32 + 4);
     let accent = v3(0.45, 0.85, 1.0);
     frame_box(fb, x, y, w, h, "◆ FLEET MANUAL", accent);
     for (k, (key, what)) in lines.iter().enumerate() {
@@ -2604,8 +2601,8 @@ fn help(fb: &mut Fb, l: &Lay) {
         if what.is_empty() {
             seg(fb, x + 3, r, key, w - 6, accent, Some(BOX));
         } else {
-            let c = seg(fb, x + 3, r, &pad(key, 17), 17, TEXT, Some(BOX));
-            seg(fb, c + 1, r, what, w - 22, DIM, Some(BOX));
+            let c = seg(fb, x + 3, r, &pad(key, 21), 21, TEXT, Some(BOX));
+            seg(fb, c + 1, r, what, w - 27, DIM, Some(BOX));
         }
     }
 }
@@ -2798,8 +2795,8 @@ fn anomalies(fb: &mut Fb, app: &mut App, l: &Lay, id: u64, typing: bool) {
     for (i, line) in detail.iter().skip(app.anomaly_detail).take(detail_h).enumerate() {
         seg(fb, x + 2, dy + i as i32, line, w - 4, TEXT, Some(BOX));
     }
-    seg(fb, x + 2, y + h - 3, "⏎ locate · t investigate · d defer · i dismiss · r resolve · o reopen", w - 4, accent, Some(BOX));
-    seg(fb, x + 2, y + h - 2, "↑↓ select · PgUp/Dn evidence/history · / search · x reset · Esc galaxy", w - 4, DIM, Some(BOX));
+    seg(fb, x + 2, y + h - 3, "⏎ locate · t investigate · d defer · x dismiss · r resolve · o reopen", w - 4, accent, Some(BOX));
+    seg(fb, x + 2, y + h - 2, "↑↓ select · PgUp/Dn evidence/history · / search · ⌫ reset · Esc galaxy", w - 4, DIM, Some(BOX));
 }
 
 // ─────────────────────────────── situation log ───────────────────────────────
@@ -2941,7 +2938,7 @@ fn situation(fb: &mut Fb, app: &App, w: &World, l: &Lay, id: u64, typing: bool, 
     } else if let Some((m, _)) = app.toast.as_ref().filter(|(_, at)| t - at < 3.2) {
         m.clone()
     } else {
-        "↑↓ select · 0-7 / f kind · w this world · / search · x clear · ⏎ go to · c comms · esc close".into()
+        "↑↓ select · 0-7 / f kind · w this world · / search · ⌫ clear · ⏎ go to · c comms · esc close".into()
     };
     seg(fb, x + 3, y + h - 2, &help, bw - 6, DIM, Some(BOX));
 }
