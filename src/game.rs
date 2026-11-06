@@ -1297,8 +1297,14 @@ impl App {
                 if let Some(r) = v.refit.as_ref().filter(|r| was.as_deref() != Some(r.state.as_str()) && was.is_some()) {
                     let (kind, planet) = (a.kind.clone(), base_name(&a.cwd));
                     let line = match r.state.as_str() {
-                        "active" => Some((format!("⚒ {kind} on {planet} refitted: {} aboard", refit_name(r)), v3(0.5, 0.9, 0.6))),
-                        "failed" => Some((format!("✖ refit of {kind} on {planet} failed: {}", r.note), v3(1.0, 0.4, 0.3))),
+                        "active" => {
+                            cues.push(Cue::Done);
+                            Some((format!("⚒ {kind} on {planet} refitted: {} aboard", refit_name(r)), v3(0.5, 0.9, 0.6)))
+                        }
+                        "failed" => {
+                            cues.push(Cue::Alert);
+                            Some((format!("✖ refit of {kind} on {planet} failed: {}", r.note), v3(1.0, 0.4, 0.3)))
+                        }
                         "unsupported" => Some((format!("⊘ {kind} on {planet} can't be refitted: {}", r.note), v3(0.7, 0.7, 0.75))),
                         _ => None,
                     };
@@ -1314,7 +1320,7 @@ impl App {
                         let rival = self.agents.iter().find(|r| r.id == w.rival).map_or("another agent".into(), |r| r.kind.clone());
                         self.say(Ev::Alert, format!("⚔ border conflict on {planet}: {kind} and {rival} both editing {}", w.files.join(", ")), v3(1.0, 0.45, 0.3)).on(&v.cwd).by(v.id);
                         self.fx.push(Fx::Ring { x: pos.0, y: pos.1, t0: t, col: v3(1.0, 0.4, 0.2), speed: 50.0, dur: 1.2 });
-                        cues.push(Cue::Blocked);
+                        cues.push(Cue::Alert);
                     }
                 }
                 let a = &mut self.agents[i];
@@ -2543,6 +2549,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                 Msg::Error(e) => {
                     app.say(Ev::Error, format!("✖ {e}"), v3(1.0, 0.4, 0.3));
                     app.toast(format!("✖ {e}"), t);
+                    cues.push(Cue::Alert);
                 }
             }
         }
@@ -2598,6 +2605,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                     for b in w.structures.iter().filter(|b| !had.contains(&b.kind)) {
                         let k = b.kind;
                         app.say(Ev::World, format!("{} {} raised on {} ({})", k.glyph(), k.name(), base_name(path), b.files.join(", ")), k.color()).on(path);
+                        cues.push(Cue::Done);
                         let host = app.moon_host(path).unwrap_or_else(|| path.clone());
                         awards.push((path.clone(), format!("built-{host}-{}", k.name()), 1, format!("{} built ({})", k.name(), k.what())));
                     }
@@ -2610,10 +2618,11 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
                     match (before, pr.ci) {
                         (Some(b), "fail") if b != "fail" => {
                             app.say(Ev::Alert, format!("✖ CI failed on #{} ({}): {}", pr.number, base_name(path), pr.title), v3(1.0, 0.4, 0.3)).on(path);
-                            cues.push(Cue::Blocked);
+                            cues.push(Cue::Alert);
                         }
                         (Some(b), "pass") if b != "pass" => {
                             app.say(Ev::Trade, format!("✔ CI green on #{} ({}): {}", pr.number, base_name(path), pr.title), v3(0.4, 0.95, 0.6)).on(path);
+                            cues.push(Cue::Done);
                         }
                         (None, _) if app.survey.worlds.contains_key(path) && app.survey.worlds[path].github => {
                             app.say(Ev::Trade, format!("▸ PR #{} docked at the station ({}): {}", pr.number, base_name(path), pr.title), v3(0.6, 0.85, 1.0)).on(path);
