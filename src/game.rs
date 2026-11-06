@@ -3557,7 +3557,7 @@ fn handle(
         Mode::Workspace { .. } | Mode::Root(_) | Mode::Folders { .. } | Mode::Research | Mode::Galaxy | Mode::Planet(_) | Mode::Anomalies { .. } | Mode::Commander | Mode::Comms(_) | Mode::Trade { .. } | Mode::Situation { .. } => {}
     }
 
-    if app.sel_planet().as_deref() == Some(crate::workspace::HOME) && matches!(k.code, KeyCode::Char('e' | 't' | 'B' | 'L' | 'r')) {
+    if app.sel_planet().as_deref() == Some(crate::workspace::HOME) && matches!(k.code, KeyCode::Char('e' | 't' | 'b' | 'B' | 'L' | 'r')) {
         app.mode = Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 }; return false;
     }
     // ── galaxy
@@ -3649,6 +3649,11 @@ fn handle(
                 app.mode = Mode::Brief { planet, text: Line::default(), kind: 0, launch: !crewed, attachments: Vec::new(), sending: false };
             }
             None => app.toast("select a world to give it a mission", t),
+        },
+        // a fresh shell on the selected world, opened as soon as it's up
+        KeyCode::Char('b') => match app.sel_planet() {
+            Some(p) => app.spawn("shell", Path::new(&p), client, t),
+            None => app.toast("select a world to open a terminal there", t),
         },
         KeyCode::Char('T') => {
             // strike finished missions on the selected world from the log
@@ -5498,6 +5503,57 @@ mod workspace_tests {
         press(&mut app, &w, &l, &client, KeyCode::Char('y'));
         assert!(commands.try_iter().any(|c| matches!(c, Cmd::Kill(2))));
         assert!(matches!(&app.mode, Mode::Workspace { key, .. } if key == "/world"));
+    }
+
+    #[test]
+    fn b_opens_a_fresh_shell_on_the_selected_world_from_the_galaxy() {
+        let mut app = App::new();
+        app.agents.push(ship_card_tests::ship(1, false));
+        let cwd = app.agents[0].cwd.clone();
+        let w = app.world(1.0, 0.0);
+        let l = Lay::new(&Fb::new(120, 35), false);
+        let (client, commands) = Client::recording();
+        for sel in [Sel::Planet("/world".into()), Sel::Agent(1)] {
+            app.mode = Mode::Galaxy;
+            app.sel = Some(sel);
+            press(&mut app, &w, &l, &client, KeyCode::Char('b'));
+            assert!(matches!(app.mode, Mode::Galaxy), "comms open once the shell is up");
+        }
+        let shells: Vec<String> = commands.try_iter().filter_map(|c| match c { Cmd::Spawn { kind, cwd } if kind == "shell" => Some(cwd), _ => None }).collect();
+        assert_eq!(shells, vec!["/world".to_string(), cwd]);
+        app.sel = None;
+        press(&mut app, &w, &l, &client, KeyCode::Char('b'));
+        assert!(commands.try_iter().next().is_none(), "no world, no shell");
+    }
+
+    #[test]
+    fn galaxy_footer_keeps_the_open_action_help_and_leave_whole_at_every_width() {
+        let mut app = App::new();
+        app.agents.push(ship_card_tests::ship(1, false));
+        let w = app.world(1.0, 0.0);
+        let cases = [
+            (Some(Sel::Planet("/world".into())), "Enter project"), (Some(Sel::Planet(crate::workspace::HOME.into())), "Enter home"),
+            (Some(Sel::Agent(1)), "Enter terminal"), (Some(Sel::Research), "Enter research"), (Some(Sel::GitHub), "Enter pull requests"), (None, ""),
+        ];
+        for cols in [40, 80, 140] {
+            for (sel, open) in &cases {
+                app.mode = Mode::Galaxy;
+                app.sel = sel.clone();
+                let mut fb = Fb::new(cols, 30);
+                let l = Lay::new(&fb, false);
+                draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+                let row = (l.rows - 1) as usize;
+                let foot: String = (0..fb.cols).map(|c| fb.txt[row * fb.cols + c].map_or(' ', |c| c.ch)).collect();
+                let foot = foot.trim_end();
+                let hints: Vec<&str> = foot.split(" · ").collect();
+                for need in [*open, "? help", "q leave"].into_iter().filter(|h| !h.is_empty()) {
+                    assert!(hints.contains(&need), "{cols} cols, {sel:?}: |{foot}|");
+                }
+                assert!(!foot.contains('…') && hints.iter().all(|h| !h.trim().is_empty()), "{cols} cols, {sel:?}: |{foot}|");
+                if cols >= 80 { assert!(hints.contains(&"Tab next alert"), "{cols} cols, {sel:?}: |{foot}|"); }
+                if cols == 140 && matches!(sel, Some(Sel::Planet(k)) if k == "/world") { assert!(hints.contains(&"b shell"), "|{foot}|"); }
+            }
+        }
     }
 
     #[test]

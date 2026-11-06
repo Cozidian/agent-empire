@@ -168,6 +168,7 @@ count, so their space-station markers remain distinct and do not duplicate PR co
 | Delete | Remove selected planet from the map; keep files and sessions |
 | p / click ◇ PR | Open the selected planet's repository PRs |
 | e / t | Launch an agent / give the selected planet a task |
+| b | Open a new terminal (shell) on the selected planet or ship's world |
 | Tab / C | Next agent needing you / attention list |
 | 1-9 / h | Answer / hail (open comms with) the incoming transmission |
 | A | Anomalies |

@@ -1645,25 +1645,29 @@ pub fn commander_button(app: &App, w: &World) -> String {
 
 fn footer(fb: &mut Fb, app: &App, _w: &World, l: &Lay, sound: Option<&Sound>) {
     fb.panel(0, l.rows - 1, l.cols, 1, BAR);
-    let mute = match sound {
-        None => "",
-        Some(s) if s.muted.load(Relaxed) => " · m alerts off",
-        Some(_) => " · m alerts on",
+    let mute = sound.map(|s| if s.muted.load(Relaxed) { "m alerts off" } else { "m alerts on" });
+    let music = sound.map(|s| if s.music_muted.load(Relaxed) { "M music off" } else { "M music on" });
+    let ctx: &[&str] = match &app.sel {
+        Some(Sel::Planet(key)) if key != crate::workspace::HOME => &["Enter project", "t task", "b shell", "e agent", "p PRs", "Del remove"],
+        Some(Sel::Planet(_)) => &["Enter home"],
+        Some(Sel::Agent(_)) => &["Enter terminal", "b shell", "x dismiss"],
+        Some(Sel::Research) => &["Enter research"],
+        Some(Sel::GitHub) => &["Enter pull requests"],
+        _ => &[],
     };
-    let music = match sound {
-        None => "",
-        Some(s) if s.music_muted.load(Relaxed) => "· M music off ",
-        Some(_) => "· M music on ",
-    };
-    let ctx = match &app.sel {
-        Some(Sel::Planet(key)) if key != crate::workspace::HOME => "Enter project · p PRs · Del remove · t task · e agent · ",
-        Some(Sel::Planet(_)) => "Enter home · ",
-        Some(Sel::Agent(_)) => "Enter terminal · x dismiss · ",
-        Some(Sel::Research) => "Enter research · ",
-        Some(Sel::GitHub) => "Enter pull requests · ",
-        _ => "",
-    };
-    let s = format!("{ctx}R research · H home · n folder · V sectors · Tab next alert · A anomalies · ? help · q leave {music}{mute}");
+    // (hint, rank): on a narrow terminal the lowest-ranked hints give way, whole, rather than clipping help and leave
+    let mut hints: Vec<(&str, u8)> = ctx.iter().enumerate().map(|(i, h)| (*h, if i == 0 { 0 } else { 2 })).collect();
+    hints.extend([("R research", 3), ("H home", 3), ("n folder", 3), ("V sectors", 3), ("Tab next alert", 1), ("A anomalies", 3), ("? help", 0), ("q leave", 0)]);
+    hints.extend(music.into_iter().chain(mute).map(|h| (h, 4)));
+    let mut keep = vec![false; hints.len()];
+    let mut used = 0;
+    for rank in 0..=4 {
+        for (i, (h, r)) in hints.iter().enumerate() {
+            let n = h.chars().count() + if used > 0 { 3 } else { 0 };
+            if *r == rank && used + n <= l.cols as usize { keep[i] = true; used += n; }
+        }
+    }
+    let s = hints.iter().zip(keep).filter(|(_, k)| *k).map(|((h, _), _)| *h).collect::<Vec<_>>().join(" · ");
     seg(fb, 0, l.rows - 1, &s, l.cols, DIM, Some(BAR));
 }
 
@@ -2571,7 +2575,7 @@ fn help(fb: &mut Fb, l: &Lay) {
         ("1-9 / h", "answer / hail an incoming transmission"),
         ("R", "Research Station: experiments and resource proposals"),
         ("A", "anomalies: investigate, dismiss or resolve"),
-        ("e / t", "launch agent / give planet a task"),
+        ("e / t / b", "launch agent / give planet a task / new terminal"),
         ("p / click PR marker", "open this planet's pull requests"),
         ("L / S", "planet task history / situation log"),
         ("wasd / drag", "pan · ± / wheel zoom · z fit · f focus"),
