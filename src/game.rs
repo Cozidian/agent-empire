@@ -1149,7 +1149,12 @@ impl App {
     }
 
     pub fn moon_host(&self, key: &str) -> Option<String> {
-        self.survey.worlds.get(key)?.host.clone()
+        self.survey.worlds.get(key).and_then(|w| w.host.clone()).or_else(|| {
+            self.survey.worlds.iter().find_map(|(p, w)| {
+                let host = w.host.as_ref().unwrap_or(p);
+                (host != key && w.worktrees.iter().any(|s| s == key)).then(|| host.clone())
+            })
+        })
     }
 
     /// Live agents in a system or on a world.
@@ -1264,6 +1269,10 @@ impl App {
             let title = if v.kind == "shell" { format!("Terminal #{}", v.id) }
                 else if v.task.is_empty() { clean_title(&v.title) } else { v.task.clone() };
             if let Some(i) = self.agents.iter().position(|a| a.id == v.id && a.dying.is_none()) {
+                if self.agents[i].cwd != v.cwd {
+                    self.agents[i].cwd = v.cwd.clone();
+                    self.say(Ev::Agent, format!("▣ {} moved to {}", v.kind, base_name(&v.cwd)), kind_color(&v.kind)).on(&v.cwd).by(v.id);
+                }
                 if v.kind == "shell" { self.agents[i].title = title.clone(); }
                 let old = self.agents[i].status;
                 if old != st {
@@ -1460,7 +1469,15 @@ impl App {
             if Path::new(key).is_dir() && !self.workspace.hidden.contains(key) { pmap.entry(key.clone()).or_default(); }
         }
         // worktrees are stations of the world they were split from (which shows up even if empty)
-        let host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
+        let mut host_of: BTreeMap<String, String> = pmap.keys().filter_map(|k| Some((k.clone(), self.survey.worlds.get(k)?.host.clone()?))).collect();
+        for key in pmap.keys().cloned().collect::<Vec<_>>() {
+            let Some(s) = self.survey.worlds.get(&key) else { continue };
+            let host = s.host.as_ref().unwrap_or(&key);
+            for path in &s.worktrees {
+                if path == host || self.workspace.hidden.contains(path) { continue; }
+                pmap.entry(path.clone()).or_default(); host_of.insert(path.clone(), host.clone());
+            }
+        }
         for h in host_of.values() {
             pmap.entry(h.clone()).or_default();
         }
@@ -5353,6 +5370,52 @@ mod anomaly_tests {
 #[cfg(test)]
 mod workspace_tests {
     use super::*;
+
+    #[test]
+    fn a_new_registered_worktree_is_charted_without_a_ship_or_folder_refresh() {
+        let mut app = App::new(); app.history.clear();
+        app.projects = vec!["/world".into()];
+        app.survey.worlds.insert("/world".into(), survey::World {
+            worktrees: vec!["/world".into(), "/outside/new-worktree".into()], ..Default::default()
+        });
+        let w = app.world(1.0, 0.0);
+        let station = w.planet("/outside/new-worktree").expect("new worktree should appear without Refresh projects");
+        assert_eq!(w.planets[station.host.unwrap()].key, "/world");
+        assert!(station.agents.is_empty());
+        app.workspace.hidden.push("/outside/new-worktree".into());
+        assert!(app.world(2.0, 0.0).planet("/outside/new-worktree").is_none());
+        app.workspace.hidden.clear();
+        app.survey.worlds.get_mut("/world").unwrap().worktrees.clear();
+        assert!(app.world(3.0, 0.0).planet("/outside/new-worktree").is_none());
+    }
+
+    #[test]
+    fn an_existing_ship_follows_its_worktree_without_losing_selection_or_comms() {
+        let mut app = App::new();
+        let mut v: AgentView = serde_json::from_value(serde_json::json!({
+            "id": 1, "kind": "codex", "cwd": "/world", "title": "working", "status": "working", "age": 1.0
+        })).unwrap();
+        app.apply(vec![v.clone()], 1.0, &mut vec![]);
+        app.sel = Some(Sel::Agent(1)); app.mode = Mode::Comms(1);
+        v.cwd = "/outside/new-worktree".into();
+        app.survey.worlds.insert(v.cwd.clone(), survey::World { host: Some("/world".into()), ..Default::default() });
+        app.apply(vec![v.clone()], 2.0, &mut vec![]);
+        assert_eq!(app.agent(1).unwrap().cwd, v.cwd);
+        assert_eq!(app.agents.len(), 1);
+        assert!(matches!(app.sel, Some(Sel::Agent(1))));
+        assert!(matches!(app.mode, Mode::Comms(1)));
+        let w = app.world(2.0, 0.0);
+        let station = w.planet(&v.cwd).unwrap();
+        assert!(station.host.is_some());
+        assert_eq!(station.agents, vec![0]);
+        assert!(w.planet("/world").unwrap().agents.is_empty());
+        app.mode = Mode::Galaxy;
+        let mut fb = Fb::new(160, 48); let l = Lay::new(&fb, true);
+        draw::frame(&mut fb, &mut app, &w, &l, 2.0, None);
+        let lines: Vec<String> = fb.txt.chunks(fb.cols).map(|r| r[(l.cols - l.pw) as usize..].iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+        let row = lines.iter().position(|s| s.contains("▣") && s.contains("new-worktree")).expect("the outliner shows the station");
+        assert!(lines[row + 1].contains("codex"), "the same ship is listed beneath its station");
+    }
 
     #[test]
     fn shell_metadata_from_older_daemons_never_appears_in_the_ui() {

@@ -49,6 +49,9 @@ pub enum Req {
         /// The agent's session id, when the hook payload carries one.
         #[serde(default)]
         session: Option<String>,
+        /// Native working directory, when the harness reports one.
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Settle a border conflict: `id` keeps the contested files, its rivals are told to leave them.
     Priority { id: u32 },

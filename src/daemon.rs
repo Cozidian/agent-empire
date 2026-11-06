@@ -1214,6 +1214,35 @@ fn discover_sessions(hub: &Shared) {
     }
 }
 
+/// Follow executed commands, keeping the native session and PTY intact.
+fn follow_worktrees(hub: &Shared, trails: &mut HashMap<u32, crate::worktree::Trail>, sessions: &std::path::Path) {
+    let ships: Vec<_> = hub.lock().unwrap().agents.values().filter_map(|a| {
+        let g = a.lock().unwrap();
+        (g.kind == "codex" && g.exited.is_none()).then(|| Some((g.id, g.cwd.clone(), g.session.clone()?))).flatten()
+    }).collect();
+    trails.retain(|id, _| ships.iter().any(|(i, _, _)| i == id));
+    for (id, from, session) in ships {
+        let paths = trails.entry(id).or_default().poll(sessions, &session);
+        // the newest related checkout wins, including a return to the current checkout
+        if let Some(to) = paths.iter().rev().find_map(|cwd| crate::worktree::destination(&from, cwd)) {
+            move_ship(hub, id, &from, &to);
+        }
+    }
+}
+
+fn move_ship(hub: &Shared, id: u32, from: &str, to: &str) {
+    if from == to { return; }
+    let mut h = hub.lock().unwrap();
+    let Some(a) = h.agents.get(&id).cloned() else { return };
+    let mut g = a.lock().unwrap();
+    if g.cwd != from || g.exited.is_some() { return; }
+    g.cwd = to.into();
+    // assigned work follows its ship; completed records and untargeted queues keep their world
+    for m in &mut h.missions {
+        if m.agent == Some(id) && m.cwd == from && matches!(m.state.as_str(), "queued" | "sent" | "active") { m.cwd = to.into(); }
+    }
+}
+
 /// Context, spend and lines changed, from a Grok session directory.
 /// `costUsdTicks` is 10^10 ticks per USD.
 fn grok_vitals(dir: &std::path::Path) -> Option<Report> {
@@ -1646,8 +1675,12 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             }
             None => missing(id),
         },
-        Req::Hook { id, event, message, file, session } => match get(id) {
+        Req::Hook { id, event, message, file, session, cwd } => match get(id) {
             Some(a) => {
+                if let Some(cwd) = cwd {
+                    let from = a.lock().unwrap().cwd.clone();
+                    if let Some(to) = crate::worktree::destination(&from, &cwd) { move_ship(hub, id, &from, &to); }
+                }
                 let mut g = a.lock().unwrap();
                 g.hooks = true;
                 if let Some(s) = session.filter(|s| !s.is_empty()) {
@@ -1744,6 +1777,14 @@ pub fn run() -> io::Result<()> {
         Err(_) => resurrect(&hub),
     }
 
+    // filesystem and git probes must not hold up PTY status or mission dispatch
+    let h = hub.clone();
+    thread::spawn(move || {
+        let mut trails = HashMap::new();
+        let home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| crate::game::home().join(".codex"));
+        loop { follow_worktrees(&h, &mut trails, &home.join("sessions")); thread::sleep(Duration::from_secs(2)); }
+    });
+
     // status bookkeeping, and reaping agents a while after they exit
     let h = hub.clone();
     thread::spawn(move || {
@@ -1809,7 +1850,8 @@ pub fn hook(event: &str) {
     let message = hook_message(&v);
     let file = edited_file(&v);
     let session = v.get("session_id").or_else(|| v.get("sessionId")).and_then(|s| s.as_str()).map(String::from);
-    let _ = call(&Req::Hook { id, event: event.into(), message, file, session });
+    let cwd = v.get("cwd").and_then(|s| s.as_str()).map(String::from);
+    let _ = call(&Req::Hook { id, event: event.into(), message, file, session, cwd });
 }
 
 /// `empire statusline`: Claude Code's statusline command inside the empire. Reports
@@ -2231,6 +2273,52 @@ mod refit_tests {
         let a = Arc::new(Mutex::new(a));
         hub.lock().unwrap().agents.insert(id, a.clone());
         a
+    }
+
+    #[test]
+    fn executed_worktree_commands_move_only_their_ship_and_its_unfinished_assignments() {
+        let dir = std::env::temp_dir().join(format!("empire-follow-worktrees-{}", std::process::id()));
+        let main = dir.join("main"); let station = dir.join("station"); let sessions = dir.join("sessions/2026/11/06");
+        std::fs::create_dir_all(&main).unwrap(); std::fs::create_dir_all(&sessions).unwrap();
+        let run = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&main).args(args).output().unwrap().status.success());
+        run(&["init", "-b", "main"]);
+        run(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        run(&["worktree", "add", "-b", "feature", station.to_str().unwrap()]);
+        let from = main.to_string_lossy().into_owned(); let to = station.to_string_lossy().into_owned();
+        let hub = Shared::default();
+        let a = ship(&hub, 1, "codex", Some("session-1"), Status::Working);
+        a.lock().unwrap().cwd = from.clone();
+        let other = ship(&hub, 2, "codex", Some("session-2"), Status::Working); other.lock().unwrap().cwd = from.clone();
+        let fd = a.lock().unwrap().writer.master.as_raw_fd();
+        for (id, state, agent) in [(1, "active", Some(1)), (2, "queued", Some(1)), (3, "done", Some(1)), (4, "queued", None), (5, "active", Some(2))] {
+            hub.lock().unwrap().missions.push(Mission { id, cwd: from.clone(), state: state.into(), agent, ..Mission::default() });
+        }
+        let record = |cwd: &str| format!("{}\n", serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+            "type":"CommandExecution","cwd":cwd,"status":"completed"
+        }}}));
+        let log = sessions.join("rollout-session-1.jsonl");
+        std::fs::write(&log, format!("{}{}", record(&from), record(&to))).unwrap();
+        let mut trails = HashMap::new();
+        follow_worktrees(&hub, &mut trails, &dir.join("sessions"));
+        assert_eq!(a.lock().unwrap().view(Instant::now()).cwd, to);
+        assert_eq!(a.lock().unwrap().writer.master.as_raw_fd(), fd);
+        assert_eq!(a.lock().unwrap().session.as_deref(), Some("session-1"));
+        assert_eq!(other.lock().unwrap().cwd, from);
+        let worlds: Vec<_> = hub.lock().unwrap().missions.iter().map(|m| m.cwd.clone()).collect();
+        assert_eq!(worlds, vec![to.clone(), to.clone(), from.clone(), from.clone(), from.clone()]);
+        // polling or re-reading on daemon upgrade must not replay an older departure
+        follow_worktrees(&hub, &mut trails, &dir.join("sessions"));
+        assert_eq!(a.lock().unwrap().cwd, to);
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(record(&from).as_bytes()).unwrap();
+        follow_worktrees(&hub, &mut HashMap::new(), &dir.join("sessions"));
+        assert_eq!(a.lock().unwrap().cwd, from);
+        // old hook clients remain compatible; new hooks can report a native directory change
+        let old: Req = serde_json::from_value(serde_json::json!({"op":"hook","id":1,"event":"working"})).unwrap();
+        assert!(matches!(handle(&hub, old), Resp::Ok));
+        let new: Req = serde_json::from_value(serde_json::json!({"op":"hook","id":1,"event":"working","cwd":to})).unwrap();
+        assert!(matches!(handle(&hub, new), Resp::Ok));
+        assert_eq!(a.lock().unwrap().cwd, station.to_str().unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

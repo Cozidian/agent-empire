@@ -22,6 +22,22 @@ in the background, stops inside repositories, and skips hidden directories, syml
 amber lights while an agent is aboard and dark lights when it has none. It is distinct from the
 ring-shaped GitHub station. Select and open them like any project.
 
+While the galaxy is open, Empire also checks each repository's Git worktree registry during
+its regular survey (about every eight seconds). Worktrees created by your agent appear as stations
+automatically, including ones in hidden folders or outside your sector roots. Missing worktrees
+are skipped; explicitly hidden stations stay hidden.
+
+For Codex, the existing ship follows the working directory of completed commands recorded in its
+local session log. Claude/Grok hooks can also report a changed native working directory. Empire
+only follows checkouts of the same repository, keeps the ship ID and open conversation, and moves
+unfinished missions assigned to that ship with it. Unassigned project tasks stay on their planet.
+Ask your agent to create the worktree **and run its work there**: the station appears once Git
+registers it, and the ship moves when execution there is observed. Empire does not interpret prompt
+text, restart the agent, or change the harness's permissions or default directory. A command using
+only `git -C` or a shell-internal `cd` may still report its original directory; use the worktree as
+the command's working directory. Older Codex logs without execution-directory records cannot
+report these moves automatically.
+
 If no root has been saved, Empire uses `/home/code` or `~/code` when one exists. **R on Home**
 rescans all roots. A scan reads directory entries; it does not pull, clone or modify repositories.
 
