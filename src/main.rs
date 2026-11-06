@@ -1,5 +1,6 @@
 mod research;
 mod workspace;
+mod worktree;
 mod anomaly;
 mod client;
 mod daemon;

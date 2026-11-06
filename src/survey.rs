@@ -28,6 +28,8 @@ pub struct World {
     pub lang: String,
     /// For a linked worktree (a station): the main worktree it belongs to.
     pub host: Option<String>,
+    /// Existing checkouts registered with this repository, including stations outside the roots.
+    pub worktrees: Vec<String>,
     /// Has a GitHub remote, so it trades with the station.
     pub github: bool,
     /// Your open pull requests there.
@@ -200,6 +202,7 @@ fn status(path: &str, w: &mut World) {
     }
     w.last_commit = git(path, &["log", "-1", "--format=%ct"]).and_then(|s| s.trim().parse().ok());
     w.host = world_host(path);
+    if Path::new(path).join(".git").exists() && let Some(paths) = crate::worktree::list(path) { w.worktrees = paths; }
 }
 
 pub fn world_host(path: &str) -> Option<String> {
