@@ -220,6 +220,9 @@ pub struct Ask {
     /// What it's about (the command, the file, …), a few lines above the question.
     pub context: Vec<String>,
     pub options: Vec<Choice>,
+    /// What's being asked for, between the question and its choices (Codex's `$ command`, a reason).
+    #[serde(default)]
+    pub detail: Vec<String>,
     /// Advisor's risk read on this approval. Advice for the player to see; nothing acts on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<RiskView>,
@@ -244,9 +247,6 @@ pub struct RiskView {
     /// Why, when the denylist decided.
     #[serde(default)]
     pub reason: String,
-    /// What's being asked for, between the question and its choices (Codex's `$ command`, a reason).
-    #[serde(default)]
-    pub detail: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]

@@ -4690,8 +4690,7 @@ mod commander_tests {
             a.title = format!("task for ship {id}");
             app.agents.push(a);
         }
-        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![], risk: None });
-        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![], detail: vec![] });
+        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![], detail: vec![], risk: None });
         app.sel = Some(Sel::Sys("/beta".into()));
         let world = app.world(0.0, 0.0);
         let l = Lay::new(&Fb::new(120, 40), false);

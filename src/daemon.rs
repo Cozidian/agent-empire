@@ -300,11 +300,10 @@ impl Agent {
             options = vec![Choice { key: "y\r".into(), label: "Yes".into() }, Choice { key: "n\r".into(), label: "No".into() }];
         }
         let question = lines[qi].clone();
-        let mut ask = Ask { question, context, options, risk: None };
+        let mut ask = Ask { question, context, options, detail, risk: None };
         // advice only: a badge for the player. Nothing here ever answers, and launches still never skip permissions
         ask.risk = crate::triage::assess(&ask, &crate::game::base_name(&self.cwd), &self.kind);
         Some(ask)
-        Some(Ask { question, context, options, detail })
     }
 
     /// A path as the agent named it, made absolute against its world.
