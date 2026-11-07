@@ -1,6 +1,5 @@
 //! Pixel framebuffer, math, post-processing and the half-block terminal encoder.
 
-use rayon::prelude::*;
 use std::io::{self, Write};
 use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub};
 
@@ -229,10 +228,11 @@ pub fn splat(buf: &mut [V3], w: usize, h: usize, x: f32, y: f32, c: V3) {
 // ─────────────────────────── post-processing ───────────────────────────
 
 pub fn bloom(fb: &mut Fb, thr: f32, k: f32) {
+    // terminal-sized buffers cost less to process here than to wake a pool each frame
     let (w, h) = (fb.w, fb.h);
     let mut a: Vec<V3> = fb
         .px
-        .par_iter()
+        .iter()
         .map(|c| {
             let l = c.max_elem();
             if l > thr { *c * ((l - thr) / l) } else { V3::default() }
@@ -244,13 +244,13 @@ pub fn bloom(fb: &mut Fb, thr: f32, k: f32) {
         blur_h(&a, &mut b, w, r);
         blur_v(&b, &mut a, w, h, r);
     }
-    fb.px.par_iter_mut().zip(a.par_iter()).for_each(|(p, g)| *p += *g * k);
+    fb.px.iter_mut().zip(a.iter()).for_each(|(p, g)| *p += *g * k);
 }
 
 fn blur_h(src: &[V3], dst: &mut [V3], w: usize, r: i32) {
     let n = (2 * r + 1) as f32;
     let wi = w as i32;
-    dst.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+    dst.chunks_mut(w).enumerate().for_each(|(y, row)| {
         let s = &src[y * w..(y + 1) * w];
         let mut acc = V3::default();
         for i in -r..=r {
@@ -380,6 +380,31 @@ fn fitted_cell(fb: &Fb, r: usize, c: usize) -> Cell {
 #[cfg(test)]
 mod graphics_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "paced CPU benchmark; run alone with --ignored --nocapture"]
+    fn bloom_cpu_cost() {
+        use std::time::{Duration, Instant};
+        let cpu = || {
+            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut t); }
+            t.tv_sec as f64 + t.tv_nsec as f64 / 1e9
+        };
+        for (cols, rows) in [(80, 24), (135, 63), (240, 100)] {
+            let mut fb = Fb::new(cols, rows);
+            let pixels: Vec<_> = (0..fb.px.len()).map(|i| v3((i % 17) as f32 / 13.0, (i % 11) as f32 / 9.0, (i % 7) as f32 / 8.0)).collect();
+            fb.px.copy_from_slice(&pixels); bloom(&mut fb, 0.5, 0.7);
+            let (start, before, mut draw) = (Instant::now(), cpu(), Duration::ZERO);
+            for _ in 0..90 {
+                let frame = Instant::now();
+                fb.px.copy_from_slice(&pixels); bloom(&mut fb, 0.5, 0.7);
+                draw += frame.elapsed();
+                std::hint::black_box(&fb.px);
+                std::thread::sleep(Duration::from_micros(33333).saturating_sub(frame.elapsed()));
+            }
+            eprintln!("bloom {cols}x{rows}: cpu {:.2}% of one core, draw {:.3} ms/frame", (cpu() - before) / start.elapsed().as_secs_f64() * 100.0, draw.as_secs_f64() * 1000.0 / 90.0);
+        }
+    }
 
     fn error(fb: &Fb, cell: Cell) -> f32 {
         let mask = crate::octant::OCTANT.iter().position(|&c| c == cell.ch).unwrap();

@@ -9,6 +9,10 @@ pub struct Config {
     pub root: String,
     #[serde(default)]
     pub folders: Vec<String>,
+    #[serde(default)]
+    pub roots: Vec<String>,
+    #[serde(default)]
+    pub hidden: Vec<String>,
 }
 
 pub fn path() -> PathBuf { crate::daemon::dirs_state().join("workspace.json") }
@@ -20,18 +24,37 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
                 let root = [PathBuf::from("/home/code"), home.join("code")].into_iter().find(|p| p.is_dir()).unwrap_or_default();
-                Ok(Self { root: root.to_string_lossy().into_owned(), folders: vec![] })
+                Ok(Self { root: root.to_string_lossy().into_owned(), ..Default::default() })
             }
             Err(e) => Err(e),
         }
     }
     pub fn save(&self) -> std::io::Result<()> {
-        crate::state::edit::<Self>(&path(), |c| *c = self.clone()).map(|_| ())
+        self.save_to(&path())
+    }
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        // an explicit empty workspace must differ from an absent file (which chooses a default root)
+        crate::state::edit::<Option<Self>>(path, |c| *c = Some(self.clone())).map(|_| ())
     }
     pub fn projects(&self) -> Vec<String> {
-        let mut paths = if self.root.is_empty() { vec![] } else { discover(Path::new(&self.root)) };
+        let mut paths: Vec<_> = self.discovery_roots().into_iter().flat_map(|p| discover(Path::new(p))).collect();
         paths.extend(self.folders.iter().filter_map(|p| std::fs::canonicalize(p).ok()).filter(|p| p.is_dir()).map(|p| p.to_string_lossy().into_owned()));
+        paths.retain(|p| !self.hidden.contains(p));
         paths.sort(); paths.dedup(); paths
+    }
+    pub fn discovery_roots(&self) -> Vec<&str> {
+        let mut roots: Vec<_> = std::iter::once(self.root.as_str()).chain(self.roots.iter().map(String::as_str)).filter(|p| !p.is_empty()).collect();
+        roots.sort(); roots.dedup(); roots
+    }
+    pub fn sources(&self) -> Vec<(bool, String)> {
+        self.discovery_roots().into_iter().map(|p| (true, p.into())).chain(self.folders.iter().map(|p| (false, p.clone()))).collect()
+    }
+    pub fn includes(&self, path: &str) -> bool {
+        self.folders.iter().any(|p| p == path) || self.discovery_roots().iter().any(|p| Path::new(path).starts_with(p))
+    }
+    pub fn hide(&mut self, key: &str) {
+        self.folders.retain(|p| p != key);
+        if !self.hidden.iter().any(|p| p == key) { self.hidden.push(key.into()); }
     }
     pub fn sectors(&self, projects: &[String]) -> crate::sector::Book {
         let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
@@ -67,8 +90,33 @@ pub fn discover(root: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     #[test]
+    fn removing_the_default_root_before_discovery_persists_an_empty_workspace() {
+        let dir = std::env::temp_dir().join(format!("empire-empty-workspace-{}", std::process::id()));
+        let path = dir.join("workspace.json");
+        Config::default().save_to(&path).unwrap();
+        let c: Config = serde_json::from_slice(&std::fs::read(&path).expect("an empty workspace must not fall back to the default root on restart")).unwrap();
+        assert!(c.discovery_roots().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn multiple_roots_and_removed_projects_survive_reload() {
+        let dir = std::env::temp_dir().join(format!("empire-roots-{}", std::process::id()));
+        for p in ["first/team/api/.git", "second/tools/web/.git", "second/tools/hidden/.git"] { std::fs::create_dir_all(dir.join(p)).unwrap(); }
+        let api = dir.join("first/team/api").to_string_lossy().into_owned();
+        let web = dir.join("second/tools/web").to_string_lossy().into_owned();
+        let hidden = dir.join("second/tools/hidden").to_string_lossy().into_owned();
+        let c: Config = serde_json::from_value(serde_json::json!({
+            "root": dir.join("first"), "roots": [dir.join("second"), dir.join("first/team")], "folders": [], "hidden": [hidden]
+        })).unwrap();
+        let back: Config = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert_eq!(back.projects(), vec![api, web]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn folder_sectors_keep_their_identity_and_distinguish_external_folders() {
-        let c = Config { root: "/code".into(), folders: vec![] };
+        let c = Config { root: "/code".into(), ..Default::default() };
         let p = vec!["/code/team/api".into(), "/outside/team/web".into()];
         let old = c.sectors(&p); assert_eq!(old.sectors.len(), 2);
         let mut more = p; more.push("/code/aaa/other".into());
