@@ -1,6 +1,6 @@
-//! Spacious grand-strategy UI cues: glassy FM bells, warm detuned synth pads and
-//! brass, sub swells and filtered-noise whooshes, all in a long reverb, plus an
-//! ambient score composed on the fly. Silent if there's no audio device.
+//! Starship-bridge cues: soft glass tones, open fifths, sub swells and hyperspace
+//! air, all in a long hall, plus an ambient score composed on the fly. Silent if
+//! there's no audio device.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
@@ -19,6 +19,8 @@ pub enum Cue {
     Spawn,
     /// An agent went away.
     Gone,
+    /// Something failed, or two ships contest the same ground.
+    Alert,
     /// A world reached a new development level.
     Fanfare,
 }
@@ -28,15 +30,17 @@ impl Cue {
     pub fn rank(self) -> u8 {
         match self {
             Cue::Blocked => 0,
-            Cue::Fanfare => 1,
-            Cue::Done => 2,
-            Cue::Spawn => 3,
-            Cue::Gone => 4,
+            Cue::Alert => 1,
+            Cue::Fanfare => 2,
+            Cue::Done => 3,
+            Cue::Spawn => 4,
+            Cue::Gone => 5,
         }
     }
 }
 
-pub const ALL: [Cue; 5] = [Cue::Done, Cue::Blocked, Cue::Spawn, Cue::Gone, Cue::Fanfare];
+/// Listening order for `empire sounds`: a ship arrives, hails, finishes, fails, leaves, and a world ascends.
+pub const ALL: [Cue; 6] = [Cue::Spawn, Cue::Blocked, Cue::Done, Cue::Alert, Cue::Gone, Cue::Fanfare];
 
 pub struct Sound {
     tx: Sender<Cue>,
@@ -190,8 +194,9 @@ impl Voice {
     fn new(wave: Wave, delay: f32, dur: f32, f0: f32, f1: f32, amp: f32) -> Self {
         Self { wave, t: -delay, dur, f0, f1, cut: (18000.0, 18000.0), att: 0.005, decay: 0.0, rel: 0.6, amp, pan: 0.0, vib: 0.0, send: 0.0, ph: [0.0, 0.33, 0.67], mph: 0.0, svf: Svf::default(), svf2: Svf::default(), rng: 0x2545_f491 ^ (f0 as u32).wrapping_mul(2_654_435_761) }
     }
-    fn bell(note: f32, delay: f32, dur: f32, amp: f32) -> Self {
-        Self::new(Wave::Bell { ratio: 3.5, index: 1.6 }, delay, dur, hz(note), hz(note), amp).decay(2.2).rel(0.85)
+    /// Octave-modulated glass at a low index: a console crystal, not a tubular bell.
+    fn crystal(note: f32, delay: f32, dur: f32, amp: f32) -> Self {
+        Self::new(Wave::Bell { ratio: 2.0, index: 0.7 }, delay, dur, hz(note), hz(note), amp).att(0.004).decay(2.6).rel(0.82)
     }
     fn pad(note: f32, delay: f32, dur: f32, amp: f32) -> Self {
         Self::new(Wave::Pad { detune: 0.006 }, delay, dur, hz(note), hz(note), amp).att(0.25).rel(0.55)
@@ -347,6 +352,11 @@ impl Hall {
         Self { combs: [combs(0), combs(23)], aps: [aps(0), aps(23)] }
     }
 
+    fn clear(&mut self) {
+        for cb in self.combs.iter_mut().flatten() { cb.buf.fill(0.0); cb.store = 0.0; cb.i = 0; }
+        for ap in self.aps.iter_mut().flatten() { ap.buf.fill(0.0); ap.i = 0; }
+    }
+
     fn run(&mut self, l: f32, r: f32) -> (f32, f32) {
         let x = (l + r) * 0.08;
         let mut out = [0.0; 2];
@@ -376,53 +386,48 @@ impl Synth {
         use Wave::*;
         let v = &mut self.voices;
         match c {
-            // a rising fifth of glass bells over a soft swell: task complete
+            // a cycle settling: one glass tone rises a fifth, air opening with it. same voice as a departure, aimed the other way
             Cue::Done => {
-                v.push(Voice::bell(76.0, 0.0, 2.2, 0.16).pan(-0.25));
-                v.push(Voice::bell(83.0, 0.14, 2.6, 0.13).pan(0.25));
-                v.push(Voice::pad(52.0, 0.0, 2.0, 0.07).cut(300.0, 900.0));
-                v.push(Voice::pad(59.0, 0.05, 2.0, 0.05).cut(300.0, 900.0));
+                v.push(Voice::new(Bell { ratio: 2.0, index: 0.5 }, 0.0, 1.55, hz(76.0), hz(83.0), 0.10).att(0.02).decay(1.5).rel(0.72).pan(-0.2));
+                v.push(Voice::new(Sine, 0.0, 1.15, hz(83.0), hz(90.0), 0.03).att(0.02).decay(2.0).pan(0.4));
+                v.push(Voice::new(Noise, 0.0, 1.25, 480.0, 1900.0, 0.055).att(0.04).rel(0.42));
+                v.push(Voice::new(Sine, 0.0, 1.3, 42.0, 60.0, 0.09).att(0.04).decay(1.1).rel(0.45));
             }
-            // incoming transmission: a doubled ping, then a low minor swell that asks for you
+            // someone waiting: a signal draws nearer and keeps a slight waver, so the line still feels open
             Cue::Blocked => {
-                v.push(Voice::bell(81.0, 0.0, 1.4, 0.15).pan(-0.2));
-                v.push(Voice::bell(81.0, 0.2, 1.8, 0.13).pan(0.2));
-                for (i, n) in [50.0, 53.0, 57.0].into_iter().enumerate() {
-                    v.push(Voice::pad(n, 0.3 + i as f32 * 0.04, 2.0, 0.07).att(0.35).cut(250.0, 1800.0).pan(i as f32 * 0.3 - 0.3));
-                }
-                v.push(Voice::new(Sine, 0.3, 1.8, hz(38.0), hz(38.0), 0.16).att(0.3).rel(0.5));
+                v.push(Voice::new(Bell { ratio: 2.0, index: 0.48 }, 0.0, 1.85, hz(67.0), hz(70.0), 0.10).att(0.03).decay(1.15).rel(0.74).pan(-0.2).vib(0.0035));
+                v.push(Voice::new(Sine, 0.0, 1.3, hz(74.0), hz(77.0), 0.028).att(0.03).decay(1.8).pan(0.4));
+                v.push(Voice::new(Noise, 0.0, 1.6, 200.0, 980.0, 0.06).att(0.08).rel(0.4));
+                v.push(Voice::new(Sine, 0.0, 1.55, 40.0, 48.0, 0.09).att(0.06).decay(0.9).rel(0.45));
             }
-            // a ship launches: rising whoosh and sub, a high shimmer as it clears
+            // dropping out of the lane: air tearing upward, mass arriving, a fifth as the ship resolves
             Cue::Spawn => {
-                v.push(Voice::new(Noise, 0.0, 1.1, 250.0, 3500.0, 0.14).att(0.5).rel(0.7));
-                v.push(Voice::new(Sine, 0.0, 1.1, 45.0, 95.0, 0.1).att(0.3).rel(0.6));
-                v.push(Voice::bell(79.0, 0.75, 1.8, 0.07).pan(-0.4));
-                v.push(Voice::bell(86.0, 0.85, 1.8, 0.06).pan(0.4));
+                v.push(Voice::new(Noise, 0.0, 0.9, 160.0, 5200.0, 0.11).att(0.1).rel(0.68));
+                v.push(Voice::new(Sine, 0.0, 0.95, 34.0, 86.0, 0.14).att(0.06).decay(0.7).rel(0.55));
+                v.push(Voice::new(Noise, 0.22, 0.5, 700.0, 2200.0, 0.04).att(0.04).rel(0.55).pan(0.35));
+                v.push(Voice::crystal(88.0, 0.55, 1.6, 0.08).pan(-0.4));
+                v.push(Voice::crystal(95.0, 0.66, 1.7, 0.055).pan(0.4));
             }
-            // a ship leaves: a dark chord sinking away, wind trailing off
+            // contact lost: one glass tone falls a minor third and the carrier dies into the vacuum
             Cue::Gone => {
-                v.push(Voice::new(Pad { detune: 0.006 }, 0.0, 1.8, hz(48.0), hz(46.0), 0.08).att(0.05).cut(1400.0, 180.0).rel(0.4));
-                v.push(Voice::new(Pad { detune: 0.006 }, 0.0, 1.8, hz(55.0), hz(53.0), 0.06).att(0.05).cut(1400.0, 180.0).rel(0.4));
-                v.push(Voice::new(Noise, 0.0, 1.4, 2200.0, 220.0, 0.12).att(0.05).rel(0.4));
-                v.push(Voice::bell(67.0, 0.05, 1.6, 0.05));
+                v.push(Voice::new(Bell { ratio: 2.0, index: 0.55 }, 0.0, 1.7, hz(79.0), hz(76.0), 0.10).att(0.008).decay(1.5).rel(0.72).pan(-0.2));
+                v.push(Voice::new(Sine, 0.0, 1.1, hz(86.0), hz(83.0), 0.03).att(0.01).decay(2.2).pan(0.4));
+                v.push(Voice::new(Noise, 0.0, 1.45, 3400.0, 140.0, 0.09).att(0.02).rel(0.38));
+                v.push(Voice::new(Sine, 0.0, 1.35, 70.0, 32.0, 0.11).att(0.02).decay(1.15).rel(0.4));
             }
-            // a world grows: synth brass rising I–V–I, timpani under, bells on the landing
+            // an anomaly: two sensor pulses, then glass falling a minor third
+            Cue::Alert => {
+                v.push(Voice::new(Sine, 0.0, 0.24, 96.0, 64.0, 0.15).att(0.004).decay(11.0));
+                v.push(Voice::new(Sine, 0.16, 0.28, 90.0, 55.0, 0.13).att(0.004).decay(10.0));
+                v.push(Voice::new(Bell { ratio: 2.0, index: 0.6 }, 0.06, 1.45, hz(75.0), hz(72.0), 0.09).att(0.005).decay(2.2).rel(0.7).pan(-0.3));
+                v.push(Voice::new(Noise, 0.0, 0.75, 800.0, 160.0, 0.065).att(0.01).rel(0.4));
+            }
+            // a world grows: the same single tone, lower and slower, rising a whole octave as the space opens
             Cue::Fanfare => {
-                let brass = |n: f32, at: f32, dur: f32, amp: f32| Voice::new(Pad { detune: 0.004 }, at, dur, hz(n), hz(n), amp).att(0.06).cut(500.0, 3200.0).rel(0.7);
-                for n in [60.0, 64.0, 67.0] {
-                    v.push(brass(n, 0.0, 0.75, 0.06));
-                }
-                for n in [62.0, 67.0, 71.0] {
-                    v.push(brass(n, 0.55, 0.75, 0.06));
-                }
-                for n in [48.0, 60.0, 64.0, 67.0, 72.0] {
-                    v.push(brass(n, 1.1, 2.6, 0.06));
-                }
-                for at in [0.0, 1.1] {
-                    v.push(Voice::new(Sine, at, 0.9, 95.0, 48.0, 0.3).decay(5.0));
-                }
-                v.push(Voice::bell(84.0, 1.15, 2.6, 0.07).pan(-0.3));
-                v.push(Voice::bell(88.0, 1.25, 2.6, 0.06).pan(0.3));
+                v.push(Voice::new(Bell { ratio: 2.0, index: 0.45 }, 0.0, 2.4, hz(60.0), hz(72.0), 0.09).att(0.1).decay(0.85).rel(0.7).pan(-0.15));
+                v.push(Voice::new(Sine, 0.0, 2.0, hz(67.0), hz(79.0), 0.028).att(0.12).decay(1.0).pan(0.35));
+                v.push(Voice::new(Noise, 0.0, 2.15, 180.0, 1500.0, 0.065).att(0.18).rel(0.48));
+                v.push(Voice::new(Sine, 0.0, 2.2, 32.0, 52.0, 0.12).att(0.2).decay(0.55).rel(0.5));
             }
         }
     }
@@ -512,6 +517,11 @@ impl Echo {
     fn new(sr: f32) -> Self {
         let n = (sr * 0.55) as usize;
         Self { buf: [vec![0.0; n], vec![0.0; n]], i: 0, damp: [0.0; 2] }
+    }
+
+    fn clear(&mut self) {
+        for b in &mut self.buf { b.fill(0.0); }
+        self.i = 0; self.damp = [0.0; 2];
     }
 
     fn run(&mut self, x: f32) -> (f32, f32) {
@@ -729,13 +739,17 @@ impl Music {
         self.voices.push(Voice::new(Wave::Lead, 0.0, d + 1.2, hz(n as f32), hz(n as f32), 0.022).att(0.35).rel(d / (d + 1.2)).vib(0.004).send(0.4));
     }
 
-    fn tick(&mut self) -> (f32, f32) {
+    fn clock(&mut self) {
         if self.wait == 0 {
             self.play();
             self.wait = (self.texture.beat * self.sr / 2.0).round() as u64;
         }
         self.wait -= 1;
         self.frame += 1;
+    }
+
+    fn tick(&mut self) -> (f32, f32) {
+        self.clock();
         let sr = self.sr;
         let (mut l, mut r, mut send) = (0.0, 0.0, 0.0);
         for v in &mut self.voices {
@@ -755,7 +769,16 @@ impl Music {
         // A short ramp prevents clicks and silences the reverb too. Keep time
         // moving while muted, so unmuting resumes the current part of the score.
         let step = 1.0 / (self.sr * 0.03);
+        let was_audible = self.gain > 0.0;
         self.gain = (self.gain + if muted { -step } else { step }).clamp(0.0, 1.0);
+        if muted && self.gain == 0.0 {
+            // keep the composition and note ages moving, without synthesizing inaudible samples
+            if was_audible { self.hall.clear(); self.echo.clear(); }
+            self.clock();
+            for v in &mut self.voices { v.t += 1.0 / self.sr; }
+            self.voices.retain(|v| !v.finished());
+            return (0.0, 0.0);
+        }
         let (l, r) = self.tick();
         (l * self.gain, r * self.gain)
     }
@@ -764,6 +787,39 @@ impl Music {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_music_keeps_the_score_clock_without_running_reverb() {
+        let mut music = Music::new(12000.0, 7);
+        let mut reference = Music::new(12000.0, 7);
+        for _ in 0..1200 { music.output(true); reference.output(false); }
+        let hall_at = music.hall.combs[0][0].i;
+        let echo_at = music.echo.i;
+        for _ in 0..12000 * 12 {
+            assert_eq!(music.output(true), (0.0, 0.0));
+            reference.output(false);
+        }
+        assert_eq!((music.frame, music.wait, music.step, music.rng), (reference.frame, reference.wait, reference.step, reference.rng));
+        assert_eq!(music.chord, reference.chord);
+        assert_eq!(music.voices.len(), reference.voices.len());
+        assert_eq!(music.hall.combs[0][0].i, hall_at, "inaudible music must not keep processing the hall");
+        assert_eq!(music.echo.i, echo_at, "inaudible music must not keep processing the echo");
+    }
+
+    #[test]
+    #[ignore = "CPU benchmark; run alone with --ignored --nocapture"]
+    fn muted_music_cpu_cost() {
+        let sr = 48000;
+        let mut music = Music::new(sr as f32, 7);
+        let mut synth = Synth::new(sr as f32);
+        for _ in 0..sr { music.output(false); }
+        let start = std::time::Instant::now();
+        for _ in 0..sr * 30 {
+            std::hint::black_box(music.output(true));
+            std::hint::black_box(synth.tick());
+        }
+        eprintln!("muted music + idle cues: {:.2}% of one core for realtime playback", start.elapsed().as_secs_f64() / 30.0 * 100.0);
+    }
 
     #[test]
     fn music_mute_silences_reverb_and_resumes_without_restarting() {
