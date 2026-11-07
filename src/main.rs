@@ -1,4 +1,6 @@
+mod research;
 mod workspace;
+mod worktree;
 mod anomaly;
 mod client;
 mod daemon;
@@ -7,6 +9,7 @@ mod game;
 mod gfx;
 mod graphics;
 mod jev;
+mod perf;
 mod octant;
 mod proto;
 mod role;
@@ -31,6 +34,7 @@ const HELP: &str = "empire — a galaxy of coding agents
                    (the galaxy does this by itself when it starts)
   empire stop      shut down the daemon and every agent in it (they won't come back)
   empire sounds    play every sound cue once
+  empire research  open the Research Station (setup installs Harness2)
   empire graphics  offline graphics comparison (Space compares classic/polished)
   empire anomaly WORLD TITLE EVIDENCE [SOURCE]
                    record a finding without starting the daemon";
@@ -38,6 +42,7 @@ const HELP: &str = "empire — a galaxy of coding agents
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("research") => research::cli(&args[1..]),
         Some("graphics") => graphics::run(&args[1..]),
         Some("campaign-report") => Err(io::Error::other("Campaigns have been retired; continue in the project terminal")),
         Some("anomaly") => {
@@ -73,7 +78,7 @@ fn main() -> io::Result<()> {
             for c in sound::ALL {
                 println!("{c:?}");
                 s.play(c);
-                std::thread::sleep(std::time::Duration::from_millis(3200));
+                std::thread::sleep(std::time::Duration::from_millis(4000));
             }
             Ok(())
         }
