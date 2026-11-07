@@ -181,6 +181,7 @@ impl Agent {
     /// Remember a prompt as what it's working on: its first line, unless it's a slash
     /// command or too short to be one (a menu pick, a y/n).
     fn note_task(&mut self, text: &str) {
+        if self.kind == "shell" { self.task.clear(); self.typed.clear(); return; }
         let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
         if line.chars().count() >= 3 && !line.starts_with('/') {
             self.task = line.to_string();
@@ -189,6 +190,8 @@ impl Agent {
 
     /// Follow keystrokes from comms, so a prompt typed there becomes the task once it's sent.
     fn keys(&mut self, data: &str) {
+        // shells may be reading passwords with echo off; never turn their input into metadata
+        if self.kind == "shell" { self.task.clear(); self.typed.clear(); return; }
         let mut cs = data.chars().peekable();
         while let Some(c) = cs.next() {
             match c {
@@ -284,9 +287,13 @@ impl Agent {
         }
         context.reverse();
         let mut options = Vec::new();
+        let mut detail = Vec::new();
         for l in &lines[qi + 1..] {
             if let Some((n, label)) = option(l) {
                 options.push(Choice { key: n.into(), label: label.into() });
+            } else if options.is_empty() && !l.is_empty() && !l.to_lowercase().starts_with("environment:") {
+                // between the question and its choices: what it wants to run, and why
+                detail.push(l.clone());
             }
         }
         if options.is_empty() && (q.contains("(y/n)") || q.contains("[y/n]")) {
@@ -297,6 +304,7 @@ impl Agent {
         // advice only: a badge for the player. Nothing here ever answers, and launches still never skip permissions
         ask.risk = crate::triage::assess(&ask, &crate::game::base_name(&self.cwd), &self.kind);
         Some(ask)
+        Some(Ask { question, context, options, detail })
     }
 
     /// A path as the agent named it, made absolute against its world.
@@ -410,13 +418,13 @@ impl Agent {
             id: self.id,
             kind: self.kind.clone(),
             cwd: self.cwd.clone(),
-            title: self.parser.callbacks().title.clone(),
+            title: self.title(),
             output: if self.kind != "shell" && matches!(self.status, Status::Done | Status::Blocked | Status::Idle) {
                 let text = self.parser.screen().contents();
                 let lines: Vec<_> = text.lines().filter(|s| !s.trim().is_empty()).collect();
                 lines.iter().skip(lines.len().saturating_sub(18)).copied().collect::<Vec<_>>().join("\n").chars().take(4000).collect()
             } else { String::new() },
-            task: self.task.clone(),
+            task: if self.kind == "shell" { String::new() } else { self.task.clone() },
             role: self.role.name().into(),
             design: self.spec.design.clone(),
             status: self.status.name().into(),
@@ -432,6 +440,10 @@ impl Agent {
     }
 
     fn refit_is(&self, state: &str) -> bool { self.refit.as_ref().is_some_and(|r| r.state == state) }
+
+    fn title(&self) -> String {
+        if self.kind == "shell" { format!("Terminal #{}", self.id) } else { self.parser.callbacks().title.clone() }
+    }
 
     /// The screen changed: wake anyone waiting to see it.
     fn touch(&mut self) {
@@ -806,8 +818,8 @@ fn upgrade(hub: &Shared) -> io::Result<()> {
             rows: rows.get(),
             cols: cols.get(),
             screen,
-            title: g.parser.callbacks().title.clone(),
-            task: g.task.clone(),
+            title: g.title(),
+            task: if g.kind == "shell" { String::new() } else { g.task.clone() },
             role: g.role.name().into(),
             spec: g.spec.clone(),
             status: g.status.name().into(),
@@ -838,14 +850,14 @@ fn adopt(hub: &Shared, file: &str) -> anyhow::Result<()> {
         unsafe { libc::fcntl(h.fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         let mut a = new_agent(h.id, &h.kind, &h.cwd, Pty { master, pid: h.pid }, h.rows.max(2), h.cols.max(2));
         a.parser.process(h.screen.as_bytes());
-        a.parser.callbacks_mut().title = h.title;
+        a.parser.callbacks_mut().title = if h.kind == "shell" { a.title() } else { h.title };
         a.parser.callbacks_mut().replies.clear();
         a.status = Status::parse(&h.status);
         a.told = a.status;
         a.since = now.checked_sub(Duration::from_secs_f32(h.age)).unwrap_or(now);
         a.started = now.checked_sub(Duration::from_secs(60)).unwrap_or(now); // long past booting
         a.turns = h.turns;
-        a.task = h.task;
+        if h.kind != "shell" { a.task = h.task; }
         a.role = Role::parse(&h.role);
         a.spec = h.spec;
         a.report = h.report;
@@ -1048,7 +1060,7 @@ fn relaunch(hub: &Shared, id: u32, role: Role, spec: &ShipSpec) -> Result<String
     }
 }
 
-// ──────────────────────────────── moons ────────────────────────────────
+// ─────────────────────────────── stations ───────────────────────────────
 
 fn git(dir: &str, args: &[&str]) -> Result<String, String> {
     let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| e.to_string())?;
@@ -1066,13 +1078,13 @@ fn moons_dir() -> PathBuf {
 
 /// A worktree of the repo at `cwd` on `branch` (new or existing), with an agent on it.
 fn launch_moon(hub: &Shared, cwd: &str, branch: &str, kind: &str) -> Result<u32, String> {
-    let top = git(cwd, &["rev-parse", "--show-toplevel"]).map_err(|_| "only a git world can have moons".to_string())?;
+    let top = git(cwd, &["rev-parse", "--show-toplevel"]).map_err(|_| "only a git world can have stations".to_string())?;
     let slug: String = branch.chars().map(|c| if c.is_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect();
     let h = top.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
     let path = moons_dir().join(format!("{}-{:08x}", crate::game::base_name(&top), h as u32)).join(&slug);
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     let p = path.to_string_lossy().into_owned();
-    // the moon is still there (its crew left): just send a ship back
+    // the station is still there (its crew left): just send a ship back
     if path.is_dir() && git(&p, &["rev-parse", "--git-dir"]).is_ok() {
         return spawn(hub, kind, &p, None, None, Role::None, &ShipSpec::default(), &[]).map_err(|e| e.to_string());
     }
@@ -1085,29 +1097,29 @@ fn launch_moon(hub: &Shared, cwd: &str, branch: &str, kind: &str) -> Result<u32,
     spawn(hub, kind, &p, None, None, Role::None, &ShipSpec::default(), &[]).map_err(|e| e.to_string())
 }
 
-/// Merge a moon's branch into its world, then recall its agents and remove it.
+/// Merge a station's branch into its world, then recall its agents and remove it.
 /// A merge conflict is a collision: the merge is aborted and nothing changes.
 fn dock(hub: &Shared, moon: &str) -> Result<String, String> {
     let common = git(moon, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
     let own = git(moon, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
-    let host = common.strip_suffix("/.git").filter(|_| common != own).ok_or("that world isn't a moon")?.to_string();
+    let host = common.strip_suffix("/.git").filter(|_| common != own).ok_or("that world isn't a station")?.to_string();
     let branch = git(moon, &["branch", "--show-current"])?;
     if branch.is_empty() {
-        return Err("the moon isn't on a branch".into());
+        return Err("the station isn't on a branch".into());
     }
     if !git(moon, &["status", "--porcelain"])?.is_empty() {
-        return Err("the moon has uncommitted work: have its agent commit first".into());
+        return Err("the station has uncommitted work: have its agent commit first".into());
     }
     if !git(&host, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
         return Err(format!("{} has uncommitted changes: commit or stash them before docking", crate::game::base_name(&host)));
     }
-    if git(&host, &["merge", "--no-ff", "-m", &format!("Dock moon {branch}"), &branch]).is_err() {
+    if git(&host, &["merge", "--no-ff", "-m", &format!("Dock station {branch}"), &branch]).is_err() {
         let files = git(&host, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
         let _ = git(&host, &["merge", "--abort"]);
         let files: Vec<&str> = files.lines().collect();
         return Err(format!("collision! {} conflict{} ({})", files.len(), if files.len() == 1 { "" } else { "s" }, files.join(", ")));
     }
-    // recall the moon's crew before taking the ground out from under them
+    // recall the station's crew before taking the ground out from under them
     for a in hub.lock().unwrap().agents.values() {
         let g = a.lock().unwrap();
         if g.cwd == moon {
@@ -1203,6 +1215,35 @@ fn discover_sessions(hub: &Shared) {
         let Some(mut report) = grok_vitals(&grok_sessions_dir(&cwd).join(&session)) else { continue };
         report.session = Some(session);
         a.lock().unwrap().report = report;
+    }
+}
+
+/// Follow executed commands, keeping the native session and PTY intact.
+fn follow_worktrees(hub: &Shared, trails: &mut HashMap<u32, crate::worktree::Trail>, sessions: &std::path::Path) {
+    let ships: Vec<_> = hub.lock().unwrap().agents.values().filter_map(|a| {
+        let g = a.lock().unwrap();
+        (g.kind == "codex" && g.exited.is_none()).then(|| Some((g.id, g.cwd.clone(), g.session.clone()?))).flatten()
+    }).collect();
+    trails.retain(|id, _| ships.iter().any(|(i, _, _)| i == id));
+    for (id, from, session) in ships {
+        let paths = trails.entry(id).or_default().poll(sessions, &session);
+        // the newest related checkout wins, including a return to the current checkout
+        if let Some(to) = paths.iter().rev().find_map(|cwd| crate::worktree::destination(&from, cwd)) {
+            move_ship(hub, id, &from, &to);
+        }
+    }
+}
+
+fn move_ship(hub: &Shared, id: u32, from: &str, to: &str) {
+    if from == to { return; }
+    let mut h = hub.lock().unwrap();
+    let Some(a) = h.agents.get(&id).cloned() else { return };
+    let mut g = a.lock().unwrap();
+    if g.cwd != from || g.exited.is_some() { return; }
+    g.cwd = to.into();
+    // assigned work follows its ship; completed records and untargeted queues keep their world
+    for m in &mut h.missions {
+        if m.agent == Some(id) && m.cwd == from && matches!(m.state.as_str(), "queued" | "sent" | "active") { m.cwd = to.into(); }
     }
 }
 
@@ -1639,8 +1680,12 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             }
             None => missing(id),
         },
-        Req::Hook { id, event, message, file, session } => match get(id) {
+        Req::Hook { id, event, message, file, session, cwd } => match get(id) {
             Some(a) => {
+                if let Some(cwd) = cwd {
+                    let from = a.lock().unwrap().cwd.clone();
+                    if let Some(to) = crate::worktree::destination(&from, &cwd) { move_ship(hub, id, &from, &to); }
+                }
                 let mut g = a.lock().unwrap();
                 g.hooks = true;
                 if let Some(s) = session.filter(|s| !s.is_empty()) {
@@ -1737,6 +1782,14 @@ pub fn run() -> io::Result<()> {
         Err(_) => resurrect(&hub),
     }
 
+    // filesystem and git probes must not hold up PTY status or mission dispatch
+    let h = hub.clone();
+    thread::spawn(move || {
+        let mut trails = HashMap::new();
+        let home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| crate::game::home().join(".codex"));
+        loop { follow_worktrees(&h, &mut trails, &home.join("sessions")); thread::sleep(Duration::from_secs(2)); }
+    });
+
     // status bookkeeping, and reaping agents a while after they exit
     let h = hub.clone();
     thread::spawn(move || {
@@ -1802,7 +1855,8 @@ pub fn hook(event: &str) {
     let message = hook_message(&v);
     let file = edited_file(&v);
     let session = v.get("session_id").or_else(|| v.get("sessionId")).and_then(|s| s.as_str()).map(String::from);
-    let _ = call(&Req::Hook { id, event: event.into(), message, file, session });
+    let cwd = v.get("cwd").and_then(|s| s.as_str()).map(String::from);
+    let _ = call(&Req::Hook { id, event: event.into(), message, file, session, cwd });
 }
 
 /// `empire statusline`: Claude Code's statusline command inside the empire. Reports
@@ -1971,6 +2025,42 @@ pub fn ensure_running() -> io::Result<()> {
 pub fn dirs_state() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
     std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| home.join(".local/state")).join("empire")
+}
+
+#[cfg(test)]
+mod shell_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn shell_input_reaches_the_terminal_without_becoming_metadata() {
+        let hub = Shared::default();
+        let (tx, mut rx) = UnixStream::pair().unwrap(); rx.set_nonblocking(true).unwrap();
+        let a = Arc::new(Mutex::new(new_agent(1, "shell", "/world", Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80)));
+        hub.lock().unwrap().agents.insert(1, a.clone());
+        for input in ["sudo example\r", "private-", "test-input", "\r", "\x1b[200~pasted-test-input\x1b[201~", "\r"] {
+            assert!(matches!(handle(&hub, Req::Input { id: 1, data: input.into() }), Resp::Ok));
+            let mut bytes = vec![0; input.len()]; rx.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, input.as_bytes());
+            let g = a.lock().unwrap();
+            assert!(g.typed.is_empty(), "shell keystrokes must not be retained, even before Enter");
+            assert!(g.task.is_empty(), "shell input must never become a task");
+        }
+        a.lock().unwrap().note_task("another-private-test-input");
+        assert!(a.lock().unwrap().task.is_empty());
+    }
+
+    #[test]
+    fn shell_views_omit_stale_tasks_and_terminal_titles() {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let mut a = new_agent(1, "shell", "/world", Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80);
+        a.task = "private-test-task".into(); a.typed = "private-test-pending".into();
+        a.parser.process(b"\x1b]0;private-test-title\x07");
+        let v = a.view(Instant::now());
+        assert!(v.task.is_empty() && v.title == "Terminal #1" && v.output.is_empty());
+        assert!(!serde_json::to_string(&v).unwrap().contains("private-test"));
+        a.keys("x");
+        assert!(a.task.is_empty() && a.typed.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -2147,6 +2237,8 @@ Press enter to confirm or esc to cancel\r\n\
         let ask = a.ask().unwrap();
         assert!(ask.options.len() >= 3, "{:?}", ask.options);
         assert!(ask.options.iter().any(|o| o.label.to_lowercase().contains("proceed")));
+        assert_eq!(ask.detail.len(), 2, "{:?}", ask.detail);
+        assert!(ask.detail[1].starts_with("$ pnpm test --runInBand"), "{:?}", ask.detail);
     }
 }
 
@@ -2186,6 +2278,52 @@ mod refit_tests {
         let a = Arc::new(Mutex::new(a));
         hub.lock().unwrap().agents.insert(id, a.clone());
         a
+    }
+
+    #[test]
+    fn executed_worktree_commands_move_only_their_ship_and_its_unfinished_assignments() {
+        let dir = std::env::temp_dir().join(format!("empire-follow-worktrees-{}", std::process::id()));
+        let main = dir.join("main"); let station = dir.join("station"); let sessions = dir.join("sessions/2026/11/06");
+        std::fs::create_dir_all(&main).unwrap(); std::fs::create_dir_all(&sessions).unwrap();
+        let run = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&main).args(args).output().unwrap().status.success());
+        run(&["init", "-b", "main"]);
+        run(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        run(&["worktree", "add", "-b", "feature", station.to_str().unwrap()]);
+        let from = main.to_string_lossy().into_owned(); let to = station.to_string_lossy().into_owned();
+        let hub = Shared::default();
+        let a = ship(&hub, 1, "codex", Some("session-1"), Status::Working);
+        a.lock().unwrap().cwd = from.clone();
+        let other = ship(&hub, 2, "codex", Some("session-2"), Status::Working); other.lock().unwrap().cwd = from.clone();
+        let fd = a.lock().unwrap().writer.master.as_raw_fd();
+        for (id, state, agent) in [(1, "active", Some(1)), (2, "queued", Some(1)), (3, "done", Some(1)), (4, "queued", None), (5, "active", Some(2))] {
+            hub.lock().unwrap().missions.push(Mission { id, cwd: from.clone(), state: state.into(), agent, ..Mission::default() });
+        }
+        let record = |cwd: &str| format!("{}\n", serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+            "type":"CommandExecution","cwd":cwd,"status":"completed"
+        }}}));
+        let log = sessions.join("rollout-session-1.jsonl");
+        std::fs::write(&log, format!("{}{}", record(&from), record(&to))).unwrap();
+        let mut trails = HashMap::new();
+        follow_worktrees(&hub, &mut trails, &dir.join("sessions"));
+        assert_eq!(a.lock().unwrap().view(Instant::now()).cwd, to);
+        assert_eq!(a.lock().unwrap().writer.master.as_raw_fd(), fd);
+        assert_eq!(a.lock().unwrap().session.as_deref(), Some("session-1"));
+        assert_eq!(other.lock().unwrap().cwd, from);
+        let worlds: Vec<_> = hub.lock().unwrap().missions.iter().map(|m| m.cwd.clone()).collect();
+        assert_eq!(worlds, vec![to.clone(), to.clone(), from.clone(), from.clone(), from.clone()]);
+        // polling or re-reading on daemon upgrade must not replay an older departure
+        follow_worktrees(&hub, &mut trails, &dir.join("sessions"));
+        assert_eq!(a.lock().unwrap().cwd, to);
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(record(&from).as_bytes()).unwrap();
+        follow_worktrees(&hub, &mut HashMap::new(), &dir.join("sessions"));
+        assert_eq!(a.lock().unwrap().cwd, from);
+        // old hook clients remain compatible; new hooks can report a native directory change
+        let old: Req = serde_json::from_value(serde_json::json!({"op":"hook","id":1,"event":"working"})).unwrap();
+        assert!(matches!(handle(&hub, old), Resp::Ok));
+        let new: Req = serde_json::from_value(serde_json::json!({"op":"hook","id":1,"event":"working","cwd":to})).unwrap();
+        assert!(matches!(handle(&hub, new), Resp::Ok));
+        assert_eq!(a.lock().unwrap().cwd, station.to_str().unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
