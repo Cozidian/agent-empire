@@ -11,26 +11,57 @@ cargo build --release
 
 ## Home and your projects
 
-Press **H** to visit **Home**. Choose **Configure project root** and enter the folder containing
-your projects, for example `/home/code` or `~/code`. Empire discovers Git repositories beneath
-that folder and makes them planets. Their parent folders determine the sectors. Discovery runs
+Press **V** to manage **sectors and folders**, or choose **Manage sectors and folders** on
+**Home** (`H`, then `r`). Press **n** in the manager to add a sector root: a folder containing
+projects, for example `~/code`, `~/work`, or `/mnt/projects`. Add as many roots as you need;
+each addition keeps the existing roots. **Tab** completes the path. Empire discovers Git repositories beneath
+these folders and makes them planets. Their parent folders determine the sectors. Discovery runs
 in the background, stops inside repositories, and skips hidden directories, symlink directories,
-`node_modules`, `target`, and `vendor`. Git worktrees with a `.git` file are recognized too.
+`node_modules`, `target`, and `vendor`. Git worktrees with a `.git` file are recognized too; each one is shown as a small space station
+(`▣`) in close orbit around its project planet: a core module, a truss and two solar wings, with
+amber lights while an agent is aboard and dark lights when it has none. It is distinct from the
+ring-shaped GitHub station. Select and open them like any project.
+
+While the galaxy is open, Empire also checks each repository's Git worktree registry during
+its regular survey (about every eight seconds). Worktrees created by your agent appear as stations
+automatically, including ones in hidden folders or outside your sector roots. Missing worktrees
+are skipped; explicitly hidden stations stay hidden.
+
+For Codex, the existing ship follows the working directory of completed commands recorded in its
+local session log. Claude/Grok hooks can also report a changed native working directory. Empire
+only follows checkouts of the same repository, keeps the ship ID and open conversation, and moves
+unfinished missions assigned to that ship with it. Unassigned project tasks stay on their planet.
+Ask your agent to create the worktree **and run its work there**: the station appears once Git
+registers it, and the ship moves when execution there is observed. Empire does not interpret prompt
+text, restart the agent, or change the harness's permissions or default directory. A command using
+only `git -C` or a shell-internal `cd` may still report its original directory; use the worktree as
+the command's working directory. Older Codex logs without execution-directory records cannot
+report these moves automatically.
 
 If no root has been saved, Empire uses `/home/code` or `~/code` when one exists. **R on Home**
-rescans the root. A scan reads directory entries; it does not pull, clone or modify repositories.
+rescans all roots. A scan reads directory entries; it does not pull, clone or modify repositories.
 
-**n** adds a folder manually, including folders outside the root and folders without Git.
+**n on the galaxy or Home** adds a single planet manually, including folders outside the roots
+and folders without Git. To discover several projects under a folder, use **V**, then **n** instead.
 A missing folder is created only after a second Enter. Adding a planet does not launch an agent.
-Manually added folders and the root are saved in `$XDG_STATE_HOME/empire/workspace.json`
+In the sector manager, select a root or manually added planet and press **x/Delete** to remove it.
+On Home, **x/Delete** removes the selected project; on the galaxy, **x** (or **Delete**) removes the
+selected planet. This only removes it from the map: files, repositories, agents and terminals are kept.
+Worlds with sessions stay visible until those sessions are dismissed. Removed projects stay hidden
+from discovery and history; adding their folder again restores them. Removing a root keeps projects
+covered by another root or added individually. Adding a root again restores its hidden projects.
+An empty root stays listed in the manager until it contains Git projects to show on the map.
+
+Manually added folders, roots and hidden projects are saved in `$XDG_STATE_HOME/empire/workspace.json`
 (normally `~/.local/state/empire/workspace.json`). Existing projects from Empire's history and
-running sessions remain visible. Discovered projects stay charted without requiring an agent.
+running sessions remain visible unless explicitly removed as described above. Discovered projects stay
+charted without requiring an agent.
 
 Home puts projects needing you first, with clear input/check labels and their latest question or task.
 Other projects use compact rows grouped by parent folder; only nonzero ship and terminal counts
 are shown. The selected project's full path stays in the footer. Folder headings are not selectable.
 Choose a project to open its workspace, or press **e** on its Home row to launch a ship.
-**r on Home** edits the project root. New ships depart from Home and settle into the project's
+**r on Home** manages sector roots and folders. New ships depart from Home and settle into the project's
 orbit; they remain there between tasks until you dismiss them.
 
 ## Working on a planet
@@ -42,24 +73,28 @@ Enter or double-click a planet to open its workspace:
   With no live agents, the composer defaults to launching a new ship. **Tab** switches between
   an available agent and a new ship; **↑↓** chooses Claude, Codex or Grok when launching.
 - **Launch an agent from Home** (`e`): choose a species and open its native terminal.
-- **Open another terminal** (`s`): start your normal shell in the project folder. Open as many
+- **Open another terminal** (`b`): start your normal shell in the project folder. Open as many
   as you need for `git pull`, development servers, logs and manual testing. Shells never take
   agent tasks or generate agent permission/completion alerts.
 - **Agents** and **Terminals** have separate sections. Every terminal has a stable number and
-  shows its current title. Select one and press **Enter** to reopen it; **F12** or **Ctrl-]**
-  returns with that session selected. **s** opens another terminal. **x** closes the selected
+  a fixed `Terminal #…` label. Shell keystrokes and window titles never become task labels or
+  list previews, including input entered at password prompts. Select one and press **Enter** to reopen it; **F12** or **Ctrl-]**
+  returns with that session selected. **b** opens another terminal. **x** closes the selected
   session after confirmation and keeps you on the project. Closing a shell stops its running
   commands too; cancelling leaves it running.
 - **Anomalies** (`a`): inspect detected problems and reported discoveries on this planet.
 - **Project resources**: browse `AGENTS.md`, `CLAUDE.md`, skills, subagents, commands, hooks, MCP
-  configuration and other agents' instruction files; each kind found stands as a spire on the
-  planet. **Enter** or **e** opens the selected file in your editor (`$VISUAL`, `$EDITOR`, else
+  configuration and other agents' instruction files. These buildings appear as small, warm
+  city-light clusters on the planet's night side, fading out at distant zoom. More kinds of
+  resources fill out the settlements; building names and files stay in the resource view.
+  **Enter** or **e** opens the selected file in your editor (`$VISUAL`, `$EDITOR`, else
   nvim, vim, vi or nano) as a full terminal; quit the editor to come straight back with the
   file re-read, or step out with **F12** and pick it up again later (it's listed as an Editor
   under Terminals). On an empty plot, **Enter** or **n** lays a short first draft (`AGENTS.md`,
   `CLAUDE.md`, `.claude/skills/new-skill/SKILL.md`, `.mcp.json`…) and opens it; **n** on a kind
   that holds many adds another. Existing files are never overwritten. **B** instead briefs a
-  ship to build or renovate it, as an ordinary task you can inspect before sending.
+  ship to build or renovate it, as an ordinary task you can inspect before sending. **b** opens a
+  terminal in the project, **c** opens comms with its lead ship, and **Ctrl+R** re-reads the files.
 
 The project header shows branch, changed files and ahead/behind counts. Agent rows show their
 current task or question. On wider terminals, selecting an agent with a handoff shows its actual
@@ -92,7 +127,8 @@ implementation or testing succeeded. You remain in charge of testing, committing
 
 Ships and planets highlight agents needing an answer or ready for you to check. **Tab** on the
 galaxy selects the next agent needing you; **C** opens the attention list across projects.
-Permission questions remain incoming transmissions; number keys answer the displayed choices.
+Permission questions remain incoming transmissions, with the command the agent wants to run shown
+in full and highlighted; number keys answer the displayed choices and **c** opens comms with the ship.
 When the galaxy is closed, desktop notifications report questions and completed longer turns.
 
 **Outcome tags (optional, automatic).** "Done" only means a turn ended. With
@@ -114,9 +150,10 @@ its source and evidence. Reported findings are labelled as not independently ver
 
 Select a finding and press **t** to prepare an investigation as an ordinary planet task. Its
 brief asks for read-only investigation; the agent retains its native permissions. Review and edit
-before sending. **i** dismisses, **r** resolves, **o** reopens. Automatic findings resolve only
+before sending. **x** dismisses, **d** defers, **r** resolves, **o** reopens. Automatic findings resolve only
 when a fresh survey confirms recovery. A finished investigation does not prove resolution.
-Use **v** to include resolved/dismissed history, **f** to filter kinds, and **/** to search.
+Use **v** to include resolved/dismissed history, **f** to filter kinds, **/** to search and
+**Backspace** to reset the filters.
 
 Record a discovery without starting the daemon:
 
@@ -137,18 +174,36 @@ The station uses your installed `gh` and its existing authentication. It refresh
 your open PRs and 100 other open PRs per project every 150 seconds, and marks stale cached results
 when GitHub is unavailable. Unpushed commits still appear as freighters travelling to the station.
 
+Planets with open pull requests show a fixed **◇ PR N** marker beside their map name and in the
+outliner, including planets without agents. It counts both your PRs and other people's PRs.
+**!** in red means your PRs have failing checks; **↗** in amber means a non-draft PR requests your
+review. Failing checks take priority if both apply. A quiet blue marker means open PRs with neither
+signal; passing checks alone do not imply a PR is ready to merge. **?** marks unavailable or cached
+data (including a successful check more than 7½ minutes old); a checked repository with no open PRs
+has no marker. These signals use symbols as well as colour and do not blink or orbit.
+
+Click the marker or select a planet and press **p** to open only that repository's PRs. **Tab**
+still switches all/review/mine within that repository. **p** also works on a selected Home project
+and inside its workspace, which has a **Pull requests** action. **Esc** returns to where you opened
+the list. The GitHub station still opens the global overview. Worktrees share their parent planet's
+count, so their space-station markers remain distinct and do not duplicate PR counts.
+
 ## Galaxy controls and atmosphere
 
 | Key | Action |
 | --- | --- |
 | Enter / double-click | Open planet workspace or native agent terminal |
-| H / n | Home / add a project folder |
-| e / t | Launch an agent / give the selected planet a task |
+| t / b / e | Give the selected planet a task / open a new terminal there / launch an agent |
+| c / 1-9 | Comms with the incoming transmission (else the selected ship) / answer it |
+| x | Dismiss the selected ship (with confirmation) / remove the selected planet from the map |
+| i | Ship information |
 | Tab / C | Next agent needing you / attention list |
-| A | Anomalies |
+| H / n | Home / add a project folder |
+| V | Manage sectors and folders: n adds a root, x/Delete removes an entry |
+| p / click ◇ PR | Open the selected planet's repository PRs |
+| R / A | Research Station: experiments, evidence and resource proposals / anomalies |
 | L / S | Selected planet's task history / situation log |
-| i / x on a ship | Ship information / dismiss with confirmation |
-| ↑↓ / j k | Select in the outliner |
+| ↑↓ / j k / g G | Select in the outliner / first / last |
 | wasd / drag | Pan |
 | ± / wheel | Zoom between systems, sectors and planets |
 | z / f | Fit galaxy / focus selection |
@@ -163,18 +218,22 @@ Planets retain their seeded procedural appearance, with curved daylight shading,
 ocean glints and drifting cloud banks. Fitted two-colour octant cells give surfaces and glows smoother
 gradients; small worlds receive a little extra light to stay readable on the map.
 Useful progress adds rings, city lights and
-other development without a separate management workflow. Music and sounds are synthesized
-locally; music starts when the galaxy opens and stops when you leave. The score is composed
+other development without a separate management workflow. Music and operational cues are synthesized
+locally. The cues are a starship bridge, apart from the score: a signal drawing near, a hyperlane arrival,
+a tone rising to rest, an anomaly pulse, a contact fading and a low tone lifting an octave. Music starts
+when the galaxy opens and stops when you leave. The score is composed
 on the fly and never repeats: slow, hopeful chord changes in a drifting key, with sections
 that move between pads, strings and a wordless choir. Echoing arpeggios, soft chimes and an
 improvised lead melody join once each section settles. Home and the project
 workspace show larger planetary portraits when there is enough room.
+Muting music fades it out, then skips inaudible synthesis while the score's clock keeps moving;
+unmuting fades back into the current passage. Alert sounds remain independent.
 
 Campaigns, expeditions, ship designs/refits, prescribed launch roles, fleet orders, manual
 hyperlane/sector editors and worktree creation/merging are retired from the workspace. Existing
 folders, worktrees and saved records are not deleted. The daemon retains legacy wire fields and
 session outfits so existing agents can survive upgrades. Campaign automation no longer dispatches
-stages. Worktrees you already have can still appear as moons.
+stages. Worktrees you already have still appear as space stations.
 
 ## Persistence and commands
 
@@ -206,6 +265,27 @@ ln -s "$PWD/target/release/empire" "$HOME/.local/bin/empire"
 
 ## Development
 
+For a long-run performance trace, open the galaxy with:
+
+```sh
+EMPIRE_PERF_DIR=/tmp/empire-perf empire
+```
+
+This opt-in recorder writes a separate `ui-PID-TIMESTAMP.jsonl` file per launch, with a sample
+every 10 seconds and a final partial sample on normal exit. It records CPU usage (100% = one core),
+resident/peak memory, busy threads, frame rate, and frame timings grouped by view and terminal size.
+`mean_ms` and `max_ms` contain update, draw, and terminal-presentation wall times in that order;
+they exclude frame pacing and are not CPU times. The last-frame context includes zoom, object
+counts and audio settings. No terminal contents, prompts or project paths are logged.
+Logging stops at 8 MiB per launch, or on a write error, with a toast; it never overwrites earlier logs.
+Omit `EMPIRE_PERF_DIR` to disable tracing. After building a new version, close and reopen only the
+galaxy to enable it; the daemon and agent sessions can stay running.
+
+The glow pass runs serially to avoid waking rendering workers every frame; graphics and the
+30 FPS target are unchanged. Repeatable component benchmarks (run separately) are available with
+`cargo test bloom_cpu_cost -- --ignored --nocapture` and
+`cargo test muted_music_cpu_cost -- --ignored --nocapture`.
+
 Single Rust binary crate. `game.rs` handles the model/input, `draw.rs` renders it, `workspace.rs`
 discovers projects, `daemon.rs` owns terminals, `proto.rs`/`client.rs` connect them, `survey.rs`
 reads Git/GitHub status, and `anomaly.rs` stores findings. Graphics and sound are procedural.
@@ -232,7 +312,90 @@ worlds at portrait and map sizes. **Space** switches between the polished render
 starts agents or audio, or reads/writes workspace state.
 
 The polished renderer is the default in the galaxy and planetary portraits. The comparison keeps
-the same procedural world identities and terminal resolution for both looks.
+the same procedural world identities and terminal resolution for both looks. The example worlds
+have five building kinds, showing city lights at portrait and map sizes.
 
 For reproducible 140×48 terminal captures, use `empire graphics --snapshot` and
 `empire graphics --snapshot --classic` (ANSI output, fixed animation time).
+
+## Research Station
+
+**R** on the galaxy map, **Research Station** on Home or a project, or `empire research`
+opens a standalone laboratory. Its teal orbital marker lives outside planetary systems. It is
+independent of worktree stations and the fleet: leaving the screen keeps an experiment running.
+The standalone command never starts or upgrades the Empire daemon.
+
+1. Press **i** once to install the pinned [Google Harness²](https://github.com/google-research/harness2)
+   runtime (or run `empire research setup`). This needs `git`, `uv`, and network access. It uses
+   Python 3.12 in its own environment; your project dependencies are not changed.
+2. Press **n**. Describe the problem, choose a project folder and a commit/ref (default `HEAD`),
+   (**↑↓** in the project field selects a discovered project; typing/pasting a path also works),
+   and enter **1–3 representative tasks**, one per line. **Alt+Enter** adds a task; pasted newlines
+   work too. **Tab** moves fields. Set a time budget, then **Enter** to review the frozen commit,
+   tasks and limits. **Enter** again starts it; **Esc** returns to editing.
+3. Watch snapshot → baseline → proposals → trials → composition → review. The current stage
+   is highlighted; the experiment trail records completed and failed sessions. **Enter** opens a study,
+   **v** reads its evidence report, **p** reads its resource patch, and **o** returns to progress.
+   **↑↓ / PgUp / PgDn** scroll. **x**, then **y**, cancels with evidence retained.
+4. Review the report and patch. From the patch, **a**, then **y**, applies the proposed resource
+   changes to the original project. Every original resource must still match the snapshot;
+   conflicts refuse the entire application. No commit, push, or broad rollout happens automatically.
+   The saved patch can also be reviewed and transferred manually to another project.
+
+Research screens use a centered reading column, section headings and highlighted selections.
+Brief fields wrap across lines and keep the active cursor in view; **Shift+Tab** moves to the
+previous field and **Ctrl+Enter** reviews the brief. Evidence reports distinguish headings,
+execution references and code; patches mark additions in green and removals in red, retaining
+their `+`/`-` signs. The footer shows complete, contextual actions and the current scroll range
+when content continues below. Adoption and cancellation open a separate, scrollable confirmation
+with the target and consequences; **y** confirms, **n / Esc** returns.
+
+A useful first question: “My agents keep missing layout problems when they finish UI work.
+Investigate a better verification workflow.” Choose a small UI change whose acceptance criteria
+explicitly include narrow and wide layouts, and ensure its dependencies/checks can run offline.
+
+This first version uses Harness²'s **single-step aggregate schedule** and the **native Codex CLI**
+for both task execution and instruction improvement. It uses your existing `codex login` account.
+Each task normally takes eight model sessions (four executions, three resource edits, one
+reflection); the hard ceiling is ten calls per task, 30 minutes by default, and ten minutes per
+session. One experiment runs at a time. Calls are serialized, so this is intentionally a small
+research workflow, not a replacement fleet scheduler.
+
+Trials get separate copies of the chosen Git commit. Uncommitted/untracked files, symlinks,
+`.env`/`.env.*`, `.codex` and `.mcp.json` are excluded. Codex runs with `workspace-write`, network
+access disabled for task commands, escalation denied, and user configuration ignored. Model
+requests still need network access and your account authentication. Global instructions/skills may
+still apply; `environment.json` records the runtime versions and traces retain the observed context. This is a workspace write
+boundary, not a confidentiality sandbox: only use suitable source/tasks. Dependencies are not
+automatically downloaded; tasks that need a local server or browser must have usable tooling.
+Failures and incomplete checks remain evidence, never a silent success.
+
+Editable resources are `AGENTS.md`, `.agents/skills/<name>/SKILL.md`, Python helpers under
+`.agents/skills/<name>/scripts/`, and `scripts/*.py`. Supporting skill documents stay intact. Application changes made during trials stay in the experiment copies. Harness² retains
+experience across tasks **within a study**; studies do not silently share learned resources.
+The final task's selected candidate becomes the proposal. This is model-selected evidence,
+**not an independent proof that the workflow improved**: compare baseline/candidate traces and
+validate on fresh tasks before wider adoption.
+
+Records, snapshots, candidate workspaces, model traces, `REPORT.md`, `proposal.json` and
+`proposal.patch` live under `$XDG_STATE_HOME/empire/research/RUN-ID`. Runtime dependencies live
+under `$XDG_DATA_HOME/empire/research`. Native CLI input/output/cache token counts are recorded;
+**billed cost is unavailable**, rather than reported as zero. Check your account usage for cost.
+For an existing compatible environment, set `EMPIRE_RESEARCH_PYTHON=/path/to/python`.
+
+For scripted starts, `empire research start REQUEST.json` accepts:
+
+```json
+{
+  "problem": "Improve verification of narrow layouts",
+  "project": "/absolute/path/to/project",
+  "revision": "HEAD",
+  "tasks": ["Implement a compact settings panel; check it at 390 and 1280 pixels and report evidence."],
+  "minutes": 30
+}
+```
+
+`empire research --snapshot` renders the empty station offline at 140×48. Python runner tests
+need the research environment: `PATH/TO/research/venv/bin/python -m unittest discover -s research -v`.
+They include the actual Harness² schedule with a clearly marked model test double; no paid model
+calls are made by the unit tests.
