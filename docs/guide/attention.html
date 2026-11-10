@@ -13,3 +13,11 @@
 <pre><code>empire anomaly /path/to/project 'Confusing login flow' \
   'The callback discards the destination; see src/auth.rs.' 'agent report'</code></pre>
 <p>Use concrete evidence and a useful source label. Keep secrets and personal data out of report text if you plan to share it.</p>
+
+<h2 id="advisor">Optional report severity</h2>
+<p>With <code>EMPIRE_ADVISOR_SEVERITY=1</code>, <code>PROVIDER_API_KEY</code> and an explicit
+<code>PROVIDER_BASE_URL</code>, a compatible typed-decision service can score reports to order
+the attention list. Report titles, evidence and project basenames leave your machine.
+This is off by default; failures and uncertain answers preserve the normal ordering.
+The service must implement <code>POST /v1/advice</code>, and <code>PROVIDER_DEFAULT_MODEL</code>
+selects its model. This is not a generic chat API.</p>
