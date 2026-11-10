@@ -3027,7 +3027,7 @@ impl App {
             }
             let actions: Vec<_> = rows.drain(..3).collect(); rows.extend(actions);
         } else {
-            rows.push(("Give this planet a task".into(), "An available agent here takes it; busy agents finish first".into(), WorkAct::Task));
+            rows.push((if w.planet(key).is_some_and(|p| p.host.is_some()) { "Give this station a task" } else { "Give this planet a task" }.into(), "An available agent here takes it; busy agents finish first".into(), WorkAct::Task));
             rows.push(("Launch an agent from Home".into(), "Claude · Codex · Grok".into(), WorkAct::Launch));
             rows.push(("Open another terminal".into(), "An ordinary shell in this project, kept running when you leave".into(), WorkAct::Terminal));
             let mut sessions: Vec<_> = self.agents.iter().filter(|a| a.cwd == key && a.dying.is_none()).collect();
