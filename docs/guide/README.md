@@ -1,5 +1,7 @@
 # Agent Empire user guide
 
+Read the published guide at https://cozidian.github.io/agent-empire/.
+
 The guide is a static site for GitHub Pages. Its eleven chapters cover setup, projects and
 worktrees, native agents and shells, tasks and screenshots, attention and findings, GitHub,
 research, controls, persistence/privacy, and troubleshooting.
@@ -41,4 +43,4 @@ After the repository's publication audit and history cleanup:
 
 The workflow publishes only `target/docs`. It does not change repository visibility. Public
 repositories can use Pages on GitHub Free; hosting from a private repository depends on the
-account's plan. Pages is not configured until the repository settings and deployment succeed.
+account's plan. This repository uses GitHub Actions deployment with `PAGES_ENABLED=true`.

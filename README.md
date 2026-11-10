@@ -10,7 +10,7 @@ ready to review. Come back to the same fleet when you reopen your terminal.
 
 *A real render with fictional projects. Planets, ships, nebulae and sound are generated in code.*
 
-[User guide](docs/guide/README.md) · [Get started](#get-started) · [Daily workflow](#your-first-flight) · [Controls](#galaxy-controls-and-atmosphere) · [Full manual](#home-and-your-projects) · [Contributing](CONTRIBUTING.md)
+[User guide](https://cozidian.github.io/agent-empire/) · [Get started](#get-started) · [Daily workflow](#your-first-flight) · [Controls](#galaxy-controls-and-atmosphere) · [Full manual](#home-and-your-projects) · [Contributing](CONTRIBUTING.md)
 
 ## A place for the work you have in flight
 
@@ -54,14 +54,6 @@ into `~/.local/bin`. It also keeps license notices beside the command as
 `--version v0.1.0` for a specific release or `--bin-dir /your/bin` for another location. Run it
 again to update; it replaces the command without stopping your agents. `empire upgrade` switches
 a running daemon to the installed build—it does not download updates.
-
-While this repository is private, use an authenticated GitHub CLI instead of the public download:
-
-```sh
-mkdir empire-release
-gh release download --repo Cozidian/agent-empire --dir empire-release
-bash empire-release/install.sh --from-dir empire-release
-```
 
 For manual installation, verify the matching archive against `SHA256SUMS`, extract it and copy
 `empire` into a directory on your `PATH`. Removing that binary uninstalls the command; it leaves
@@ -393,7 +385,7 @@ ln -s "$PWD/target/release/empire" "$HOME/.local/bin/empire"
 
 ## User guide site
 
-The [user guide](docs/guide/README.md) provides eleven chapters for setup and daily use, with
+The [user guide](https://cozidian.github.io/agent-empire/) provides eleven chapters for setup and daily use, with
 chapter navigation, keyboard reference and local search. It builds into static HTML for GitHub
 Pages, with no extra package dependencies:
 
@@ -403,8 +395,8 @@ python3 -m http.server 8765 --bind 127.0.0.1 --directory target/docs
 ```
 
 Open `http://127.0.0.1:8765/`. The [guide README](docs/guide/README.md) explains editing and Pages
-setup. The deployment workflow stays disabled until `PAGES_ENABLED=true` is configured after
-release cleanup. Keep the guide and this manual in step when behavior changes.
+setup. GitHub Pages publishes the guide from `main` after its checks pass.
+Keep the guide and this manual in step when behavior changes.
 
 ## Development
 

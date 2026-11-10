@@ -5,8 +5,7 @@ version receives fixes; there is no supported older release series yet.
 
 ## Reporting a vulnerability
 
-Use GitHub's **Security → Report a vulnerability** for this repository when private reporting is
-enabled. Include the affected commit, reproduction steps using a disposable project, and the
+Use [GitHub’s private vulnerability reporting](https://github.com/Cozidian/agent-empire/security/advisories/new). Include the affected commit, reproduction steps using a disposable project, and the
 impact. Do not paste credentials or private agent transcripts into a public issue.
 
 If private reporting is unavailable, open an issue asking the maintainer for a private reporting
@@ -33,3 +32,7 @@ separately under `$XDG_DATA_HOME/empire/research`.
 Agent CLIs contact their configured model providers. GitHub integration calls `gh`; Research
 Station setup downloads its optional runtime. Review the relevant tool's permissions and data
 handling before using it with confidential projects.
+
+Optional advisor features are off by default. When configured, they send feature-specific task,
+report or terminal excerpts to `PROVIDER_BASE_URL`. Common-pattern redaction is best effort;
+review the README’s advisor sections before enabling them with confidential work.
