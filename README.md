@@ -175,13 +175,12 @@ recent terminal output, including testing instructions when the agent provided t
 excerpt, not an independently verified summary. Open the native terminal for the full conversation.
 
 **Overlapping work (optional, automatic).** With `EMPIRE_ADVISOR_OVERLAP=1`, when two or more ships are
-Working on one world, Provider's Advisor model (`PROVIDER_API_KEY`) is asked, once per pair, whether
+Working on one world, a configured advisor is asked, once per pair, whether
 their tasks ask for the same work or work likely to edit the same files. At 0.7 or more both ships
 get a dim `≈#7` in the outliner and an `overlap` row on the ship card. This comes earlier than
 the red `⚔` border conflict, which still means files were really edited by both. It is only a
-hint: nothing is asked of you or done for you, and a low score, a missing key or any error shows
-nothing. With the flag but no key (or if Advisor fails), shared file paths or mostly shared words in
-the two tasks stand in. Only the species and the first line of each task (up to 300 characters)
+hint: nothing is asked of you or done for you. With the flag but no advisor configuration (or if Advisor fails), shared file paths or mostly shared words in
+the two tasks stand in. Only the project basename, species and each task snippet (up to 300 characters)
 are sent, never terminal text; a world is asked about at most once every 30 seconds. The model
 (`advisor-1.14.0`) and endpoint can be overridden with `PROVIDER_DEFAULT_MODEL` and `PROVIDER_BASE_URL`.
 
@@ -522,3 +521,8 @@ to order reported anomalies by severity. Other finding kinds keep their fixed pr
 Errors and uncertain answers leave the existing behavior intact. Treat report text as potentially
 sensitive before enabling this. `EMPIRE_ADVISOR_LOG=1` records decision labels in a private
 `advisor.log` in the state directory. No advisor is needed to play or run agents.
+
+`EMPIRE_ADVISOR_ROUTE=1` suggests an installed species while you compose a task. After the
+text pauses for one second, it sends the project basename and up to 4,000 characters of task
+text. A confident answer can preselect a species, but a species you choose manually wins.
+It never sends the mission; press Enter when you are ready.

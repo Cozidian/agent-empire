@@ -14,3 +14,9 @@
 <h2 id="follow-the-task">Follow the task</h2>
 <p>Press uppercase <kbd>L</kbd> on the galaxy to open the selected planet's task history. Open the agent's terminal to see its actual work or answer a question. Completing a turn signals that the result is ready to check, not that it passed its acceptance criteria.</p>
 <p>For a conversation already in progress, you can always type directly into the agent's native terminal instead of creating another queued task.</p>
+
+<h2 id="routing">Optional species suggestions</h2>
+<p>With advisor configuration and <code>EMPIRE_ADVISOR_ROUTE=1</code>, the composer can suggest
+an installed species after a one-second typing pause. It sends the project basename and up to
+4,000 characters of task text to the configured service. A confident result can preselect the
+species; choosing one yourself takes precedence. Nothing is launched until you send the task.</p>
