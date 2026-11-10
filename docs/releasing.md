@@ -72,11 +72,12 @@ Update `docs/release-notes.md` for each release, including its pinned install co
 `Release fleet` runs Fleet checks, builds and tests natively on Ubuntu 22.04 for x86-64 and
 ARM64, strips the binaries, packages the license, manual, dependency notices and Rust standard-library
 attributions, and exercises the installer.
-Only after both builds succeed does it create the GitHub Release with two archives,
+The uploaded artifacts are downloaded again and checked for both architectures, matching versions
+and bundled notices. Only after these checks succeed does it create the GitHub Release with two archives,
 `install.sh` and `SHA256SUMS`. The tag must match the package version. Repository write permission
 is confined to the publishing job. Published assets are not overwritten on a rerun.
 
-A manual workflow run on `main` tests packaging and saves Actions artifacts without publishing
+A manual workflow run on a branch tests packaging, artifact upload/download and saves Actions artifacts without publishing
 or creating a tag. Run on an existing tag to retry a failed release. If publication left a draft,
 inspect its assets before completing or deleting that draft; do not retag a published version.
 

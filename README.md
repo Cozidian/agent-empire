@@ -584,3 +584,6 @@ with `python3 tools/third-party-notices.py`; CI checks they stay current.
 
 Dependency advisories, licenses and sources are checked in CI and weekly using cargo-deny.
 Dependabot proposes Cargo and GitHub Actions updates. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+The release workflow verifies both Linux archives after uploading and downloading them, including
+their versions and bundled notices. Manual branch runs exercise this without publishing a release.
