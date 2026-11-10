@@ -1610,6 +1610,15 @@ fn transmission(fb: &mut Fb, app: &App, l: &Lay, t: f32) {
     for d in &q.detail {
         rest.extend(if commandish(d) { lines(d, 8, cmd).collect::<Vec<_>>() } else { lines(d, 3, TEXT * 0.8).collect() });
     }
+    if let Some(risk) = &q.risk {
+        // Advisor's read (or the denylist's): advice for you, never an answer
+        let c = match risk.level {
+            crate::proto::RiskLevel::Calm => v3(0.45, 0.9, 0.55),
+            crate::proto::RiskLevel::Care => v3(1.0, 0.8, 0.3),
+            crate::proto::RiskLevel::NeedsYou => Status::Blocked.color(),
+        };
+        rest.push((trunc(&format!("⚑ {}", risk.line()), inner), c));
+    }
     rest.push((String::new(), DIM));
     // on a short terminal the oldest context gives way first
     let room = (l.rows - 6 - q.options.len().min(9) as i32 - 3).max(0) as usize;

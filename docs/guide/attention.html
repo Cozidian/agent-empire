@@ -28,3 +28,10 @@ world appear to share a task. Without advisor configuration this compares task w
 paths locally. With a configured advisor it sends project basenames, species and task snippets
 (up to 300 characters per ship). Failures fall back to the local comparison. This does not stop
 ships or replace the red badge for actual file conflicts.</p>
+
+<h2 id="approval-advice">Optional approval advice</h2>
+<p>With advisor configuration and <code>EMPIRE_ADVISOR_TRIAGE=1</code>, approval prompts show
+an advisory risk label. The configured service receives the question, command details, context
+and choices, with common secret patterns removed. Recognized destructive commands and credential
+requests receive a local “needs you” label instead. You still decide every approval; these labels
+are not a security boundary and never change an agent’s native permissions.</p>

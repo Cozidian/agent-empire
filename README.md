@@ -221,14 +221,15 @@ When the galaxy is closed, desktop notifications report questions and completed 
 
 **Outcome tags (optional, automatic).** "Done" only means a turn ended. With
 `EMPIRE_ADVISOR_OUTCOME=1`, a turn longer than 15 seconds is read once its output settles. If the
-output holds the agent's own summary, Provider's Advisor model (`PROVIDER_API_KEY`) judges whether
+output holds the agent's own summary, the configured advisor judges whether
 the work looks failed, partial or needs review. A confident warning (0.4 or more) shows as "Looks
 failed" or "Partly done" instead of "Ready to check" on Home, in the needs list, higher in the
 attention list and on the mission log row, and is saved with the mission. It never shows a good-news
-badge, never asks anything and does nothing for you; low confidence, no summary or any error shows
-nothing. With the flag but no key (or if Advisor fails) a keyword scan stands in (`error:`, `failed`,
+badge and never acts for you. Low confidence or no summary shows nothing. With the flag
+but no advisor configuration (or if Advisor fails) a keyword scan stands in (`error:`, `failed`,
 `panicked`; `remaining`, `skipped`, `TODO`; `please review`). The last 1500 characters of the
-screen, with secrets blanked, are sent to Provider. `PROVIDER_DEFAULT_MODEL` and `PROVIDER_BASE_URL`
+screen and up to 300 characters of mission text are sent to the configured service, with common
+secret patterns removed. Redaction cannot detect every secret. `PROVIDER_DEFAULT_MODEL` and `PROVIDER_BASE_URL`
 override the model (`advisor-1.14.0`) and endpoint.
 
 **A** opens anomalies across the galaxy; a planet's **a** action filters to that project.
@@ -538,3 +539,8 @@ sensitive before enabling this. `EMPIRE_ADVISOR_LOG=1` records decision labels i
 text pauses for one second, it sends the project basename and up to 4,000 characters of task
 text. A confident answer can preselect a species, but a species you choose manually wins.
 It never sends the mission; press Enter when you are ready.
+
+`EMPIRE_ADVISOR_TRIAGE=1` adds advisory risk labels to approval prompts. It sends the question,
+command details, nearby context and choices to the configured advisor after removing common
+secret patterns. Recognized destructive commands and credential requests get a local “needs you”
+label without a network request. Labels never approve anything or change native permissions.

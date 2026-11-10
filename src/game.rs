@@ -4762,7 +4762,7 @@ mod commander_tests {
             a.title = format!("task for ship {id}");
             app.agents.push(a);
         }
-        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![], detail: vec![] });
+        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![], detail: vec![], risk: None });
         app.sel = Some(Sel::Sys("/beta".into()));
         let world = app.world(0.0, 0.0);
         let l = Lay::new(&Fb::new(120, 40), false);
@@ -4778,6 +4778,21 @@ mod commander_tests {
         let l = Lay::new(&fb, false);
         draw::frame(&mut fb, app, w, &l, 1.0, None);
         fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_approval_prompt_shows_advisor_risk_badge_and_nothing_answers_for_you() {
+        let (mut app, w, _l) = fixture();
+        let ask = app.agents[0].ask.as_mut().unwrap();
+        ask.options = vec![crate::proto::Choice { key: "1".into(), label: "Yes, proceed".into() }];
+        ask.risk = Some(crate::proto::RiskView { label: "destructive_or_irreversible".into(), probability: 0.91, level: crate::proto::RiskLevel::NeedsYou, outside: Some(0.8), reason: String::new() });
+        let screen = rendered(&mut app, &w);
+        assert!(screen.contains("INCOMING TRANSMISSION"));
+        assert!(screen.contains("needs you · destructive or irreversible · 91%"), "{screen}");
+        // the badge is advice: the agent is still blocked on you
+        assert_eq!(app.agents[0].status, Status::Blocked);
+        app.agents[0].ask.as_mut().unwrap().risk = None;
+        assert!(!rendered(&mut app, &w).contains("Advisor's advice"), "no risk, no badge");
     }
 
     #[test]
@@ -5136,6 +5151,7 @@ mod structure_tests {
             question: "Would you like to run the following command?".into(),
             context: vec!["• Hook failed".into()],
             detail: vec![cmd.into()],
+            risk: None,
             options: vec![crate::proto::Choice { key: "1".into(), label: "Yes, proceed (y)".into() }],
         });
         app.agents.push(ship);

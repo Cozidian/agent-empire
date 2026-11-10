@@ -22,6 +22,7 @@ mod sound;
 mod structure;
 mod screenshots;
 mod survey;
+mod triage;
 
 use proto::{Req, call};
 use std::io;
