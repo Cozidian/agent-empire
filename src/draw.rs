@@ -368,6 +368,17 @@ fn worktree_station(fb: &mut Fb, x: f32, y: f32, r: f32, p: &Planet, t: f32) {
             let h = r * 0.6;
             fb.line(px, y - h, px, y + h, panel * 0.45, panel * 0.85);
             fb.splat(px + side * 0.7, y, panel * 0.3);
+            if r > 10.0 {
+                // broad photovoltaic wings resolve into individual cells up close
+                for iy in (y - h) as i32..=(y + h) as i32 {
+                    for ix in (px - r * 0.16) as i32..=(px + r * 0.16) as i32 {
+                        let u = (ix as f32 - px) / r;
+                        let v = (iy as f32 - y) / r;
+                        let seam = ((u + 0.16) * 18.0).fract() < 0.12 || ((v + 0.6) * 12.0).fract() < 0.1;
+                        if let Some(i) = fb.idx(ix, iy) { fb.px[i] = if seam { hull * 0.45 } else { panel * (0.65 - v * 0.2) }; }
+                    }
+                }
+            }
         }
         fb.splat(x + side * r * 1.35, y, lamp * 0.9);
     }
@@ -378,6 +389,12 @@ fn worktree_station(fb: &mut Fb, x: f32, y: f32, r: f32, p: &Planet, t: f32) {
     fb.splat(x, y - r * 0.95, if crewed { v3(1.0, 0.45, 0.35) * beacon } else { lamp * beacon });
     fb.splat(x - 0.6, y + 0.4, lamp);
     fb.splat(x + 0.6, y + 0.4, lamp);
+}
+
+/// A project's portrait, with worktrees keeping their station silhouette at every size.
+fn project_portrait(fb: &mut Fb, app: &App, x: f32, y: f32, r: f32, p: &Planet, t: f32) {
+    if p.host.is_some() { worktree_station(fb, x, y, r * 0.72, p, t); }
+    else { sphere(fb, app, x, y, r, p, (-1.0, -0.5), t); }
 }
 
 /// Small settlements on a world's night side, carried with its rotating surface.
@@ -2069,10 +2086,11 @@ impl WorkspaceLayout {
 fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, t: f32) {
     fb.px.fill(PANEL);
     let home = key == crate::workspace::HOME;
+    let station = w.planet(key).is_some_and(|p| p.host.is_some());
     let accent = if home { v3(0.5, 0.85, 1.0) } else { v3(0.65, 0.9, 0.75) };
     fb.panel(0, 0, l.cols, 6, BAR);
     seg(fb, 2, 0, "‹ Esc galaxy", l.cols - 4, DIM, Some(BAR));
-    seg(fb, 2, 2, &format!("{}  {}", if home { "⌂" } else { "◉" }, if home { "HOME".into() } else { base_name(key) }), l.cols - 4, TEXT, Some(BAR));
+    seg(fb, 2, 2, &format!("{}  {}", if home { "⌂" } else if station { "▣" } else { "◉" }, if home { "HOME".into() } else { base_name(key) }), l.cols - 4, TEXT, Some(BAR));
     let summary = if home {
         let ships = app.agents.iter().filter(|a| a.kind != "shell" && a.dying.is_none()).count();
         let waiting = app.agents.iter().filter(|a| a.kind != "shell" && a.status.needs_you() && a.dying.is_none()).count();
@@ -2100,8 +2118,8 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
         let x = (width + (l.cols - width) / 2) as f32 * 2.0;
         let y = l.rows as f32 * 2.1;
         let radius = ((l.cols - width) as f32 * 0.75).min(l.rows as f32 * 1.3);
-        sphere(fb, app, x, y, radius, p, (-1.0, -0.5), t);
-        seg(fb, width + 2, l.rows - 6, if home { "Your fleet starts here." } else { "A world of your own." }, l.cols - width - 4, DIM, None);
+        project_portrait(fb, app, x, y, radius, p, t);
+        seg(fb, width + 2, l.rows - 6, if home { "Your fleet starts here." } else if station { "A station of your own." } else { "A world of your own." }, l.cols - width - 4, DIM, None);
     }
     for (y, heading) in &layout.headings {
         seg(fb, 4, *y, heading, width - 6, if heading == "NEEDS YOU" { v3(1.0, 0.78, 0.45) } else { accent * 0.8 }, None);
@@ -2148,13 +2166,13 @@ fn planet_view(fb: &mut Fb, app: &App, w: &World, v: &PlanetView, l: &Lay, t: f3
     fb.panel(0, 0, l.cols, 4, BAR);
     let accent = KINDS[v.sel].color();
     seg(fb, 2, 0, "‹ Esc project", l.cols - 4, DIM, Some(BAR));
-    seg(fb, 2, 1, &format!("PLANET  {}", base_name(&v.key)), l.cols - 17, TEXT, Some(BAR));
+    seg(fb, 2, 1, &format!("{}  {}", if w.planet(&v.key).is_some_and(|p| p.host.is_some()) { "STATION" } else { "PLANET" }, base_name(&v.key)), l.cols - 17, TEXT, Some(BAR));
     seg(fb, 2, 2, &tilde(&v.key), l.cols - 17, DIM, Some(BAR));
     if let Some(p) = w.planet(&v.key) {
         for row in 0..4 {
             for col in (l.cols - 13).max(0)..l.cols { fb.txt[(row * l.cols + col) as usize] = None; }
         }
-        sphere(fb, app, l.cols as f32 * 2.0 - 15.0, 8.0, 6.0, p, (-1.0, -0.5), t);
+        project_portrait(fb, app, l.cols as f32 * 2.0 - 15.0, 8.0, 6.0, p, t);
     }
     if l.cols < 48 || l.rows < 18 {
         seg(fb, 2, 6, "Enlarge the terminal to browse buildings.", l.cols - 4, TEXT, None);
@@ -2178,7 +2196,7 @@ fn planet_view(fb: &mut Fb, app: &App, w: &World, v: &PlanetView, l: &Lay, t: f3
     if l.rows >= 30 {
         if let Some(p) = w.planet(&v.key) {
             let cy = (l.rows as f32 - 6.0) * 4.0;
-            sphere(fb, app, g.split as f32, cy, 12.0, p, (-1.0, -0.5), t);
+            project_portrait(fb, app, g.split as f32, cy, 12.0, p, t);
         }
     }
     let x = g.split + 2;

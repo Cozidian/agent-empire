@@ -112,7 +112,8 @@ in the background, stops inside repositories, and skips hidden directories, syml
 `node_modules`, `target`, and `vendor`. Git worktrees with a `.git` file are recognized too; each one is shown as a small space station
 (`▣`) in close orbit around its project planet: a core module, a truss and two solar wings, with
 amber lights while an agent is aboard and dark lights when it has none. It is distinct from the
-ring-shaped GitHub station. Select and open them like any project.
+ring-shaped GitHub station. Select and open them like any project. Their fullscreen workspace and
+resource browser retain the station graphic and labels, with detailed solar panels in the large portrait.
 
 While the galaxy is open, Empire also checks each repository's Git worktree registry during
 its regular survey (about every eight seconds). Worktrees created by your agent appear as stations
