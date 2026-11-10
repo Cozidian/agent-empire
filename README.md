@@ -498,3 +498,16 @@ See [SECURITY.md](SECURITY.md) for reporting and scope.
 
 [MIT](LICENSE) © 2026 Cozidian and contributors. Agent CLIs and optional research tools are
 separate projects with their own licenses and terms.
+
+### Optional advisor
+
+Advisor features are off by default. They require `curl`, `PROVIDER_API_KEY`, an explicit
+`PROVIDER_BASE_URL` for a compatible typed-decision API (`POST /v1/advice`), and a feature flag.
+This is a specialized API, not an OpenAI-compatible chat endpoint. `PROVIDER_DEFAULT_MODEL`
+selects the model (default `advisor-1.14.0`); set it to one your service supports.
+
+`EMPIRE_ADVISOR_SEVERITY=1` sends report titles, evidence and project basenames to that service
+to order reported anomalies by severity. Other finding kinds keep their fixed priorities.
+Errors and uncertain answers leave the existing behavior intact. Treat report text as potentially
+sensitive before enabling this. `EMPIRE_ADVISOR_LOG=1` records decision labels in a private
+`advisor.log` in the state directory. No advisor is needed to play or run agents.
