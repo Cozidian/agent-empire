@@ -309,6 +309,41 @@ pub fn socket_path() -> PathBuf {
     dir.join(format!("empire-{}.sock", unsafe { libc::getuid() }))
 }
 
+/// Only processes running as this player may control the fleet.
+pub fn same_user(s: &UnixStream) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        if unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        require_user(cred.uid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = s; Err(io::Error::new(io::ErrorKind::Unsupported, "daemon peer authentication currently requires Linux")) }
+}
+
+#[cfg(target_os = "linux")]
+fn require_user(uid: libc::uid_t) -> io::Result<()> {
+    if uid == unsafe { libc::geteuid() } { return Ok(()); }
+    Err(io::Error::new(io::ErrorKind::PermissionDenied, "daemon peer belongs to another user"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod peer_tests {
+    use super::*;
+
+    #[test]
+    fn fleet_connections_require_the_players_uid() {
+        let (a, b) = UnixStream::pair().unwrap();
+        same_user(&a).unwrap(); same_user(&b).unwrap();
+        let other = unsafe { libc::geteuid() }.wrapping_add(1);
+        assert_eq!(require_user(other).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+}
+
 /// A persistent connection to the daemon.
 pub struct Conn {
     rd: BufReader<UnixStream>,
@@ -318,6 +353,7 @@ pub struct Conn {
 impl Conn {
     pub fn open() -> io::Result<Self> {
         let s = UnixStream::connect(socket_path())?;
+        same_user(&s)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         Ok(Self { rd: BufReader::new(s.try_clone()?), wr: s })
     }

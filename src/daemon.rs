@@ -828,7 +828,7 @@ fn upgrade(hub: &Shared) -> io::Result<()> {
         });
     }
     let file = dirs_state().join("handoff.json");
-    std::fs::write(&file, serde_json::to_string(&(h.next, out))?)?;
+    crate::state::private_write(&file, serde_json::to_string(&(h.next, out))?)?;
     let _ = std::fs::remove_file(socket_path());
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(exe_path()).arg("daemon").env("EMPIRE_HANDOFF", &file).exec();
@@ -1148,7 +1148,7 @@ fn save_registry(hub: &Shared, last: &mut Vec<Saved>) {
     let now: Vec<Saved> = now.into_iter().map(|(_, s)| s).collect();
     if now != *last {
         let _ = std::fs::create_dir_all(dirs_state());
-        let _ = std::fs::write(registry_file(), serde_json::to_string(&now).unwrap_or_default());
+        let _ = crate::state::private_write(&registry_file(), serde_json::to_string(&now).unwrap_or_default());
         *last = now;
     }
 }
@@ -1730,6 +1730,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
 }
 
 fn serve(hub: Shared, s: UnixStream) -> io::Result<()> {
+    same_user(&s)?;
     let mut w = s.try_clone()?;
     for line in BufReader::new(s).lines() {
         let line = line?;
@@ -1745,13 +1746,22 @@ fn serve(hub: Shared, s: UnixStream) -> io::Result<()> {
 }
 
 pub fn run() -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     let path = socket_path();
-    if UnixStream::connect(&path).is_ok() {
+    if let Ok(s) = UnixStream::connect(&path) {
+        same_user(&s)?;
         eprintln!("empire daemon already running at {}", path.display());
         return Ok(());
     }
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "refusing to replace an unowned or non-socket daemon path"));
+        }
+    }
+    crate::state::private_dir(&dirs_state())?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let hub: Shared = Arc::default();
     let _ = BUILD.set(build_id());
     if let Ok(s) = std::fs::read_to_string(missions_file()) {
@@ -1866,7 +1876,7 @@ pub fn statusline() {
         let file = crate::survey::claude_limits_file();
         let _ = std::fs::create_dir_all(dirs_state());
         let tmp = file.with_extension("tmp");
-        if std::fs::write(&tmp, rl.to_string()).is_ok() {
+        if crate::state::private_write(&tmp, rl.to_string()).is_ok() {
             let _ = std::fs::rename(tmp, file);
         }
     }
@@ -1996,9 +2006,11 @@ pub fn ensure_running() -> io::Result<()> {
         return Ok(());
     }
     use std::os::unix::process::CommandExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let log_dir = dirs_state();
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join("daemon.log"))?;
+    crate::state::private_dir(&log_dir)?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(log_dir.join("daemon.log"))?;
+    log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("daemon").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     unsafe {
