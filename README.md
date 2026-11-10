@@ -588,3 +588,6 @@ Third-party Rust dependency licenses and copyright notices are collected in
 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). Release archives also include the build
 toolchain’s Rust standard-library notices. Regenerate dependency notices after lockfile changes
 with `python3 tools/third-party-notices.py`; CI checks they stay current.
+
+Dependency advisories, licenses and sources are checked in CI and weekly using cargo-deny.
+Dependabot proposes Cargo and GitHub Actions updates. See [CONTRIBUTING.md](CONTRIBUTING.md).

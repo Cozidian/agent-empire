@@ -47,7 +47,9 @@ separate setting; enabling the documentation workflow does not change it.
 
 Old pull-request refs and cached commit views can survive a history rewrite. Follow
 [GitHub's sensitive-data removal guidance](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
-and resolve those retained surfaces before making the existing repository public. An edited
+and evaluate those retained surfaces before making the existing repository public. For this
+release, the owner explicitly chose to proceed after branch cleanup without a Support purge.
+Retained PR references and edit history have not been certified erased. An edited
 issue may also retain its prior body in edit history; replacing visible text alone is not a
 complete deletion of that history.
 

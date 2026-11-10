@@ -44,3 +44,9 @@ For documentation images, see [the capture recipe](docs/images/README.md).
 
 Keep credentials, local agent state, model transcripts and real project screenshots out of commits.
 Report security problems using [SECURITY.md](SECURITY.md).
+
+Dependency advisories, licenses and registry sources are checked on every CI run and weekly
+with cargo-deny 0.20.2 (`cargo deny --locked check advisories licenses sources`). Policy lives
+in `deny.toml`. Dependabot proposes weekly Cargo and GitHub Actions updates; review changes
+and regenerate third-party notices before merging lockfile updates. The optional Git-pinned
+Harness² runtime is reviewed separately; Cargo checks do not cover it.

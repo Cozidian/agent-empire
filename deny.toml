@@ -1,0 +1,12 @@
+# Both supported release targets; do not silently exempt vulnerable dependencies.
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "Unicode-3.0"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

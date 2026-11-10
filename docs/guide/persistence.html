@@ -23,3 +23,7 @@ empire research        # standalone Research Station</code></pre>
 <p>Processes running as you are inside the trust boundary. Empire does not sandbox them or replace agent permissions. Do not expose its socket through a network proxy or share a Unix account with someone who should not control your fleet.</p>
 <p>Saved tasks, screenshots and model traces can contain confidential source or pasted credentials. Native CLIs contact their configured model providers. Review saved data before sharing it, including screenshots used in bug reports.</p>
 <p>See the repository's <a href="https://github.com/Cozidian/agent-empire/blob/main/SECURITY.md">security policy</a> for reporting a vulnerability.</p>
+
+<h2 id="agent-hooks">Agent integration files</h2>
+<p>Claude launches receive Empire hooks and a status-line command through their launch settings. Empire does not rewrite your Claude settings file. Its status-line bridge forwards input to your configured command from <code>$CLAUDE_CONFIG_DIR/settings.json</code> (default <code>~/.claude/settings.json</code>), running it through <code>sh -c</code>.</p>
+<p>Grok integration writes <code>$GROK_HOME/hooks/empire.json</code> (default <code>~/.grok/hooks/empire.json</code>) without modifying other hook files. It contains the Empire executable path and hook configuration, not mission transcripts. The hooks do nothing for sessions Empire did not launch.</p>

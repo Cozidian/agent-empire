@@ -10,6 +10,9 @@ permissions:
   contents: read
 
 jobs:
+  dependencies:
+    uses: ./.github/workflows/dependencies.yml
+
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
