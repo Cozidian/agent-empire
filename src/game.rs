@@ -14,7 +14,7 @@ use crate::sound::{Cue, Sound};
 use crate::screenshots::{self, Attachment};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::{cursor, execute, style, terminal};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -1918,6 +1918,11 @@ impl App {
 fn key_bytes(k: &KeyEvent) -> Option<String> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
+    // preserve shifted Enter for the agent's multiline prompt instead of submitting it
+    if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::SHIFT) {
+        let mods = 2 + if alt { 2 } else { 0 } + if ctrl { 4 } else { 0 };
+        return Some(format!("\x1b[13;{mods}u"));
+    }
     let s = match k.code {
         KeyCode::Char(c) if ctrl => {
             let b = (c.to_ascii_lowercase() as u8) & 0x1f;
@@ -2479,7 +2484,8 @@ pub fn run() -> io::Result<()> {
 
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
-    execute!(out, terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture, EnableBracketedPaste, terminal::Clear(terminal::ClearType::All))?;
+    execute!(out, terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture, EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES), terminal::Clear(terminal::ClearType::All))?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore();
@@ -2492,7 +2498,7 @@ pub fn run() -> io::Result<()> {
 
 fn restore() {
     let mut o = io::stdout();
-    let _ = execute!(o, DisableBracketedPaste, DisableMouseCapture, style::ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
+    let _ = execute!(o, PopKeyboardEnhancementFlags, DisableBracketedPaste, DisableMouseCapture, style::ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
 }
 
@@ -4929,6 +4935,37 @@ mod multiline_tests {
     use super::*;
 
     #[test]
+    fn task_species_arrows_match_vertical_keys() {
+        let mut app = App::new();
+        app.kinds = vec!["claude".into(), "codex".into()];
+        let w = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        for cols in [40, 80, 140] {
+            let mut fb = Fb::new(cols, 30);
+            let l = Lay::new(&fb, false);
+            app.mode = Mode::Brief { planet: "/world".into(), text: Line::default(), kind: 0, launch: true, attachments: vec![], sending: false };
+            handle(&mut app, &w, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), 1.0, &mut None);
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let rows: Vec<String> = fb.txt.chunks(cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+            let row = rows.iter().find(|r| r.contains("species")).unwrap();
+            assert!(row.contains("↑ codex ↓"), "{cols} cols: |{row}|");
+        }
+    }
+
+    #[test]
+    fn agent_enter_preserves_newline_shortcuts() {
+        for (code, mods, bytes) in [
+            (KeyCode::Enter, KeyModifiers::NONE, "\r"),
+            (KeyCode::Enter, KeyModifiers::SHIFT, "\x1b[13;2u"),
+            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT, "\x1b[13;4u"),
+            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::CONTROL, "\x1b[13;6u"),
+            (KeyCode::Enter, KeyModifiers::ALT, "\x1b\r"),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL, "\n"),
+        ] {
+            assert_eq!(key_bytes(&KeyEvent::new(code, mods)).as_deref(), Some(bytes));
+        }
+    }
+
+    #[test]
     fn mission_text_moves_between_lines_keeping_the_column() {
         let mut text = Line::default();
         text.paste_lines("first line\r\nab\n\tthird");
@@ -5931,5 +5968,46 @@ mod research_tests {
         let mut fb = Fb::new(140, 48); draw::frame(&mut fb, &mut app, &w, &l, 0.0, None);
         let text: String = fb.txt.iter().map(|c| c.as_ref().map_or(' ', |c| c.ch)).collect();
         assert!(text.contains("RESEARCH STATION"));
+    }
+}
+
+#[cfg(test)]
+mod release_images {
+    use super::*;
+
+    /// Render fictional projects through the real UI, without a daemon or saved user state.
+    #[test]
+    #[ignore = "writes documentation captures; run explicitly with EMPIRE_CAPTURE_DIR"]
+    fn capture_release_images() {
+        let dir = PathBuf::from(std::env::var("EMPIRE_CAPTURE_DIR").expect("set EMPIRE_CAPTURE_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new();
+        app.online = true; app.loaded = true; app.panel = false;
+        app.kinds = vec!["claude".into(), "codex".into(), "grok".into()];
+        app.projects = ["/demo/observatory", "/demo/star-chart", "/demo/flight-deck"].map(String::from).to_vec();
+        for (i, (kind, status, title)) in [
+            ("claude", Status::Working, "Build the observation timeline"),
+            ("codex", Status::Done, "Chart labels are ready to review"),
+            ("grok", Status::Working, "Test the launch checklist"),
+        ].into_iter().enumerate() {
+            let mut a = ship_card_tests::ship(i as u32 + 1, false);
+            a.cwd = app.projects[i].clone(); a.kind = kind.into(); a.status = status; a.title = title.into();
+            app.survey.worlds.insert(a.cwd.clone(), survey::World { git: true, branch: "main".into(), lang: "Rust".into(), ..Default::default() });
+            app.agents.push(a);
+        }
+        let world = app.world(12.0, 0.0);
+        let mut fb = Fb::new(140, 44);
+        let l = Lay::new(&fb, false);
+        app.sel = Some(Sel::Planet(app.projects[0].clone()));
+        app.fit(&world, &l);
+        let system = world.systems.iter().find(|s| s.name == "demo").unwrap();
+        (app.cam.x, app.cam.y, app.cam.z) = (system.wpos.0, system.wpos.1, 0.75);
+        app.sel = None;
+        for name in ["galaxy", "workspace"] {
+            if name == "workspace" { app.mode = Mode::Workspace { key: app.projects[0].clone(), sel: 0 }; }
+            draw::frame(&mut fb, &mut app, &world, &l, 12.0, None);
+            let mut file = std::fs::File::create(dir.join(format!("{name}.ansi"))).unwrap();
+            Out::new(fb.cols * fb.rows).present(&fb, &mut file).unwrap();
+        }
     }
 }

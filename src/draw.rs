@@ -1846,12 +1846,12 @@ fn centered(l: &Lay, w: i32, h: i32) -> (i32, i32, i32, i32) {
     ((l.cols - w) / 2, (l.rows - h) / 2, w, h)
 }
 
-fn species(fb: &mut Fb, app: &App, x: i32, y: i32, kind: usize) {
+fn species(fb: &mut Fb, app: &App, x: i32, y: i32, kind: usize, vertical: bool) {
     let k = app.kinds.get(kind).map_or("?", String::as_str);
     let mut c = seg(fb, x, y, "species   ", 10, DIM, Some(BOX));
-    c = seg(fb, c, y, "◀ ", 2, DIM, Some(BOX));
+    c = seg(fb, c, y, if vertical { "↑ " } else { "◀ " }, 2, DIM, Some(BOX));
     c = seg(fb, c, y, k, 16, kind_color(k), Some(BOX));
-    seg(fb, c, y, " ▶", 2, DIM, Some(BOX));
+    seg(fb, c, y, if vertical { " ↓" } else { " ▶" }, 2, DIM, Some(BOX));
 }
 
 fn colonize(fb: &mut Fb, _app: &App, c: &Colonize, l: &Lay, t: f32) {
@@ -1904,7 +1904,7 @@ fn deploy(fb: &mut Fb, app: &App, planet: &str, kind: usize, l: &Lay) {
     let accent = v3(0.45, 0.85, 1.0);
     frame_box(fb, x, y, w, h, &format!("◆ HOME → {}", base_name(planet).to_uppercase()), accent);
     seg(fb, x + 3, y + 2, &trunc(&tilde(planet), (w - 6) as usize), w - 6, DIM, Some(BOX));
-    species(fb, app, x + 3, y + 4, kind);
+    species(fb, app, x + 3, y + 4, kind, false);
     seg(fb, x + 3, y + h - 2, "⏎ deploy · ←→ species · esc cancel", w - 6, DIM, Some(BOX));
 }
 
@@ -2399,7 +2399,7 @@ pub fn brief_hit(l: &Lay, text: &Line, images: usize, ships: usize, c: i32, r: i
     }
 }
 
-/// What Advisor suggests for the mission, under its text.
+/// A task for the next available ship or a new launch.
 
 #[allow(clippy::too_many_arguments)]
 fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch: bool, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
@@ -2413,7 +2413,7 @@ fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch:
     }
     seg(fb, x + 3, r, if launch { "○ Next available agent on this planet" } else { "● Next available agent on this planet" }, w - 6, if launch { DIM } else { TEXT }, Some(BOX));
     seg(fb, x + 3, r + 1, if launch { "● Launch from Home" } else { "○ Launch from Home" }, w - 6, if launch { TEXT } else { DIM }, Some(BOX));
-    if launch { species(fb, app, x + 5, r + 2, kind); }
+    if launch { species(fb, app, x + 5, r + 2, kind, true); }
     let queue = app.missions.iter().filter(|m| m.cwd == planet && m.state == "queued").count();
     seg(fb, x + 3, r + 3, &format!("{queue} queued · working agents finish before taking another task"), w - 6, DIM, Some(BOX));
     seg(fb, x + 3, y + h - 3, "Ctrl+V image · Ctrl+O attach path · Ctrl+X remove image", w - 6, DIM, Some(BOX));
