@@ -15,3 +15,11 @@
 <p>Use a shell to run your checks, inspect the changes and decide what to commit. Multiple agents may share a folder, so consider separate worktrees when tasks need independent branches.</p>
 <h2 id="dismiss-a-session">Dismiss a session</h2>
 <p>Select an agent or terminal and press <kbd>x</kbd>. Empire asks before closing it. To leave the view while keeping the session, use <kbd>F12</kbd> or <kbd>Ctrl</kbd>+<kbd>]</kbd> instead.</p>
+
+<h2 id="pulse">Optional ship pulse</h2>
+<p><code>EMPIRE_ADVISOR_PULSE=1</code> can mark a working ship as looping (↻) or erroring (✖?).
+After 90 seconds of work it checks changed output at most once a minute. With advisor
+configuration it sends up to 2,000 characters from the last 25 nonblank screen lines and a
+300-character task excerpt, with common secret patterns removed. Without configuration, or on
+a failed request, a local repeated-line check stands in after two minutes. Badges expire after
+five minutes or when work stops. They never interrupt the ship or send it instructions.</p>

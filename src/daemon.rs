@@ -166,6 +166,11 @@ struct Agent {
     /// The last thing it was asked to do, and what's being typed to it now.
     task: String,
     typed: String,
+    /// What it looks to be doing (transient, with when that was read), the last time Advisor was
+    /// asked, and a hash of the screen it was shown: it's asked again only once that has changed.
+    pulse: Option<(Pulse, Instant)>,
+    pulse_asked: Option<Instant>,
+    pulse_screen: u64,
     role: Role,
     /// Its own orders and skills, from the design it was launched from.
     spec: ShipSpec,
@@ -435,6 +440,7 @@ impl Agent {
             role: self.role.name().into(),
             design: self.spec.design.clone(),
             status: self.status.name().into(),
+            pulse: self.pulse.as_ref().filter(|(_, at)| self.status == Status::Working && now.saturating_duration_since(*at) < PULSE_LIFE).map(|(p, _)| p.clone()),
             age: (now - self.since).as_secs_f32(),
             turns: self.turns,
             report: self.report.clone(),
@@ -635,6 +641,9 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         worked_at: None,
         task: String::new(),
         typed: String::new(),
+        pulse: None,
+        pulse_asked: None,
+        pulse_screen: 0,
         role: Role::None,
         spec: ShipSpec::default(),
         refit: None,
@@ -1277,6 +1286,161 @@ fn relaunch(hub: &Shared, id: u32, role: Role, spec: &ShipSpec) -> Result<String
 }
 
 // ─────────────────────────────── stations ───────────────────────────────
+
+// ───────────────────────── a ship's pulse ─────────────────────────
+
+/// Set to 1 to split Working into finer states: Advisor reads the last lines of a ship's screen now
+/// and then and says whether it looks to be looping or erroring. It only ever adds an amber badge.
+/// Needs `PROVIDER_API_KEY`; with the flag but no key, or when Advisor fails, a repeat check on the
+/// screen stands in. THE SCREEN TEXT (secrets blanked first) IS SENT TO PROVIDER.
+const PULSE_FLAG: &str = "EMPIRE_ADVISOR_PULSE";
+/// A ship is asked about once it has been Working this long...
+const PULSE_AFTER: Duration = Duration::from_secs(90);
+/// ...and then at most this often, and only if its screen has changed since.
+const PULSE_EVERY: Duration = Duration::from_secs(60);
+/// A reading is dropped after this, if the ship hasn't been read again.
+const PULSE_LIFE: Duration = Duration::from_secs(300);
+/// The repeat check only speaks after this long Working, once this share of lines repeat.
+const PULSE_REPEAT_AFTER: Duration = Duration::from_secs(120);
+const PULSE_REPEAT: f32 = 0.4;
+const PULSE_LINES: usize = 25;
+const PULSE_CHARS: usize = 2000;
+const PULSE_LABELS: [&str; 4] = ["progressing", "looping", "erroring", "waiting_on_tool"];
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PulseMode {
+    Off,
+    /// Flag on, no key: the repeat check only.
+    Repeats,
+    Advisor,
+}
+
+fn pulse_mode_of(flag: bool, key: bool) -> PulseMode {
+    match (flag, key) {
+        (false, _) => PulseMode::Off,
+        (true, false) => PulseMode::Repeats,
+        (true, true) => PulseMode::Advisor,
+    }
+}
+
+fn pulse_mode() -> PulseMode {
+    let flag = std::env::var(PULSE_FLAG).ok();
+    pulse_mode_of(advisor::enabled_with(Some("x"), flag.as_deref()), advisor::enabled(PULSE_FLAG))
+}
+
+/// Whether a ship is due a reading: Working (not Blocked, Done or a terminal) for 90 s, a minute
+/// since the last one, and a screen that has moved since then.
+fn pulse_due(kind: &str, status: Status, working: Duration, since_ask: Option<Duration>, changed: bool) -> bool {
+    kind != "shell" && status == Status::Working && working >= PULSE_AFTER && since_ask.is_none_or(|s| s >= PULSE_EVERY) && changed
+}
+
+/// The last ~25 lines of the screen, blanks dropped.
+fn pulse_lines(screen: &str) -> Vec<&str> {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(PULSE_LINES)..].to_vec()
+}
+
+/// The text Advisor sees: those lines, secrets blanked, at most 2000 chars from the end.
+fn pulse_screen(screen: &str) -> String {
+    crate::redact::tail(&crate::redact::redact(&pulse_lines(screen).join("\n")), PULSE_CHARS)
+}
+
+fn pulse_req(kind: &str, working: Duration, silent: Duration, task: &str, screen: &str) -> serde_json::Value {
+    let state = serde_json::json!({
+        "species": kind,
+        "working_for_s": working.as_secs(),
+        "silent_for_s": silent.as_secs(),
+        "task": crate::redact::clip(&crate::redact::redact(task), 300),
+        "screen": screen,
+    });
+    advisor::request(state, vec![("pulse", advisor::choice_q(
+        "This is an AI coding agent that has been working on `task` for `working_for_s` seconds; `screen` is the end of its terminal. What is it doing right now? Answer progressing unless the screen clearly shows otherwise.",
+        &[
+            ("progressing", "it is making headway: reading, editing, running things, or writing a reply, with new output that differs from before"),
+            ("looping", "it repeats the same steps, commands or output without getting anywhere"),
+            ("erroring", "it keeps hitting errors or failing commands and is not recovering"),
+            ("waiting_on_tool", "it is waiting for a long-running command, build, download or tool to finish"),
+        ],
+    ))])
+}
+
+fn read_pulse(v: &serde_json::Value) -> Option<Pulse> {
+    let c = advisor::choice(v, "pulse", &PULSE_LABELS)?;
+    Some(Pulse { label: c.label, conf: c.confidence })
+}
+
+/// The stand-in for Advisor: a screen where 40% or more of the lines repeat one seen earlier on it
+/// (ignoring rules and bare punctuation), for a ship that has been Working over 2 minutes, looks
+/// like a loop. A loop cycles a few steps, so it is repeats that count, not one single line.
+/// Needs at least 10 lines to judge by.
+fn pulse_repeats(screen: &str, working: Duration) -> Option<Pulse> {
+    if working <= PULSE_REPEAT_AFTER {
+        return None;
+    }
+    let lines: Vec<&str> = pulse_lines(screen).into_iter().map(str::trim).filter(|l| l.chars().filter(|c| c.is_alphanumeric()).count() >= 3).collect();
+    if lines.len() < 10 {
+        return None;
+    }
+    let unique: HashSet<&str> = lines.iter().copied().collect();
+    let repeated = lines.len() - unique.len();
+    (repeated as f32 / lines.len() as f32 >= PULSE_REPEAT).then(|| Pulse { label: "looping".into(), conf: 0.6 })
+}
+
+/// Only one pulse request is in flight at a time.
+static PULSE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep a Working ship's pulse up to date: drop it when the ship stops Working or it has gone
+/// stale, and read the ship again when it is due.
+fn pulse_tick(a: &Arc<Mutex<Agent>>, g: &mut Agent, now: Instant, mode: PulseMode) {
+    if mode == PulseMode::Off {
+        return;
+    }
+    if g.status != Status::Working || g.pulse.as_ref().is_some_and(|(_, at)| now - *at >= PULSE_LIFE) {
+        g.pulse = None;
+    }
+    if g.status != Status::Working {
+        g.pulse_asked = None;
+        return;
+    }
+    let Some(started) = g.worked_at else { return };
+    let (working, since_ask) = (now - started, g.pulse_asked.map(|t| now - t));
+    // cheap checks first; the screen is only read once a ship is due
+    if !pulse_due(&g.kind, g.status, working, since_ask, true) {
+        return;
+    }
+    let screen = g.parser.screen().contents();
+    let hash = advisor::digest(&serde_json::json!(screen));
+    if !pulse_due(&g.kind, g.status, working, since_ask, hash != g.pulse_screen) {
+        return;
+    }
+    if mode == PulseMode::Repeats {
+        g.pulse = pulse_repeats(&screen, working).map(|p| (p, now));
+        (g.pulse_asked, g.pulse_screen) = (Some(now), hash);
+        return;
+    }
+    let req = pulse_req(&g.kind, working, now - g.last_out, &g.task, &pulse_screen(&screen));
+    let (a, turn) = (a.clone(), started);
+    let sent = {
+        use std::sync::atomic::Ordering::SeqCst;
+        !PULSE_BUSY.swap(true, SeqCst)
+    };
+    if !sent {
+        return; // another ship's request is in flight; this one is still due next tick
+    }
+    (g.pulse_asked, g.pulse_screen) = (Some(now), hash);
+    thread::spawn(move || {
+        let answer = advisor::post(&req).ok();
+        PULSE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut g = a.lock().unwrap();
+        // the same turn, still Working: otherwise the ship has moved on from what was read
+        if g.status != Status::Working || g.worked_at != Some(turn) {
+            return;
+        }
+        let at = Instant::now();
+        let read = answer.as_ref().and_then(read_pulse).or_else(|| pulse_repeats(&screen, at - turn));
+        g.pulse = read.map(|p| (p, at));
+    });
+}
 
 fn git(dir: &str, args: &[&str]) -> Result<String, String> {
     let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| e.to_string())?;
@@ -2052,6 +2216,7 @@ pub fn run() -> io::Result<()> {
             for (id, a) in list {
                 let mut g = a.lock().unwrap();
                 g.update(now);
+                pulse_tick(&a, &mut g, now, pulse_mode());
                 if g.status != g.told {
                     g.told = g.status;
                     let long = g.worked_at.is_some_and(|w| now - w > Duration::from_secs(DESKTOP_TURN));
@@ -2992,6 +3157,184 @@ mod refit_tests {
         back.lock().unwrap().writer.kill();
         STAND_IN.with(|s| *s.borrow_mut() = None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pulse_tests {
+    use super::*;
+
+    fn ship(kind: &str, status: Status, worked: u64) -> Arc<Mutex<Agent>> {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let mut a = new_agent(1, kind, "/w", Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80);
+        a.status = status;
+        a.worked_at = Some(Instant::now() - Duration::from_secs(worked));
+        Arc::new(Mutex::new(a))
+    }
+
+    fn s(n: u64) -> Duration { Duration::from_secs(n) }
+
+    const LOOP: &str = "Running cargo test\r\nerror[E0425]: cannot find value `x`\r\nRetrying the same fix\r\nRunning cargo test\r\nerror[E0425]: cannot find value `x`\r\nRetrying the same fix\r\nRunning cargo test\r\nerror[E0425]: cannot find value `x`\r\nRetrying the same fix\r\nRunning cargo test\r\nerror[E0425]: cannot find value `x`\r\nRetrying the same fix\r\n";
+
+    fn varied(n: usize) -> String { (0..n).map(|i| format!("Editing file number {i} now\r\n")).collect() }
+
+    #[test]
+    fn it_runs_only_with_its_flag_and_works_without_a_key() {
+        assert_eq!(pulse_mode_of(false, true), PulseMode::Off);
+        assert_eq!(pulse_mode_of(true, false), PulseMode::Repeats);
+        assert_eq!(pulse_mode_of(true, true), PulseMode::Advisor);
+        let a = ship("claude", Status::Working, 600);
+        a.lock().unwrap().parser.process(LOOP.as_bytes());
+        pulse_tick(&a, &mut a.lock().unwrap(), Instant::now(), PulseMode::Off);
+        assert!(a.lock().unwrap().pulse.is_none() && a.lock().unwrap().pulse_asked.is_none());
+    }
+
+    #[test]
+    fn a_ship_is_due_after_90_s_working_a_minute_apart_and_a_changed_screen() {
+        let due = |kind, status, working, ask: Option<u64>, changed| pulse_due(kind, status, s(working), ask.map(s), changed);
+        assert!(due("claude", Status::Working, 90, None, true));
+        assert!(due("claude", Status::Working, 400, Some(60), true));
+        assert!(!due("claude", Status::Working, 89, None, true));
+        assert!(!due("claude", Status::Working, 400, Some(59), true));
+        assert!(!due("claude", Status::Working, 400, None, false), "an unchanged screen is not worth another ask");
+        for status in [Status::Blocked, Status::Done, Status::Idle, Status::Booting, Status::Exited] {
+            assert!(!due("claude", status, 400, None, true), "{status:?}");
+        }
+        assert!(!due("shell", Status::Working, 400, None, true));
+    }
+
+    #[test]
+    fn the_request_sends_the_end_of_the_screen_with_secrets_blanked() {
+        let mut screen: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        screen.push_str("export OPENAI_API_KEY=sk-abcdefghijklmnop\ncurl -H 'Authorization: Bearer abc.def.ghi' https://x\ntoken ghp_ABCDEFGH12345678 and github_pat_11ABCDEFG0123456789_x\n");
+        let text = pulse_screen(&screen);
+        assert!(!text.contains("abcdefghijklmnop") && !text.contains("abc.def.ghi") && !text.contains("ABCDEFGH12345678") && !text.contains("11ABCDEFG"), "{text}");
+        assert_eq!(text.lines().count(), 25);
+        assert!(!text.contains("line 0\n") && text.contains("line 39"));
+        let big = "word ".repeat(1000);
+        assert_eq!(pulse_screen(&big).chars().count(), 2000);
+        let r = pulse_req("claude", s(125), s(7), &format!("fix it, Bearer secrettoken123 {}", "x".repeat(400)), &text);
+        assert_eq!(r["model"], advisor::model());
+        assert_eq!(r["state"]["species"], "claude");
+        assert_eq!((r["state"]["working_for_s"].as_u64(), r["state"]["silent_for_s"].as_u64()), (Some(125), Some(7)));
+        assert_eq!(r["state"]["task"].as_str().unwrap().chars().count(), 300);
+        assert!(!r.to_string().contains("secrettoken123"));
+        assert_eq!(r["state"]["screen"], text.as_str());
+        assert_eq!(r["state"].as_object().unwrap().len(), 5);
+        assert_eq!(r["questions"]["pulse"]["type"], "choice");
+        let labels: HashSet<_> = r["questions"]["pulse"]["criteria"].as_object().unwrap().keys().cloned().collect();
+        assert_eq!(labels, PULSE_LABELS.iter().map(|l| l.to_string()).collect());
+    }
+
+    #[test]
+    fn answers_are_read_strictly() {
+        let ok = |label: &str, conf: f64| serde_json::json!({ "answers": { "pulse": { "type": "choice", "choice": label, "confidence": conf, "probabilities": { label: 0.9 } } } });
+        assert_eq!(read_pulse(&ok("looping", 0.8)), Some(Pulse { label: "looping".into(), conf: 0.8 }));
+        assert_eq!(read_pulse(&ok("waiting_on_tool", 0.3)).map(|p| p.label), Some("waiting_on_tool".into()));
+        assert_eq!(read_pulse(&ok("sleeping", 0.8)), None);
+        assert_eq!(read_pulse(&serde_json::json!({ "answers": { "pulse": { "type": "noul", "noul": 0.9 } } })), None);
+        assert_eq!(read_pulse(&serde_json::json!({ "answers": { "pulse": { "type": "choice", "choice": "looping" } } })), None);
+        assert_eq!(read_pulse(&serde_json::json!({ "answers": {} })), None);
+    }
+
+    #[test]
+    fn the_repeat_check_needs_40_percent_repeated_lines_and_two_minutes() {
+        assert_eq!(pulse_repeats(LOOP, s(121)).map(|p| p.label), Some("looping".into()));
+        assert_eq!(pulse_repeats(LOOP, s(120)), None, "not yet");
+        assert_eq!(pulse_repeats(&varied(30), s(600)), None);
+        // 10 of 25 lines repeating an earlier one is exactly 40%
+        let edge: String = (0..14).map(|i| format!("Editing file number {i}\n")).chain((0..11).map(|_| "Waiting for the lock\n".to_string())).collect();
+        assert!(pulse_repeats(&edge, s(300)).is_some());
+        let under: String = (0..15).map(|i| format!("Editing file number {i}\n")).chain((0..10).map(|_| "Waiting for the lock\n".to_string())).collect();
+        assert!(pulse_repeats(&under, s(300)).is_none());
+        // rules, braces and blank lines don't make a loop; a short screen is not judged
+        let rules: String = (0..30).map(|_| "────────\n}\n\n").collect();
+        assert!(pulse_repeats(&rules, s(600)).is_none());
+        assert!(pulse_repeats("same line here\nsame line here\nsame line here\n", s(600)).is_none());
+    }
+
+    #[test]
+    fn without_a_key_a_looping_ship_is_flagged_once_due_and_unflagged_when_it_moves() {
+        let a = ship("claude", Status::Working, 300);
+        a.lock().unwrap().parser.process(LOOP.as_bytes());
+        let now = Instant::now();
+        pulse_tick(&a, &mut a.lock().unwrap(), now, PulseMode::Repeats);
+        let v = a.lock().unwrap().view(now);
+        assert_eq!(v.pulse.as_ref().and_then(|p| p.warn()), Some(("↻", "looping")));
+        // a minute on with new output: read again
+        a.lock().unwrap().parser.process(varied(60).as_bytes());
+        pulse_tick(&a, &mut a.lock().unwrap(), now + s(30), PulseMode::Repeats);
+        assert!(a.lock().unwrap().pulse.is_some(), "not asked again inside a minute");
+        pulse_tick(&a, &mut a.lock().unwrap(), now + s(61), PulseMode::Repeats);
+        assert!(a.lock().unwrap().pulse.is_none());
+    }
+
+    #[test]
+    fn a_reading_expires_after_five_minutes_and_when_the_ship_stops_working() {
+        let a = ship("claude", Status::Working, 300);
+        let now = Instant::now();
+        a.lock().unwrap().pulse = Some((Pulse { label: "looping".into(), conf: 0.9 }, now));
+        assert!(a.lock().unwrap().view(now).pulse.is_some());
+        assert!(a.lock().unwrap().view(now + s(299)).pulse.is_some());
+        assert!(a.lock().unwrap().view(now + s(301)).pulse.is_none());
+        for status in [Status::Blocked, Status::Done, Status::Idle] {
+            a.lock().unwrap().status = status;
+            assert!(a.lock().unwrap().view(now).pulse.is_none(), "{status:?}");
+        }
+        a.lock().unwrap().status = Status::Done;
+        pulse_tick(&a, &mut a.lock().unwrap(), now, PulseMode::Repeats);
+        assert!(a.lock().unwrap().pulse.is_none(), "forgotten for good once it has left Working");
+    }
+
+    #[test]
+    fn blocked_done_and_terminal_ships_are_never_read() {
+        for (kind, status) in [("claude", Status::Blocked), ("claude", Status::Done), ("shell", Status::Working)] {
+            let a = ship(kind, status, 600);
+            a.lock().unwrap().parser.process(LOOP.as_bytes());
+            pulse_tick(&a, &mut a.lock().unwrap(), Instant::now(), PulseMode::Repeats);
+            assert!(a.lock().unwrap().pulse.is_none() && a.lock().unwrap().pulse_asked.is_none(), "{kind} {status:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_advisor_call_falls_back_to_the_repeat_check() {
+        if std::env::var_os("PROVIDER_API_KEY").is_some() {
+            return; // a real key in the environment would make this a live call
+        }
+        let a = ship("claude", Status::Working, 300);
+        a.lock().unwrap().parser.process(LOOP.as_bytes());
+        pulse_tick(&a, &mut a.lock().unwrap(), Instant::now(), PulseMode::Advisor);
+        assert!(a.lock().unwrap().pulse_asked.is_some());
+        for _ in 0..300 {
+            if a.lock().unwrap().pulse.is_some() { break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(a.lock().unwrap().pulse.as_ref().map(|(p, _)| p.label.as_str()), Some("looping"));
+        // and no second ask while the screen hasn't changed or a minute hasn't passed
+        let asked = a.lock().unwrap().pulse_asked;
+        pulse_tick(&a, &mut a.lock().unwrap(), Instant::now(), PulseMode::Advisor);
+        assert_eq!(a.lock().unwrap().pulse_asked, asked);
+    }
+
+    #[test]
+    fn views_from_an_older_daemon_have_no_pulse() {
+        let v: AgentView = serde_json::from_str(r#"{"id":1,"kind":"claude","cwd":"/w","title":"","status":"working","age":0.5}"#).unwrap();
+        assert!(v.pulse.is_none());
+        let mut v = v;
+        v.pulse = Some(Pulse { label: "erroring".into(), conf: 0.7 });
+        let back: AgentView = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back.pulse, v.pulse);
+    }
+
+    #[test]
+    fn only_looping_or_erroring_at_half_confidence_is_ever_shown() {
+        let w = |l: &str, c: f32| Pulse { label: l.into(), conf: c }.warn();
+        assert_eq!(w("looping", 0.5), Some(("↻", "looping")));
+        assert_eq!(w("erroring", 0.5), Some(("✖?", "erroring")));
+        assert_eq!(w("looping", 0.49), None);
+        assert_eq!(w("progressing", 1.0), None);
+        assert_eq!(w("waiting_on_tool", 1.0), None);
+        assert_eq!(w("healthy", 1.0), None);
     }
 }
 

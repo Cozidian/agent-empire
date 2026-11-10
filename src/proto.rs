@@ -126,6 +126,9 @@ pub struct AgentView {
     /// Turns finished since launch.
     #[serde(default)]
     pub turns: u32,
+    /// What a Working ship looks to be doing, when Advisor (or the repeat check) has a view; transient.
+    #[serde(default)]
+    pub pulse: Option<Pulse>,
     #[serde(default)]
     pub report: Report,
     /// The question it's waiting on, when blocked.
@@ -221,6 +224,34 @@ pub struct ShipSpec {
 impl ShipSpec {
     /// Nothing of its own to tell the ship.
     pub fn is_bare(&self) -> bool { self.orders.trim().is_empty() && self.skills.is_empty() }
+}
+
+/// A finer reading of a Working ship: `progressing | looping | erroring | waiting_on_tool`, and
+/// how sure. Only looping and erroring, from `Pulse::SHOW` up, are ever shown.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Pulse {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub conf: f32,
+}
+
+impl Pulse {
+    /// The least confidence that's worth a badge.
+    pub const SHOW: f32 = 0.5;
+
+    /// The badge glyph and a word for it; progressing, waiting on a tool, unknown labels and
+    /// shaky guesses show nothing.
+    pub fn warn(&self) -> Option<(&'static str, &'static str)> {
+        if self.conf < Self::SHOW {
+            return None;
+        }
+        match self.label.as_str() {
+            "looping" => Some(("↻", "looping")),
+            "erroring" => Some(("✖?", "erroring")),
+            _ => None,
+        }
+    }
 }
 
 /// Another ship on the same world doing what looks like the same work, and how likely (0..1).

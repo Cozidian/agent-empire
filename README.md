@@ -211,6 +211,18 @@ Tasks go to one available agent in the exact project folder. **L** on the galaxy
 planet's task history. A finished agent turn means **ready to check**; it does not mean that
 implementation or testing succeeded. You remain in charge of testing, committing and pushing.
 
+**Ship pulse (optional, automatic).** With `EMPIRE_ADVISOR_PULSE=1`, a ship that has been Working for
+90 seconds or more is read again about once a minute, if its screen has changed: the configured advisor says whether it looks to be progressing, looping, erroring or waiting on
+a tool. Only looping (an amber `↻`) and erroring (`✖?`) at 0.5 confidence or more are shown, in the
+outliner and as a `pulse` row on the ship card; they go when the ship stops Working or after five
+minutes. Blocked and done ships and terminals are never read. Nothing is asked of you or done for
+you. A low score shows nothing. With the flag but no advisor configuration (or if Advisor
+fails), a ship that has been Working over two minutes and whose screen has 40% or more repeated
+lines is marked looping. **This sends the last ~25 lines of the ship's terminal (up to 2,000
+characters, with common token and assignment patterns removed) and up to 300 characters of its task
+to the configured service. Redaction cannot detect every secret.** `PROVIDER_DEFAULT_MODEL` and `PROVIDER_BASE_URL` override the model (`advisor-1.14.0`)
+and endpoint.
+
 ## Attention and discoveries
 
 Ships and planets highlight agents needing an answer or ready for you to check. **Tab** on the
