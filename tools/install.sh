@@ -60,6 +60,19 @@ installed_version=$("$tmp/empire" --version) || die 'Cannot run this binary. Che
 [[ "$installed_version" == "empire $release_version" ]] || die 'Binary version does not match the archive'
 mkdir -p -- "$bin_dir"
 [[ ! -d "$bin_dir/empire" ]] || die "$bin_dir/empire is a directory"
+# Keep attribution beside the installed command. The original v0.1.0 archives predate these files.
+tar -tzf "$tmp/$archive" > "$tmp/members"
+for notice in LICENSE THIRD-PARTY-NOTICES.txt RUST-THIRD-PARTY-NOTICES.html; do
+    if grep -Fxq "$notice" "$tmp/members"; then
+        tar -xOzf "$tmp/$archive" "$notice" > "$tmp/$notice"
+        staged=$(mktemp "$bin_dir/.empire-install.XXXXXX")
+        install -m 644 "$tmp/$notice" "$staged"
+        mv -fT -- "$staged" "$bin_dir/empire.$notice"
+        staged=
+    elif [[ "$release_version" != 0.1.0 ]]; then
+        die "Archive is missing $notice"
+    fi
+done
 # Rename a new inode so a running daemon keeps its existing executable until the next launch.
 staged=$(mktemp "$bin_dir/.empire-install.XXXXXX")
 install -m 755 "$tmp/empire" "$staged"

@@ -68,7 +68,8 @@ Update `docs/release-notes.md` for each release, including its pinned install co
    ```
 
 `Release fleet` runs Fleet checks, builds and tests natively on Ubuntu 22.04 for x86-64 and
-ARM64, strips the binaries, packages the license and manual, and exercises the installer.
+ARM64, strips the binaries, packages the license, manual, dependency notices and Rust standard-library
+attributions, and exercises the installer.
 Only after both builds succeed does it create the GitHub Release with two archives,
 `install.sh` and `SHA256SUMS`. The tag must match the package version. Repository write permission
 is confined to the publishing job. Published assets are not overwritten on a rerun.
@@ -82,3 +83,8 @@ runner, so no source checkout is needed. Agent CLIs, Git, optional `gh`, and the
 runtime are installed separately. The installer uses an atomic rename and does not start,
 stop or upgrade the running daemon. Private releases require authenticated access; making a
 release does not make the repository public.
+
+After dependency updates, run `python3 tools/third-party-notices.py` and review the resulting
+`THIRD-PARTY-NOTICES.txt`. CI and packaging reject stale notices or dependencies without license
+texts. Install the Rust documentation component (`rustup component add rust-docs`) if packaging
+reports a missing `COPYRIGHT-library.html`; this file supplies the build toolchain’s attributions.

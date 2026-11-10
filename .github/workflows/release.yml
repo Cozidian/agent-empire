@@ -43,7 +43,7 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - name: Select stable Rust
-        run: rustup update stable && rustup default stable
+        run: rustup update stable && rustup default stable && rustup component add rust-docs
       - run: cargo test --locked
       - run: cargo build --release --locked
       - name: Package and test the installer

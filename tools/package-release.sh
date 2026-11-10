@@ -12,7 +12,10 @@ trap 'rm -rf "$stage"' EXIT
 install -m 755 "$binary" "$stage/empire"
 strip "$stage/empire"
 install -m 644 LICENSE README.md "$stage/"
+python3 tools/third-party-notices.py --check
+install -m 644 THIRD-PARTY-NOTICES.txt "$stage/"
+install -m 644 "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" "$stage/RUST-THIRD-PARTY-NOTICES.html"
 printf '%s\n' "$version" > "$stage/VERSION"
 mkdir -p dist
-tar -czf "dist/empire-linux-$arch.tar.gz" -C "$stage" empire LICENSE README.md VERSION
+tar -czf "dist/empire-linux-$arch.tar.gz" -C "$stage" empire LICENSE README.md VERSION THIRD-PARTY-NOTICES.txt RUST-THIRD-PARTY-NOTICES.html
 install -m 755 tools/install.sh dist/install.sh

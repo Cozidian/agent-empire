@@ -13,7 +13,7 @@ bash /tmp/empire-install.sh
 <pre><code>mkdir empire-release
 gh release download --repo Cozidian/agent-empire --dir empire-release
 bash empire-release/install.sh --from-dir empire-release</code></pre>
-<p>Run the installer again to update. It does not stop agents. Opening the new build reconnects and updates the daemon. <code>empire upgrade</code> switches the daemon to your installed build; it does not download a release. Remove the installed binary to uninstall the command; local state remains.</p>
+<p>Run the installer again to update. It does not stop agents. Opening the new build reconnects and updates the daemon. <code>empire upgrade</code> switches the daemon to your installed build; it does not download a release. License notices are kept beside the binary as <code>empire.LICENSE</code>, <code>empire.THIRD-PARTY-NOTICES.txt</code> and <code>empire.RUST-THIRD-PARTY-NOTICES.html</code>. Remove the binary and these notice files to uninstall; local state remains.</p>
 <h2 id="build-and-launch">Build from source</h2>
 <p>Use a recent stable Rust toolchain. On Debian/Ubuntu install <code>build-essential pkg-config libasound2-dev git</code>; on Arch install <code>base-devel alsa-lib git</code>. The <a href="github.html">GitHub station</a> additionally needs an authenticated <code>gh</code> CLI.</p>
 <pre><code>git clone https://github.com/Cozidian/agent-empire.git

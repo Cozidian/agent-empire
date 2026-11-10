@@ -27,6 +27,8 @@ jobs:
         run: |
           bash -n tools/install.sh tools/package-release.sh
           python3 tools/test-install.py
+          python3 tools/third-party-notices.py --check
+          python3 tools/test-third-party.py
 
   research:
     runs-on: ubuntu-24.04

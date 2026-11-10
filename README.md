@@ -49,7 +49,8 @@ bash /tmp/empire-install.sh
 ```
 
 The installer selects your architecture, verifies the archive's SHA-256 checksum and installs
-into `~/.local/bin`. Add that directory to `PATH` to use `empire` from any terminal. Use
+into `~/.local/bin`. It also keeps license notices beside the command as
+`empire.LICENSE`, `empire.THIRD-PARTY-NOTICES.txt` and `empire.RUST-THIRD-PARTY-NOTICES.html`. Add that directory to `PATH` to use `empire` from any terminal. Use
 `--version v0.1.0` for a specific release or `--bin-dir /your/bin` for another location. Run it
 again to update; it replaces the command without stopping your agents. `empire upgrade` switches
 a running daemon to the installed build—it does not download updates.
@@ -582,3 +583,8 @@ It never sends the mission; press Enter when you are ready.
 command details, nearby context and choices to the configured advisor after removing common
 secret patterns. Recognized destructive commands and credential requests get a local “needs you”
 label without a network request. Labels never approve anything or change native permissions.
+
+Third-party Rust dependency licenses and copyright notices are collected in
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). Release archives also include the build
+toolchain’s Rust standard-library notices. Regenerate dependency notices after lockfile changes
+with `python3 tools/third-party-notices.py`; CI checks they stay current.

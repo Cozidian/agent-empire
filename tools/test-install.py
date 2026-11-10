@@ -23,7 +23,9 @@ class InstallTests(unittest.TestCase):
         self.dest = self.root / "bin with spaces"
         self.archive = self.assets / f"empire-linux-{platform.machine()}.tar.gz"
         with tarfile.open(self.archive, "w:gz") as tar:
-            for name, data in [("empire", b'#!/bin/sh\nprintf "empire 0.1.0\\n"\n'), ("VERSION", b"0.1.0\n")]:
+            for name, data in [("empire", b'#!/bin/sh\nprintf "empire 0.1.0\\n"\n'), ("VERSION", b"0.1.0\n"),
+                               ("LICENSE", b"Empire license\n"), ("THIRD-PARTY-NOTICES.txt", b"Dependency attribution\n"),
+                               ("RUST-THIRD-PARTY-NOTICES.html", b"Rust attribution\n")]:
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
                 info.mode = 0o755 if name == "empire" else 0o644
@@ -48,6 +50,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(subprocess.check_output([binary, "--version"], text=True).strip(), "empire 0.1.0")
         self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
         self.assertFalse(list(self.dest.glob(".empire-install.*")))
+        self.assertEqual((self.dest / "empire.THIRD-PARTY-NOTICES.txt").read_text(), "Dependency attribution\n")
+        self.assertEqual((self.dest / "empire.RUST-THIRD-PARTY-NOTICES.html").read_text(), "Rust attribution\n")
 
     def test_replace_symlink_without_writing_to_checkout(self):
         self.dest.mkdir()
