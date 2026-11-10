@@ -1,0 +1,89 @@
+name: Release fleet
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$REF_TYPE" == tag ]]; then test "$RELEASE_TAG" = "v$version"; fi
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Select stable Rust
+        run: rustup update stable && rustup default stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package and test the installer
+        run: |
+          bash tools/package-release.sh
+          (cd dist && sha256sum empire-*.tar.gz install.sh > SHA256SUMS)
+          bash tools/install.sh --from-dir dist --bin-dir "$RUNNER_TEMP/empire-bin"
+          "$RUNNER_TEMP/empire-bin/empire" --version
+          python3 tools/test-install.py
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: empire-${{ matrix.arch }}
+          path: dist/empire-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: empire-*
+          merge-multiple: true
+          path: dist
+      - name: Publish the tagged build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test -f dist/empire-linux-x86_64.tar.gz
+          test -f dist/empire-linux-aarch64.tar.gz
+          cp tools/install.sh dist/install.sh
+          (cd dist && sha256sum empire-*.tar.gz install.sh > SHA256SUMS)
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Empire $RELEASE_TAG" --notes-file docs/release-notes.md

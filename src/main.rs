@@ -39,12 +39,14 @@ const HELP: &str = "empire — a galaxy of coding agents
   empire sounds    play every sound cue once
   empire research  open the Research Station (setup installs Harness2)
   empire graphics  offline graphics comparison (Space compares classic/polished)
+  empire --version print the installed version without starting the daemon
   empire anomaly WORLD TITLE EVIDENCE [SOURCE]
                    record a finding without starting the daemon";
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("--version") | Some("-V") => { println!("empire {}", env!("CARGO_PKG_VERSION")); Ok(()) }
         Some("research") => research::cli(&args[1..]),
         Some("graphics") => graphics::run(&args[1..]),
         Some("campaign-report") => Err(io::Error::other("Campaigns have been retired; continue in the project terminal")),

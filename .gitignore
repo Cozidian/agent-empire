@@ -13,3 +13,4 @@
 *.key
 __pycache__/
 *.py[cod]
+dist/

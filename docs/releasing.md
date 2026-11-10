@@ -20,8 +20,9 @@ not remove earlier copies. Closing an issue does not hide its contents.
   and inspect the documentation images. CI must pass on GitHub after the prepared changes are pushed.
 - Enable private vulnerability reporting, available secret scanning/push protection, and branch
   protection in the repository settings. Check that the reporting link in SECURITY.md works.
-- Review the final diff and public-facing metadata before changing visibility. No workflow here
-  changes visibility, publishes a package, or uploads release binaries automatically.
+- Review the final diff and public-facing metadata before changing visibility. The release workflow
+  publishes binary archives when a version tag is pushed; no workflow changes repository visibility
+  or publishes to crates.io.
 
 Example local scan with Gitleaks installed:
 
@@ -49,3 +50,35 @@ Old pull-request refs and cached commit views can survive a history rewrite. Fol
 and resolve those retained surfaces before making the existing repository public. An edited
 issue may also retain its prior body in edit history; replacing visible text alone is not a
 complete deletion of that history.
+
+## Version tags and binary releases
+
+Use stable tags of the form `vMAJOR.MINOR.PATCH`, matching `Cargo.toml` and the root package in
+`Cargo.lock`. Do not move a released tag or replace its assets: bump the version for a correction.
+Update `docs/release-notes.md` for each release, including its pinned install command.
+
+1. Update the package version and lockfile, release notes, README and guide as needed.
+2. Run tests, `python3 tools/test-install.py` and `python3 tools/build-docs.py`.
+3. Commit and push the release preparation to `main`; check Fleet checks passes.
+4. Tag that reviewed commit and push just the tag:
+
+   ```sh
+   git tag -a v0.1.0 -m 'Launch Empire v0.1.0'
+   git push origin v0.1.0
+   ```
+
+`Release fleet` runs Fleet checks, builds and tests natively on Ubuntu 22.04 for x86-64 and
+ARM64, strips the binaries, packages the license and manual, and exercises the installer.
+Only after both builds succeed does it create the GitHub Release with two archives,
+`install.sh` and `SHA256SUMS`. The tag must match the package version. Repository write permission
+is confined to the publishing job. Published assets are not overwritten on a rerun.
+
+A manual workflow run on `main` tests packaging and saves Actions artifacts without publishing
+or creating a tag. Run on an existing tag to retry a failed release. If publication left a draft,
+inspect its assets before completing or deleting that draft; do not retag a published version.
+
+The binaries require glibc 2.35+ and the ALSA shared library. They embed the Research Station
+runner, so no source checkout is needed. Agent CLIs, Git, optional `gh`, and the opt-in research
+runtime are installed separately. The installer uses an atomic rename and does not start,
+stop or upgrade the running daemon. Private releases require authenticated access; making a
+release does not make the repository public.

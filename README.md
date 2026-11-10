@@ -29,22 +29,48 @@ ready to review. Come back to the same fleet when you reopen your terminal.
 
 ## Get started
 
-Empire is early-stage software developed on **Linux**. It needs a recent stable Rust toolchain,
-a C toolchain, `pkg-config`, ALSA development headers, Git, and a true-color terminal. A font with
-Unicode 16 octant glyphs gives the intended graphics. Other operating systems are not currently
-supported. Audio is optional at runtime; the build still needs the ALSA headers.
+Empire runs on **Linux** with Git and a true-color terminal. A font with Unicode 16 octant glyphs
+gives the intended graphics. Install and authenticate your coding agents separately.
 
-On Debian/Ubuntu, install the native build packages:
+### Download a ready-to-run build
+
+[GitHub Releases](https://github.com/Cozidian/agent-empire/releases/latest) provide **x86-64 and
+ARM64 binaries**. No Rust toolchain or compiler is needed. They require glibc 2.35+ (Ubuntu 22.04+
+or a recent compatible distribution) and the ALSA runtime library, even when sound is muted.
+Install `libasound2` on Ubuntu 22.04, `libasound2t64` on Ubuntu 24.04, or `alsa-lib` on Arch.
+
+Download the installer, then run it:
 
 ```sh
-sudo apt install build-essential pkg-config libasound2-dev git
+curl -fL https://github.com/Cozidian/agent-empire/releases/latest/download/install.sh -o /tmp/empire-install.sh
+bash /tmp/empire-install.sh
+~/.local/bin/empire --version
+~/.local/bin/empire
 ```
 
-On Arch Linux:
+The installer selects your architecture, verifies the archive's SHA-256 checksum and installs
+into `~/.local/bin`. Add that directory to `PATH` to use `empire` from any terminal. Use
+`--version v0.1.0` for a specific release or `--bin-dir /your/bin` for another location. Run it
+again to update; it replaces the command without stopping your agents. `empire upgrade` switches
+a running daemon to the installed build—it does not download updates.
+
+While this repository is private, use an authenticated GitHub CLI instead of the public download:
 
 ```sh
-sudo pacman -S --needed base-devel alsa-lib git
+mkdir empire-release
+gh release download --repo Cozidian/agent-empire --dir empire-release
+bash empire-release/install.sh --from-dir empire-release
 ```
+
+For manual installation, verify the matching archive against `SHA256SUMS`, extract it and copy
+`empire` into a directory on your `PATH`. Removing that binary uninstalls the command; it leaves
+your local state intact. Alpine/musl, macOS and Windows binaries are not currently provided.
+
+### Build from source
+
+You need a recent stable Rust toolchain, a C toolchain, `pkg-config` and ALSA development headers.
+On Debian/Ubuntu: `sudo apt install build-essential pkg-config libasound2-dev git`.
+On Arch: `sudo pacman -S --needed base-devel alsa-lib git`.
 
 Install and authenticate at least one supported agent CLI (`claude`, `codex` or `grok`) separately.
 Empire uses the executables on your `PATH`; it does not include model access or an AI subscription.

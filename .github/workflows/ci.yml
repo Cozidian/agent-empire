@@ -4,6 +4,7 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -22,6 +23,10 @@ jobs:
         run: rustup update stable && rustup default stable
       - run: cargo test --locked
       - run: cargo build --release --locked
+      - name: Check release installer
+        run: |
+          bash -n tools/install.sh tools/package-release.sh
+          python3 tools/test-install.py
 
   research:
     runs-on: ubuntu-24.04
