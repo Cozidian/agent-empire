@@ -29,7 +29,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check release version
@@ -53,25 +53,54 @@ jobs:
           bash tools/install.sh --from-dir dist --bin-dir "$RUNNER_TEMP/empire-bin"
           "$RUNNER_TEMP/empire-bin/empire" --version
           python3 tools/test-install.py
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: empire-${{ matrix.arch }}
           path: dist/empire-*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
+  verify-artifacts:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: empire-*
+          merge-multiple: true
+          path: dist
+      - name: Verify downloaded release archives
+        run: |
+          python3 - <<'PYTHON'
+          import pathlib, tarfile, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          for arch in ('x86_64', 'aarch64'):
+              with tarfile.open(f'dist/empire-linux-{arch}.tar.gz') as archive:
+                  required = {'empire', 'VERSION', 'LICENSE', 'README.md', 'THIRD-PARTY-NOTICES.txt', 'RUST-THIRD-PARTY-NOTICES.html'}
+                  assert required <= set(archive.getnames()), f'{arch}: incomplete archive'
+                  for name in required:
+                      assert archive.getmember(name).isfile() and archive.getmember(name).size > 0, (arch, name)
+                  assert archive.extractfile('VERSION').read().decode().strip() == version
+                  assert archive.extractfile('THIRD-PARTY-NOTICES.txt').read() == pathlib.Path('THIRD-PARTY-NOTICES.txt').read_bytes()
+                  print(f'{arch}: downloaded binary, version and notices verified')
+          PYTHON
+
   publish:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: verify-artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: empire-*
           merge-multiple: true
