@@ -1,0 +1,24 @@
+<p class="lead">From an empty terminal to your first working ship.</p>
+<h2 id="before-you-start">Before you start</h2>
+<p>Empire is early-stage software developed for <strong>Linux</strong>. You need a recent stable Rust toolchain, a C toolchain, Git, <code>pkg-config</code>, and ALSA development headers. Use a true-color terminal; a font with Unicode 16 octant glyphs gives the intended graphics. Other operating systems are not currently supported.</p>
+<p>Install and authenticate an agent CLI separately: <code>claude</code>, <code>codex</code> or <code>grok</code>. Empire finds executables on your <code>PATH</code>. Model access and subscriptions are provided by those tools, not by Empire. You can explore projects and open ordinary shells without an agent installed.</p>
+<h3>Debian / Ubuntu</h3><pre><code>sudo apt install build-essential pkg-config libasound2-dev git</code></pre>
+<h3>Arch Linux</h3><pre><code>sudo pacman -S --needed base-devel alsa-lib git</code></pre>
+<p>Audio is optional when running Empire, but the build still needs the ALSA headers. The <a href="github.html">GitHub station</a> additionally needs an authenticated <code>gh</code> CLI.</p>
+<h2 id="build-and-launch">Build and launch</h2>
+<pre><code>git clone https://github.com/Cozidian/agent-empire.git
+cd agent-empire
+cargo build --release --locked
+./target/release/empire</code></pre>
+<p>To use <code>empire</code> from any terminal, run this from the repository root. Make sure <code>~/.local/bin</code> is on your <code>PATH</code>.</p>
+<pre><code>mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/target/release/empire" "$HOME/.local/bin/empire"</code></pre>
+<p>The link points at this checkout's release build. Keep the checkout in place; rebuilding updates the command too. If the link already exists, inspect it rather than overwriting another installation blindly.</p>
+<h2 id="chart-your-first-project">Chart your first project</h2>
+<ol><li>Press <kbd>V</kbd> to manage sectors and folders.</li><li>Press <kbd>n</kbd> and enter a parent folder such as <code>~/code</code>. <kbd>Tab</kbd> completes the path.</li><li>Empire discovers Git repositories beneath that folder and makes them planets. Add more roots the same way.</li><li>Return to the galaxy, select a planet, and press <kbd>Enter</kbd>.</li></ol>
+<p>For a single folder instead of a whole tree, press <kbd>n</kbd> on the galaxy. It does not have to be a Git repository. A missing folder is created only after a second <kbd>Enter</kbd>.</p>
+<h2 id="launch-and-return">Launch and return</h2>
+<p>In the project workspace, press <kbd>e</kbd>, choose an installed species, and launch. You are now in the agent's native terminal. Type a prompt as you normally would.</p>
+<figure><img src="images/workspace.png" width="1400" height="880" loading="lazy" alt="The observatory project workspace, with launch and task actions and a working Claude session"><figcaption>A project workspace keeps agents, ordinary terminals and project resources together.</figcaption></figure>
+<p><kbd>F12</kbd> or <kbd>Ctrl</kbd>+<kbd>]</kbd> returns to Empire. Press <kbd>b</kbd> in the project to open a separate shell for testing. When you are done looking around, return to the galaxy and press <kbd>q</kbd>.</p>
+<aside class="note"><strong>Close the UI, keep the fleet.</strong> Leaving the galaxy keeps agents and shell commands running. <code>empire stop</code> deliberately closes every session; it is not the normal quit command.</aside>

@@ -1,0 +1,12 @@
+<p class="lead">A station for the pull requests orbiting your projects.</p>
+<h2 id="connect-your-account">Connect your account</h2>
+<p>Install GitHub CLI and authenticate it with <code>gh auth login</code>. Empire uses that existing authentication for projects with GitHub remotes. It does not ask you to paste a token into the UI.</p>
+<p>Open the GitHub station for a fleet-wide overview. To see one repository, select its planet and press <kbd>p</kbd>, click its PR marker, or choose <strong>Pull requests</strong> in the project workspace. <kbd>Esc</kbd> returns to the view you came from.</p>
+<h2 id="read-the-signals">Read the signals</h2>
+<table><thead><tr><th>Marker</th><th>Meaning</th></tr></thead><tbody><tr><td>◇ PR N</td><td>Open PR count, including yours and other people's</td></tr><tr><td>!</td><td>One of your PRs has failing checks</td></tr><tr><td>↗</td><td>A non-draft PR requests your review</td></tr><tr><td>?</td><td>Unavailable or stale cached data</td></tr></tbody></table>
+<p>Failing checks take priority over review requests. A quiet blue marker means open PRs without either signal; passing checks do not establish that a PR is ready to merge. Worktrees share their parent project's count.</p>
+<p>The station refreshes up to 100 of your open PRs and 100 other open PRs per project every 150 seconds. Data older than 7½ minutes is marked stale. If GitHub is unavailable, you may still see cached results.</p>
+<h2 id="review-or-prepare-work">Review or prepare work</h2>
+<p><kbd>Tab</kbd> cycles between all PRs, reviews requested from you, and your PRs. <kbd>Enter</kbd> opens the selected PR in your browser.</p>
+<p><kbd>t</kbd> prepares an ordinary task for that PR's project. Depending on the PR, the brief asks an agent to review it, fix failing checks or address feedback. Review briefs ask for findings without posting them. Other briefs can include pushing changes, so inspect the exact instruction before sending.</p>
+<p>Use the native terminal to follow the task, then inspect its result in GitHub. Empire's station is a view of GitHub state, not an approval to merge or deploy.</p>

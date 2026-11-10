@@ -14,6 +14,7 @@ mod octant;
 mod proto;
 mod role;
 mod sector;
+mod severity;
 mod state;
 mod sound;
 mod structure;
