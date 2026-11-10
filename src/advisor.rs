@@ -1,4 +1,4 @@
-//! Advisor, Provider AI's typed-decision model, as an optional advisor.
+//! An optional advisor using a configured typed-decision API.
 //!
 //! Everything here is opt-in and fails closed: with no `PROVIDER_API_KEY`, a feature flag that
 //! is off, any error, an unknown answer type or a missing field, callers get `None`/`Err` and the
@@ -8,7 +8,7 @@
 //! body) on stdin, so the key never appears in argv. They run on a background thread.
 //!
 //! Env: `PROVIDER_API_KEY` (required), `PROVIDER_DEFAULT_MODEL` (default `advisor-1.14.0`),
-//! `PROVIDER_BASE_URL` (default `https://api.provider.ai`), `EMPIRE_ADVISOR_LOG=1` (record what Advisor
+//! `PROVIDER_BASE_URL` (required; a compatible typed-decision API), `EMPIRE_ADVISOR_LOG=1` (record what Advisor
 //! suggested next to what you chose, labels only, in the state dir).
 #![allow(dead_code)]
 
@@ -21,7 +21,6 @@ use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 pub const DEFAULT_MODEL: &str = "advisor-1.14.0";
-pub const DEFAULT_BASE: &str = "https://api.provider.ai";
 const PATH: &str = "/v1/advice";
 const TIMEOUT_SECS: &str = "10";
 /// A `retry-after` longer than this is not waited for.
@@ -50,7 +49,7 @@ pub fn enabled_with(key: Option<&str>, flag: Option<&str>) -> bool {
 
 /// Whether a feature may ask Advisor: a key is set and its own flag (e.g. `EMPIRE_ADVISOR_ROUTE`) is on.
 pub fn enabled(flag: &str) -> bool {
-    enabled_with(env("PROVIDER_API_KEY").as_deref(), env(flag).as_deref())
+    enabled_with(env("PROVIDER_API_KEY").as_deref(), env(flag).as_deref()) && endpoint(env("PROVIDER_BASE_URL").as_deref()).is_some()
 }
 
 pub fn model() -> String {
@@ -58,7 +57,7 @@ pub fn model() -> String {
 }
 
 fn endpoint(base: Option<&str>) -> Option<String> {
-    let base = base.unwrap_or(DEFAULT_BASE).trim_end_matches('/');
+    let base = base?.trim_end_matches('/');
     let ok = (base.starts_with("https://") || base.starts_with("http://")) && base.chars().all(|c| c.is_ascii_graphic() && c != '"' && c != '\\');
     ok.then(|| format!("{base}{PATH}"))
 }
@@ -228,7 +227,7 @@ fn config(url: &str, key: &str, body: &str) -> String {
 }
 
 /// curl's arguments. Nothing secret or request-specific: that all goes on stdin.
-const CURL_ARGS: [&str; 6] = ["-sS", "-i", "--max-time", TIMEOUT_SECS, "-K", "-"];
+const CURL_ARGS: [&str; 7] = ["-q", "-sS", "-i", "--max-time", TIMEOUT_SECS, "-K", "-"];
 
 fn post_once(url: &str, key: &str, body: &str) -> Result<(u16, Option<u64>, Vec<u8>), Error> {
     let mut child = Command::new("curl")
@@ -336,9 +335,9 @@ pub fn log(feature: &str, record: Value) {
 fn append_log(path: &std::path::Path, feature: &str, record: Value) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::state::private_dir(dir)?;
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     writeln!(f, "{}", json!({ "at": at, "feature": feature, "model": model(), "record": record }))
@@ -370,7 +369,7 @@ mod tests {
     #[test]
     fn model_is_pinned_and_endpoint_can_move() {
         assert_eq!(DEFAULT_MODEL, "advisor-1.14.0");
-        assert_eq!(endpoint(None).as_deref(), Some("https://api.provider.ai/v1/advice"));
+        assert_eq!(endpoint(None), None, "no default destination for private reports");
         assert_eq!(endpoint(Some("http://localhost:8080/")).as_deref(), Some("http://localhost:8080/v1/advice"));
         assert_eq!(endpoint(Some("file:///etc/passwd")), None);
         assert_eq!(endpoint(Some("https://x\"y")), None);

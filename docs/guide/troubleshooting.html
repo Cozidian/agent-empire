@@ -1,0 +1,26 @@
+<p class="lead">Start with the smallest check that explains the symptom.</p>
+<h2 id="build-fails">The build cannot find ALSA or pkg-config</h2>
+<p>Install the native packages listed in <a href="getting-started.html#before-you-start">the setup guide</a>. On Debian/Ubuntu the ALSA development package is <code>libasound2-dev</code>; on Arch it is <code>alsa-lib</code>. Use a recent stable Rust toolchain, then rerun <code>cargo build --release --locked</code>.</p>
+<h2 id="agent-is-missing">My agent is missing or cannot authenticate</h2>
+<p>Run its command in the same terminal environment you use to launch Empire. Confirm it is installed on <code>PATH</code> and complete its native login flow. Empire does not install agent CLIs or supply provider credentials. Reopen the UI after installing a CLI.</p>
+<h2 id="projects-are-missing">My project does not appear</h2>
+<p>Use <kbd>V</kbd> to check configured roots. A root discovers repositories beneath it, but does not descend inside another repository, follow symlink directories or search hidden directories. Add an unusual folder directly with <kbd>n</kbd> on the galaxy.</p>
+<p>Press uppercase <kbd>R</kbd> on Home to rescan. If you previously removed a project from the map, add its folder again to restore it. Removing a root does not delete project files.</p>
+<h2 id="worktree-is-missing">A worktree or its agent has not moved</h2>
+<p>Check <code>git worktree list</code> in the main project. Empire surveys the registry about every eight seconds while the galaxy is open. The checkout must exist and must not be explicitly hidden.</p>
+<p>Seeing a station and moving a ship are separate observations. The ship follows recorded command working directories or native hook reports. Ask it to execute in the worktree; merely mentioning the path, using <code>git -C</code>, or changing directories inside a shell may not report a new native directory. Older Codex logs may lack the necessary records.</p>
+<h2 id="newline-and-return">Shift+Enter submits, or Escape does not leave</h2>
+<p>In a native agent terminal, the terminal emulator must distinguish <kbd>Shift</kbd>+<kbd>Enter</kbd>, and the agent must support it as a newline shortcut. Reopen Empire after updating it. If the terminal cannot report it separately, try the agent's <kbd>Alt</kbd>+<kbd>Enter</kbd> or <kbd>Ctrl</kbd>+<kbd>J</kbd> binding.</p>
+<p>In Empire's task composer, all three bindings insert a newline. <kbd>Esc</kbd> cancels that composer. Inside a native terminal, <kbd>Esc</kbd> goes to the agent; <kbd>F12</kbd> or <kbd>Ctrl</kbd>+<kbd>]</kbd> returns to Empire.</p>
+<h2 id="graphics-and-audio">Graphics look broken, or there is no sound</h2>
+<p>Use a true-color terminal and a font with Unicode 16 octant glyphs. Missing glyphs can appear as empty boxes. Run <code>empire graphics</code> for an offline comparison; <kbd>Space</kbd> switches renderers, <kbd>p</kbd> pauses rotation and <kbd>q</kbd> leaves.</p>
+<p>In the galaxy, check the separate <kbd>m</kbd> alert and <kbd>M</kbd> music toggles. <code>empire sounds</code> previews cues and reports when no audio device is available.</p>
+<h2 id="github-is-stale">GitHub signals are missing or stale</h2>
+<p>Run <code>gh auth status</code> and verify that the project has a GitHub remote. A <strong>?</strong> marker means unavailable or cached data. The normal refresh interval is 150 seconds, and data older than 7½ minutes is marked stale. Passing CI alone does not remove a PR from the list.</p>
+<h2 id="daemon-problems">The daemon is offline or cannot start</h2>
+<p>Run <code>empire status</code> and inspect <code>~/.local/state/empire/daemon.log</code>, or the equivalent under your <code>XDG_STATE_HOME</code>. Check that your state directory belongs to your user and is not a symlink.</p>
+<p>If you set <code>EMPIRE_SOCK</code>, check its parent directory and use the same value in every command. Empire refuses to replace another user's socket or a regular file at the socket path. Investigate the path instead of deleting an unfamiliar file.</p>
+<aside class="note"><strong>Protect active work.</strong> Avoid stopping the daemon while diagnosing a UI problem: <code>empire stop</code> closes every running session. Capture the error and inspect the log first.</aside>
+<h2 id="report-a-bug">Report a reproducible bug</h2>
+<p>Include your Empire commit, Linux distribution, terminal and font, the affected agent CLI version, the steps taken, and expected versus actual behavior. Use a fictional project or redact private paths and prompts in screenshots.</p>
+<p>For a public bug, use <a href="https://github.com/Cozidian/agent-empire/issues">GitHub issues</a>. For security problems, follow <a href="https://github.com/Cozidian/agent-empire/blob/main/SECURITY.md">SECURITY.md</a> instead of posting exploit details.</p>

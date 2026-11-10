@@ -137,6 +137,9 @@ pub struct AgentView {
     /// Border conflicts: other agents on this world editing the same files.
     #[serde(default)]
     pub war: Vec<War>,
+    /// Working ships on this world whose tasks look like the same job (not a file conflict, which is `war`).
+    #[serde(default)]
+    pub overlap: Vec<Overlap>,
     /// The design it was launched from, by name ("" for none).
     #[serde(default)]
     pub design: String,
@@ -149,6 +152,46 @@ pub struct AgentView {
     /// The command a shell session runs instead of the shell (an editor on a file); empty for none.
     #[serde(default)]
     pub run: Vec<String>,
+    /// How Advisor reads the turn it just finished, when it has; only for a Done ship, and transient.
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
+}
+
+/// How a finished turn looks: `completed | partial | failed | needs_review`, and how sure.
+/// Only a warning (failed, partial or needs_review, at `Outcome::SHOW` or more) is ever shown.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Outcome {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub conf: f32,
+}
+
+/// What to say about a turn that doesn't look done.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Warn {
+    pub glyph: &'static str,
+    /// "Looks failed", "Partly done", "Needs review".
+    pub text: &'static str,
+    pub red: bool,
+}
+
+impl Outcome {
+    /// The least confidence that's worth a badge.
+    pub const SHOW: f32 = 0.4;
+
+    /// The warning to show, if any. A completed turn, an unknown label or a shaky guess shows nothing.
+    pub fn warn(&self) -> Option<Warn> {
+        if self.conf < Self::SHOW {
+            return None;
+        }
+        match self.label.as_str() {
+            "failed" => Some(Warn { glyph: "✖", text: "Looks failed", red: true }),
+            "partial" => Some(Warn { glyph: "◐", text: "Partly done", red: false }),
+            "needs_review" => Some(Warn { glyph: "?", text: "Needs review", red: false }),
+            _ => None,
+        }
+    }
 }
 
 /// A refit ordered for a deployed ship: the outfit it's to get, and where that stands.
@@ -211,6 +254,19 @@ impl Pulse {
     }
 }
 
+/// Another ship on the same world doing what looks like the same work, and how likely (0..1).
+/// Only shown from `Overlap::SHOW` up.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Overlap {
+    pub rival: u32,
+    pub p: f32,
+}
+
+impl Overlap {
+    /// A Noul at or above this counts as a yes.
+    pub const SHOW: f32 = 0.7;
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct War {
     pub rival: u32,
@@ -242,6 +298,10 @@ pub struct Mission {
     #[serde(default)]
     pub campaign: Option<CampaignRef>,
     #[serde(default)] pub campaign_job: String,
+    /// How the turn that finished it looked, if Advisor or the keyword scan could tell.
+    /// `#[serde(default)]` keeps older `missions.json` files loading: a mismatch wipes the log.
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
 }
 
 /// A question read off an agent's screen, answerable from the galaxy.
@@ -254,6 +314,30 @@ pub struct Ask {
     /// What's being asked for, between the question and its choices (Codex's `$ command`, a reason).
     #[serde(default)]
     pub detail: Vec<String>,
+    /// Advisor's risk read on this approval. Advice for the player to see; nothing acts on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskView>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum RiskLevel {
+    Calm,
+    Care,
+    NeedsYou,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RiskView {
+    /// Advisor's risk label (`edit_in_project`, …), or `needs_you` when the denylist forced it.
+    pub label: String,
+    pub probability: f32,
+    pub level: RiskLevel,
+    /// Advisor's probability that it touches something outside the project or can't be undone.
+    #[serde(default)]
+    pub outside: Option<f32>,
+    /// Why, when the denylist decided.
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -340,6 +424,41 @@ pub fn socket_path() -> PathBuf {
     dir.join(format!("empire-{}.sock", unsafe { libc::getuid() }))
 }
 
+/// Only processes running as this player may control the fleet.
+pub fn same_user(s: &UnixStream) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        if unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        require_user(cred.uid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = s; Err(io::Error::new(io::ErrorKind::Unsupported, "daemon peer authentication currently requires Linux")) }
+}
+
+#[cfg(target_os = "linux")]
+fn require_user(uid: libc::uid_t) -> io::Result<()> {
+    if uid == unsafe { libc::geteuid() } { return Ok(()); }
+    Err(io::Error::new(io::ErrorKind::PermissionDenied, "daemon peer belongs to another user"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod peer_tests {
+    use super::*;
+
+    #[test]
+    fn fleet_connections_require_the_players_uid() {
+        let (a, b) = UnixStream::pair().unwrap();
+        same_user(&a).unwrap(); same_user(&b).unwrap();
+        let other = unsafe { libc::geteuid() }.wrapping_add(1);
+        assert_eq!(require_user(other).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+}
+
 /// A persistent connection to the daemon.
 pub struct Conn {
     rd: BufReader<UnixStream>,
@@ -349,6 +468,7 @@ pub struct Conn {
 impl Conn {
     pub fn open() -> io::Result<Self> {
         let s = UnixStream::connect(socket_path())?;
+        same_user(&s)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         Ok(Self { rd: BufReader::new(s.try_clone()?), wr: s })
     }

@@ -8,13 +8,13 @@ use crate::draw;
 use crate::gfx::*;
 use crate::role::Role;
 use crate::structure::{Built, KINDS, Kind};
-use crate::proto::{AgentView, Ask, Mission, Pulse, RefitState, Report, ScreenView, ShipSpec, War};
+use crate::proto::{AgentView, Ask, Mission, Outcome, Overlap, Pulse, RefitState, Report, ScreenView, ShipSpec, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crate::screenshots::{self, Attachment};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::{cursor, execute, style, terminal};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -190,6 +190,8 @@ pub struct Agent {
     pub report: Report,
     pub ask: Option<Ask>,
     pub war: Vec<War>,
+    /// Working ships on its world doing what looks like the same job.
+    pub overlap: Vec<Overlap>,
     pub role: Role,
     /// The design it was launched from, by name ("" for none).
     pub design: String,
@@ -202,6 +204,8 @@ pub struct Agent {
     pub front: bool,
     /// The command a terminal session runs instead of the shell: an editor on a file.
     pub run: Vec<String>,
+    /// How its last finished turn looked, when Advisor (or the keyword scan) could tell.
+    pub outcome: Option<Outcome>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -642,6 +646,8 @@ pub struct App {
     pub sectors: crate::sector::Book,
     pub sector_focus: Option<u64>,
     pub anomalies: crate::anomaly::Book,
+    /// Fills in report severities in the background when Advisor is on.
+    pub severity: crate::severity::Scorer,
     pub anomaly_filter: crate::anomaly::Filter,
     pub anomaly_detail: usize,
     pub anomaly_error: String,
@@ -658,6 +664,8 @@ pub struct App {
     pub commander_detail: usize,
     commander_return: bool,
     pub kinds: Vec<String>,
+    /// Advisor's suggestion for the mission being written (off unless enabled).
+    pub route: crate::route::Route,
     pub screen: Option<(u32, ScreenView)>,
     pub panel: bool,
     pub bg: Vec<V3>,
@@ -934,6 +942,7 @@ impl App {
             sectors: Default::default(),
             sector_focus: None,
             anomalies: Default::default(),
+            severity: crate::severity::Scorer::new(),
             anomaly_filter: Default::default(),
             anomaly_detail: 0,
             anomaly_error: String::new(),
@@ -948,6 +957,7 @@ impl App {
             editor: None,
             rescan: Vec::new(),
             kinds: detect_kinds(),
+            route: crate::route::Route::new(),
             screen: None,
             panel: true,
             bg: Vec::new(),
@@ -1008,7 +1018,12 @@ impl App {
             v.push(Need { badge: format!("○{queued}"), label: format!("{queued} mission{} queued with no one here to take {}: press e to send a ship", if queued == 1 { "" } else { "s" }, if queued == 1 { "it" } else { "them" }), col: AMBER, act: None });
         }
         for a in here.iter().filter(|a| a.status == Status::Done) {
-            v.push(Need { badge: "✔".into(), label: format!("{} finished{}: take a look", a.kind, if a.title.is_empty() { String::new() } else { format!(" ({})", clip(&a.title, 30)) }), col: Status::Done.color(), act: Some(Act::Comms(a.id)) });
+            let title = if a.title.is_empty() { String::new() } else { format!(" ({})", clip(&a.title, 30)) };
+            // a turn that looks failed or half done says so; one that looks fine reads as it always did
+            match a.outcome.as_ref().and_then(Outcome::warn) {
+                Some(w) => v.push(Need { badge: w.glyph.into(), label: format!("{} finished{title}, {}: take a look", a.kind, w.text.to_lowercase()), col: warn_color(w.red), act: Some(Act::Comms(a.id)) }),
+                None => v.push(Need { badge: "✔".into(), label: format!("{} finished{title}: take a look", a.kind), col: Status::Done.color(), act: Some(Act::Comms(a.id)) }),
+            }
         }
         v
     }
@@ -1303,6 +1318,7 @@ impl App {
                 a.pulse = v.pulse.clone();
                 a.report = v.report.clone();
                 a.ask = v.ask.clone();
+                a.outcome = v.outcome.clone();
                 // what's aboard can change under a refit; say how one ended
                 let was = a.refit.as_ref().map(|r| r.state.clone());
                 (a.role, a.design, a.spec, a.refit) = (Role::parse(&v.role), v.design.clone(), v.spec.clone(), v.refit.clone());
@@ -1337,6 +1353,7 @@ impl App {
                 }
                 let a = &mut self.agents[i];
                 a.war = v.war.clone();
+                a.overlap = v.overlap.clone();
                 if !title.is_empty() {
                     a.title = title;
                 }
@@ -1367,6 +1384,7 @@ impl App {
                     report: v.report.clone(),
                     ask: v.ask.clone(),
                     war: v.war.clone(),
+                    overlap: v.overlap.clone(),
                     role: Role::parse(&v.role),
                     design: v.design.clone(),
                     spec: v.spec.clone(),
@@ -1374,6 +1392,7 @@ impl App {
                     wpos: (0.0, 0.0),
                     front: true,
                     run: v.run.clone(),
+                    outcome: v.outcome.clone(),
                 });
             }
         }
@@ -1419,6 +1438,25 @@ impl App {
             }
             (_, Status::Working) => self.fx.push(ring(to.color(), 20.0)),
             _ => {}
+        }
+    }
+
+    /// Advisor's pick for the mission being written: preselects the species, nothing more.
+    fn route_step(&mut self) {
+        if !self.route.enabled { return; }
+        let input = match &self.mode {
+            Mode::Brief { planet, text, .. } => crate::route::Input::new(&base_name(planet), &text.s, &self.kinds),
+            _ => None,
+        };
+        let open = matches!(self.mode, Mode::Brief { .. });
+        if let Some(i) = self.route.step(Instant::now(), open, input.as_ref(), crate::route::ask) {
+            // the composer lists every installed species; Advisor's list is the known ones among them
+            let name = input.as_ref().map(|inp| inp.kinds[i].clone());
+            if let (Some(name), Mode::Brief { kind, .. }) = (name, &mut self.mode)
+                && let Some(at) = self.kinds.iter().position(|k| *k == name)
+            {
+                *kind = at;
+            }
         }
     }
 
@@ -1919,6 +1957,11 @@ impl App {
 fn key_bytes(k: &KeyEvent) -> Option<String> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
+    // preserve shifted Enter for the agent's multiline prompt instead of submitting it
+    if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::SHIFT) {
+        let mods = 2 + if alt { 2 } else { 0 } + if ctrl { 4 } else { 0 };
+        return Some(format!("\x1b[13;{mods}u"));
+    }
     let s = match k.code {
         KeyCode::Char(c) if ctrl => {
             let b = (c.to_ascii_lowercase() as u8) & 0x1f;
@@ -1989,7 +2032,17 @@ impl App {
                 detail.push_str(&format!("\n{}\n{}", q.context.join("\n"), q.question));
                 for o in &q.options { detail.push_str(&format!("\n{}: {}", o.key, o.label)); }
             }
-            rows.push(Attention { id: format!("agent:{}", a.id), world: a.cwd.clone(), kind: if waiting { "Input" } else { "Finished" }, title, detail, target: AttentionTarget::Agent(a.id), rank: if waiting { 0 } else { 5 } });
+            // a finished turn that looks failed or half done comes up before the ordinary finished ones
+            let warn = a.outcome.as_ref().and_then(Outcome::warn).filter(|_| !waiting);
+            let (kind, rank) = match (waiting, warn) {
+                (true, _) => ("Input", 0),
+                (_, Some(w)) if w.red => ("Failed?", 2),
+                (_, Some(w)) if w.text == "Partly done" => ("Partial?", 3),
+                (_, Some(_)) => ("Review?", 3),
+                _ => ("Finished", 5),
+            };
+            if let Some(w) = warn { detail.push_str(&format!("\n{}", w.text)); }
+            rows.push(Attention { id: format!("agent:{}", a.id), world: a.cwd.clone(), kind, title, detail, target: AttentionTarget::Agent(a.id), rank });
         }
         for p in &w.planets {
             let here: Vec<_> = self.agents.iter().filter(|a| a.cwd == p.key && a.kind != "shell" && a.dying.is_none()).collect();
@@ -2013,7 +2066,7 @@ impl App {
             }
         }
         for f in self.anomalies.findings.iter().filter(|f| f.state == crate::anomaly::State::Open && f.kind != "CI") {
-            rows.push(Attention { id: format!("anomaly:{}", f.id), world: f.world.clone(), kind: "Anomaly", title: f.title.clone(), detail: f.evidence.clone(), target: AttentionTarget::Anomaly(f.id), rank: 4 });
+            rows.push(Attention { id: format!("anomaly:{}", f.id), world: f.world.clone(), kind: "Anomaly", title: f.title.clone(), detail: f.evidence.clone(), target: AttentionTarget::Anomaly(f.id), rank: f.rank() });
         }
         rows.sort_by(|a, b| (a.rank, &a.world, &a.id).cmp(&(b.rank, &b.world, &b.id)));
         rows
@@ -2045,6 +2098,15 @@ impl App {
                 if self.anomaly_error != msg { self.say(Ev::Error, msg.clone(), RED); }
                 self.anomaly_error = msg;
             }
+        }
+    }
+
+    /// Reports get a severity from Advisor, a couple at a time, without waiting on it.
+    fn score_reports(&mut self) {
+        if !self.severity.enabled { return; }
+        let scores = self.severity.step(&self.anomalies.findings, crate::severity::ask_advisor);
+        if !scores.is_empty() {
+            self.edit_anomalies(|book| crate::severity::apply(book, &scores));
         }
     }
 
@@ -2307,6 +2369,9 @@ impl ShipAct {
 
 const AMBER: V3 = v3(1.0, 0.75, 0.3);
 
+/// The colour of a warning badge: red when it looks failed, else amber. Never green.
+pub fn warn_color(red: bool) -> V3 { if red { RED } else { AMBER } }
+
 /// What a refit is to put aboard, by design name or role.
 pub fn refit_name(r: &RefitState) -> String {
     if !r.spec.design.is_empty() { r.spec.design.clone() } else { Role::parse(&r.role).label().to_string() }
@@ -2471,7 +2536,8 @@ pub fn run() -> io::Result<()> {
 
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
-    execute!(out, terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture, EnableBracketedPaste, terminal::Clear(terminal::ClearType::All))?;
+    execute!(out, terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture, EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES), terminal::Clear(terminal::ClearType::All))?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore();
@@ -2484,7 +2550,7 @@ pub fn run() -> io::Result<()> {
 
 fn restore() {
     let mut o = io::stdout();
-    let _ = execute!(o, DisableBracketedPaste, DisableMouseCapture, style::ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
+    let _ = execute!(o, PopKeyboardEnhancementFlags, DisableBracketedPaste, DisableMouseCapture, style::ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
 }
 
@@ -2525,6 +2591,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
         if let Some(rx) = &app.discovering && let Ok(projects) = rx.try_recv() {
             app.sectors = app.workspace.sectors(&projects); app.projects = projects; app.discovering = None; app.fitted = false;
         }
+        app.route_step();
         let mut cues = Vec::new();
         for m in std::mem::take(&mut pending).into_iter().chain(client.rx.try_iter()) {
             match m {
@@ -2660,6 +2727,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             }
             surveyed = Instant::now();
         }
+        app.score_reports();
         // quitting the editor hands you straight back to the file
         if app.editor_quit() {
             app.close_comms(client, &world);
@@ -3518,11 +3586,13 @@ fn handle(
                     let up = k.code == KeyCode::Up;
                     if !text.vertical(up) {
                         *kind = if up { (*kind + nk - 1) % nk } else { (*kind + 1) % nk };
+                        app.route.touched = true;
                     }
                 }
                 KeyCode::Tab | KeyCode::BackTab => { *launch = !*launch; }
                 KeyCode::Enter if !text.s.trim().is_empty() || !attachments.is_empty() => {
                     let prompt = if text.s.trim().is_empty() { "Review the attached screenshots." } else { text.s.trim() };
+                    app.route.record(&app.kinds[*kind]);
                     let cmd = Cmd::Mission { cwd: planet.clone(), text: prompt.to_string(), kind: app.kinds[*kind].clone(), launch: *launch, attachments: attachments.clone(), draft: true, role: String::new(), to: None, campaign: None, spec: ShipSpec::default() };
                     *sending = true;
                     client.send(cmd);
@@ -4636,6 +4706,7 @@ mod ship_card_tests {
             report: Default::default(),
             ask: None,
             war: if war { vec![crate::proto::War { rival: 9, files: vec!["src/a.rs".into()] }] } else { vec![] },
+            overlap: vec![],
             role: Role::None,
             design: String::new(),
             spec: ShipSpec::default(),
@@ -4643,6 +4714,7 @@ mod ship_card_tests {
             wpos: (0.0, 0.0),
             front: true,
             run: Vec::new(),
+            outcome: None,
         }
     }
 
@@ -4695,7 +4767,7 @@ mod commander_tests {
             a.title = format!("task for ship {id}");
             app.agents.push(a);
         }
-        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![], detail: vec![] });
+        app.agents[0].ask = Some(Ask { question: "May I run the migration?".into(), context: vec!["Database changes need approval".into()], options: vec![], detail: vec![], risk: None });
         app.sel = Some(Sel::Sys("/beta".into()));
         let world = app.world(0.0, 0.0);
         let l = Lay::new(&Fb::new(120, 40), false);
@@ -4711,6 +4783,21 @@ mod commander_tests {
         let l = Lay::new(&fb, false);
         draw::frame(&mut fb, app, w, &l, 1.0, None);
         fb.txt.chunks(fb.cols).map(|row| row.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_approval_prompt_shows_advisor_risk_badge_and_nothing_answers_for_you() {
+        let (mut app, w, _l) = fixture();
+        let ask = app.agents[0].ask.as_mut().unwrap();
+        ask.options = vec![crate::proto::Choice { key: "1".into(), label: "Yes, proceed".into() }];
+        ask.risk = Some(crate::proto::RiskView { label: "destructive_or_irreversible".into(), probability: 0.91, level: crate::proto::RiskLevel::NeedsYou, outside: Some(0.8), reason: String::new() });
+        let screen = rendered(&mut app, &w);
+        assert!(screen.contains("INCOMING TRANSMISSION"));
+        assert!(screen.contains("needs you · destructive or irreversible · 91%"), "{screen}");
+        // the badge is advice: the agent is still blocked on you
+        assert_eq!(app.agents[0].status, Status::Blocked);
+        app.agents[0].ask.as_mut().unwrap().risk = None;
+        assert!(!rendered(&mut app, &w).contains("Advisor's advice"), "no risk, no badge");
     }
 
     #[test]
@@ -4921,6 +5008,37 @@ mod multiline_tests {
     use super::*;
 
     #[test]
+    fn task_species_arrows_match_vertical_keys() {
+        let mut app = App::new();
+        app.kinds = vec!["claude".into(), "codex".into()];
+        let w = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        for cols in [40, 80, 140] {
+            let mut fb = Fb::new(cols, 30);
+            let l = Lay::new(&fb, false);
+            app.mode = Mode::Brief { planet: "/world".into(), text: Line::default(), kind: 0, launch: true, attachments: vec![], sending: false };
+            handle(&mut app, &w, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), 1.0, &mut None);
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let rows: Vec<String> = fb.txt.chunks(cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+            let row = rows.iter().find(|r| r.contains("species")).unwrap();
+            assert!(row.contains("↑ codex ↓"), "{cols} cols: |{row}|");
+        }
+    }
+
+    #[test]
+    fn agent_enter_preserves_newline_shortcuts() {
+        for (code, mods, bytes) in [
+            (KeyCode::Enter, KeyModifiers::NONE, "\r"),
+            (KeyCode::Enter, KeyModifiers::SHIFT, "\x1b[13;2u"),
+            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT, "\x1b[13;4u"),
+            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::CONTROL, "\x1b[13;6u"),
+            (KeyCode::Enter, KeyModifiers::ALT, "\x1b\r"),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL, "\n"),
+        ] {
+            assert_eq!(key_bytes(&KeyEvent::new(code, mods)).as_deref(), Some(bytes));
+        }
+    }
+
+    #[test]
     fn mission_text_moves_between_lines_keeping_the_column() {
         let mut text = Line::default();
         text.paste_lines("first line\r\nab\n\tthird");
@@ -5038,6 +5156,7 @@ mod structure_tests {
             question: "Would you like to run the following command?".into(),
             context: vec!["• Hook failed".into()],
             detail: vec![cmd.into()],
+            risk: None,
             options: vec![crate::proto::Choice { key: "1".into(), label: "Yes, proceed (y)".into() }],
         });
         app.agents.push(ship);
@@ -5280,6 +5399,26 @@ mod anomaly_tests {
         key(&mut app, &w, &l, KeyCode::Char('o'));
         assert_eq!(app.anomalies.findings[0].state, State::Open);
         assert!(text(&mut app, &w, 80, 24).contains("ANOMALIES"));
+    }
+
+    #[test]
+    fn a_reports_severity_orders_the_attention_list_and_unscored_ones_rank_as_before() {
+        let (mut app, w, _l) = fixture();
+        for (i, title) in ["quiet note", "disk is full", "unscored"].iter().enumerate() {
+            app.anomalies.observe(Observation { key: format!("report:{i}"), world: "/alpha/api".into(), host: "/alpha/api".into(), kind: "Report".into(),
+                title: (*title).into(), evidence: "e".into(), at: 100, present: true });
+        }
+        let id = |app: &App, title: &str| app.anomalies.findings.iter().find(|f| f.title == title).unwrap().id;
+        let (quiet, full) = (id(&app, "quiet note"), id(&app, "disk is full"));
+        for f in &mut app.anomalies.findings {
+            if f.id == quiet { f.severity = Some(0.2); }
+            if f.id == full { f.severity = Some(2.8); }
+        }
+        let rows = app.attention(&w);
+        let rank = |t: &str| rows.iter().find(|r| r.title == t).map(|r| r.rank).unwrap();
+        assert_eq!((rank("disk is full"), rank("unscored"), rank("Unresolved merge conflicts"), rank("quiet note")), (2, 4, 4, 5));
+        let order: Vec<&str> = rows.iter().filter(|r| r.kind == "Anomaly").map(|r| r.title.as_str()).collect();
+        assert_eq!(order, ["disk is full", "Unresolved merge conflicts", "unscored", "quiet note"]);
     }
 
     #[test]
@@ -5889,6 +6028,248 @@ mod editor_tests {
 }
 
 #[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::proto::Outcome;
+
+    fn done(label: &str, conf: f32) -> Agent {
+        let mut a = ship_card_tests::ship(1, false);
+        a.cwd = "/code/review".into();
+        a.status = Status::Done;
+        a.title = "Test the settings form".into();
+        a.outcome = Some(Outcome { label: label.into(), conf });
+        a
+    }
+
+    fn lines(app: &mut App, w: &World, mode: Mode) -> String {
+        let mut fb = Fb::new(120, 36);
+        let l = Lay::new(&fb, false);
+        app.mode = mode;
+        draw::frame(&mut fb, app, w, &l, 1.0, None);
+        fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn home(a: Agent) -> String {
+        let mut app = App::new();
+        app.history.clear();
+        app.workspace.root = "/code".into();
+        app.projects = vec!["/code/review".into()];
+        app.agents.push(a);
+        let w = app.world(1.0, 0.0);
+        lines(&mut app, &w, Mode::Workspace { key: crate::workspace::HOME.into(), sel: 0 })
+    }
+
+    #[test]
+    fn home_says_when_a_finished_turn_looks_failed_or_half_done() {
+        assert!(home(done("failed", 0.8)).contains("Looks failed"));
+        assert!(home(done("partial", 0.4)).contains("Partly done"));
+        assert!(home(done("needs_review", 0.9)).contains("Needs review"));
+        for quiet in [done("completed", 0.99), done("failed", 0.39), done("whatever", 1.0)] {
+            let text = home(quiet);
+            assert!(text.contains("Ready to check") && !text.contains("Looks failed"), "{text}");
+        }
+        let mut none = done("failed", 1.0);
+        none.outcome = None;
+        assert!(home(none).contains("Ready to check"));
+    }
+
+    #[test]
+    fn a_working_ship_carries_no_warning_even_if_an_old_outcome_lingers() {
+        let mut a = done("failed", 0.9);
+        a.status = Status::Working;
+        assert!(!home(a).contains("Looks failed"));
+    }
+
+    #[test]
+    fn the_need_label_names_the_doubt_and_never_shows_a_green_tick_for_it() {
+        let mut app = App::new();
+        app.agents.push(done("failed", 0.8));
+        let need = &app.needs("/code/review")[0];
+        assert!(need.label.contains("looks failed") && need.badge == "✖" && need.col == warn_color(true));
+        app.agents[0].outcome = Some(Outcome { label: "partial".into(), conf: 0.6 });
+        let need = &app.needs("/code/review")[0];
+        assert!(need.label.contains("partly done") && need.badge == "◐" && need.col == warn_color(false));
+        // looks fine, unsure, or unread: the line it has always had
+        for o in [Some(Outcome { label: "completed".into(), conf: 0.9 }), Some(Outcome { label: "failed".into(), conf: 0.1 }), None] {
+            app.agents[0].outcome = o;
+            let need = &app.needs("/code/review")[0];
+            assert_eq!((need.badge.as_str(), need.label.as_str()), ("✔", "claude finished (Test the settings form): take a look"));
+        }
+    }
+
+    #[test]
+    fn a_turn_that_looks_failed_ranks_above_the_ordinary_finished_ones() {
+        let mut app = App::new();
+        let mut plain = ship_card_tests::ship(2, false);
+        plain.cwd = "/code/aaa".into();
+        plain.status = Status::Done;
+        app.agents = vec![plain, done("failed", 0.7)];
+        let w = app.world(0.0, 0.0);
+        let rows = app.attention(&w);
+        let kinds: Vec<_> = rows.iter().filter(|r| r.id.starts_with("agent:")).map(|r| (r.id.as_str(), r.kind)).collect();
+        assert_eq!(kinds, [("agent:1", "Failed?"), ("agent:2", "Finished")]);
+        app.agents[1].outcome = Some(Outcome { label: "completed".into(), conf: 0.9 });
+        assert!(app.attention(&w).iter().all(|r| r.kind != "Failed?"));
+    }
+
+    #[test]
+    fn the_mission_log_flags_only_done_missions_that_look_off() {
+        let mut app = App::new();
+        app.history.clear();
+        let m = |id, outcome: Option<Outcome>| Mission { id, cwd: "/code/review".into(), text: format!("job {id}"), state: "done".into(), at: 100, done_at: Some(160), outcome, ..Mission::default() };
+        app.missions = vec![
+            m(1, Some(Outcome { label: "failed".into(), conf: 0.9 })),
+            m(2, Some(Outcome { label: "completed".into(), conf: 0.9 })),
+            m(3, None),
+            m(4, Some(Outcome { label: "partial".into(), conf: 0.2 })),
+        ];
+        let w = app.world(0.0, 0.0);
+        let text = lines(&mut app, &w, Mode::Log { world: "/code/review".into(), sel: 0, open: HashSet::new() });
+        let row = |n: u32| text.lines().find(|l| l.contains(&format!("job {n}"))).unwrap_or_else(|| panic!("job {n} missing in\n{text}")).to_string();
+        assert!(row(1).contains("✖ looks failed"), "{}", row(1));
+        for n in [2, 3, 4] {
+            let r = row(n);
+            assert!(!r.contains('✖') && !r.contains('◐') && !r.to_lowercase().contains("completed"), "{r}");
+        }
+        let open = HashSet::from([1, 4]);
+        let text = lines(&mut app, &w, Mode::Log { world: "/code/review".into(), sel: 0, open });
+        assert_eq!(text.matches("looks failed").count(), 2, "row and details: {text}");
+        assert!(!text.contains("partly done"));
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use crate::proto::Overlap;
+
+    fn fleet(p: f32) -> App {
+        let mut app = App::new();
+        app.history.clear();
+        app.online = true;
+        for (id, rival) in [(1, 2), (2, 1)] {
+            let mut a = ship_card_tests::ship(id, false);
+            a.cwd = "/code/web".into();
+            a.status = Status::Working;
+            a.title = format!("task of ship {id}");
+            a.overlap = vec![Overlap { rival, p }];
+            app.agents.push(a);
+        }
+        app
+    }
+
+    fn render(app: &mut App, mode: Mode) -> String {
+        let w = app.world(0.0, 0.0);
+        let mut fb = Fb::new(140, 50);
+        let l = Lay::new(&fb, true);
+        app.sel = Some(Sel::Planet("/code/web".into()));
+        app.mode = mode;
+        draw::frame(&mut fb, app, &w, &l, 1.0, None);
+        fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn both_outliner_rows_wear_a_dim_badge_for_the_other_ship() {
+        let mut app = fleet(0.8);
+        let text = render(&mut app, Mode::Galaxy);
+        let row = |id: u32| text.lines().find(|l| l.contains(&format!("task of ship {id}"))).unwrap_or_else(|| panic!("no row for {id}\n{text}")).to_string();
+        assert!(row(1).contains("≈#2"), "{}", row(1));
+        assert!(row(2).contains("≈#1"), "{}", row(2));
+        assert!(!text.contains('⚔'), "an overlap is not a file conflict");
+        let mut quiet = fleet(0.8);
+        for a in &mut quiet.agents { a.overlap.clear(); }
+        assert!(!render(&mut quiet, Mode::Galaxy).contains('≈'));
+    }
+
+    #[test]
+    fn the_ship_card_gets_an_overlap_row_only_when_there_is_one() {
+        let mut app = fleet(0.9);
+        let text = render(&mut app, Mode::Ship { id: 1, sel: 0 });
+        let row = text.lines().find(|l| l.contains("overlap")).unwrap_or_else(|| panic!("no overlap row\n{text}"));
+        assert!(row.contains("≈ claude #2"), "{row}");
+        // the card grows by a row, and its menu is still where the clicks land
+        let l = Lay::new(&Fb::new(140, 50), false);
+        let comms = text.lines().position(|r| r.contains("open comms")).unwrap() as i32;
+        let col = text.lines().nth(comms as usize).unwrap().chars().position(|c| c == 'o').unwrap() as i32;
+        assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms), Some(Some(0)));
+        app.agents[0].overlap.clear();
+        assert!(!render(&mut app, Mode::Ship { id: 1, sel: 0 }).lines().any(|l| l.contains("overlap")));
+    }
+
+    #[test]
+    fn a_red_conflict_keeps_its_own_row_beside_an_overlap() {
+        let mut app = fleet(0.9);
+        app.agents[0].war = vec![War { rival: 9, files: vec!["src/a.rs".into()] }];
+        let w = app.world(0.0, 0.0);
+        let mut fb = Fb::new(140, 50);
+        let l = Lay::new(&fb, true);
+        app.sel = Some(Sel::Agent(1));
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("⚔ vs #9") && text.contains("≈ claude #2"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod research_tests {
+    use super::*;
+    #[test] fn research_is_an_independent_destination_at_every_zoom() {
+        let mut app = App::new();
+        let w = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        let l = Lay::new(&Fb::new(140, 48), true);
+        assert_eq!(app.rows(&w), vec![Sel::Research]);
+        app.sel = Some(Sel::Research); assert_eq!(app.sel_planet(), None);
+        let pos = research_pos(&w); app.cam.x = pos.0; app.cam.y = pos.1;
+        for z in [0.2, 0.8, 2.0] { app.cam.z = z; let screen = l.to_screen(&app.cam, pos); assert_eq!(pick_at(&app, &w, &l, screen), Some(Sel::Research)); }
+        app.activate(&w, &l, &Client::isolated()); assert!(matches!(app.mode, Mode::Research));
+        let mut fb = Fb::new(140, 48); draw::frame(&mut fb, &mut app, &w, &l, 0.0, None);
+        let text: String = fb.txt.iter().map(|c| c.as_ref().map_or(' ', |c| c.ch)).collect();
+        assert!(text.contains("RESEARCH STATION"));
+    }
+}
+
+#[cfg(test)]
+mod release_images {
+    use super::*;
+
+    /// Render fictional projects through the real UI, without a daemon or saved user state.
+    #[test]
+    #[ignore = "writes documentation captures; run explicitly with EMPIRE_CAPTURE_DIR"]
+    fn capture_release_images() {
+        let dir = PathBuf::from(std::env::var("EMPIRE_CAPTURE_DIR").expect("set EMPIRE_CAPTURE_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new();
+        app.online = true; app.loaded = true; app.panel = false;
+        app.kinds = vec!["claude".into(), "codex".into(), "grok".into()];
+        app.projects = ["/demo/observatory", "/demo/star-chart", "/demo/flight-deck"].map(String::from).to_vec();
+        for (i, (kind, status, title)) in [
+            ("claude", Status::Working, "Build the observation timeline"),
+            ("codex", Status::Done, "Chart labels are ready to review"),
+            ("grok", Status::Working, "Test the launch checklist"),
+        ].into_iter().enumerate() {
+            let mut a = ship_card_tests::ship(i as u32 + 1, false);
+            a.cwd = app.projects[i].clone(); a.kind = kind.into(); a.status = status; a.title = title.into();
+            app.survey.worlds.insert(a.cwd.clone(), survey::World { git: true, branch: "main".into(), lang: "Rust".into(), ..Default::default() });
+            app.agents.push(a);
+        }
+        let world = app.world(12.0, 0.0);
+        let mut fb = Fb::new(140, 44);
+        let l = Lay::new(&fb, false);
+        app.sel = Some(Sel::Planet(app.projects[0].clone()));
+        app.fit(&world, &l);
+        let system = world.systems.iter().find(|s| s.name == "demo").unwrap();
+        (app.cam.x, app.cam.y, app.cam.z) = (system.wpos.0, system.wpos.1, 0.75);
+        app.sel = None;
+        for name in ["galaxy", "workspace"] {
+            if name == "workspace" { app.mode = Mode::Workspace { key: app.projects[0].clone(), sel: 0 }; }
+            draw::frame(&mut fb, &mut app, &world, &l, 12.0, None);
+            let mut file = std::fs::File::create(dir.join(format!("{name}.ansi"))).unwrap();
+            Out::new(fb.cols * fb.rows).present(&fb, &mut file).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
 mod pulse_tests {
     use super::*;
     use crate::proto::Pulse;
@@ -5942,6 +6323,21 @@ mod pulse_tests {
     }
 
     #[test]
+    fn pulse_and_overlap_share_the_card_without_moving_clicks() {
+        let mut app = working("looping", 0.9);
+        app.agents[0].overlap = vec![Overlap { rival: 2, p: 0.8 }];
+        let text = render(&mut app, Mode::Galaxy);
+        let row = outliner_row(&text);
+        assert!(row.contains('↻') && row.contains("≈#2"), "{row}");
+        let text = render(&mut app, Mode::Ship { id: 1, sel: 0 });
+        assert!(text.contains("pulse") && text.contains("overlap"), "{text}");
+        let l = Lay::new(&Fb::new(140, 50), false);
+        let r = text.lines().position(|r| r.contains("open comms")).unwrap() as i32;
+        let c = text.lines().nth(r as usize).unwrap().chars().position(|c| c == 'o').unwrap() as i32;
+        assert_eq!(draw::ship_hit(&app, 1, &l, c, r), Some(Some(0)));
+    }
+
+    #[test]
     fn the_ship_card_gets_a_pulse_row_and_keeps_its_menu_in_place() {
         let mut app = working("looping", 0.72);
         let text = render(&mut app, Mode::Ship { id: 1, sel: 0 });
@@ -5953,19 +6349,5 @@ mod pulse_tests {
         assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms), Some(Some(0)));
         let mut erroring = working("erroring", 0.6);
         assert!(render(&mut erroring, Mode::Ship { id: 1, sel: 0 }).contains("✖? erroring"));
-mod research_tests {
-    use super::*;
-    #[test] fn research_is_an_independent_destination_at_every_zoom() {
-        let mut app = App::new();
-        let w = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
-        let l = Lay::new(&Fb::new(140, 48), true);
-        assert_eq!(app.rows(&w), vec![Sel::Research]);
-        app.sel = Some(Sel::Research); assert_eq!(app.sel_planet(), None);
-        let pos = research_pos(&w); app.cam.x = pos.0; app.cam.y = pos.1;
-        for z in [0.2, 0.8, 2.0] { app.cam.z = z; let screen = l.to_screen(&app.cam, pos); assert_eq!(pick_at(&app, &w, &l, screen), Some(Sel::Research)); }
-        app.activate(&w, &l, &Client::isolated()); assert!(matches!(app.mode, Mode::Research));
-        let mut fb = Fb::new(140, 48); draw::frame(&mut fb, &mut app, &w, &l, 0.0, None);
-        let text: String = fb.txt.iter().map(|c| c.as_ref().map_or(' ', |c| c.ch)).collect();
-        assert!(text.contains("RESEARCH STATION"));
     }
 }

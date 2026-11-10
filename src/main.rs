@@ -14,12 +14,15 @@ mod perf;
 mod octant;
 mod proto;
 mod role;
+mod route;
 mod sector;
+mod severity;
 mod state;
 mod sound;
 mod structure;
 mod screenshots;
 mod survey;
+mod triage;
 
 use proto::{Req, call};
 use std::io;

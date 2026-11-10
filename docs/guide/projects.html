@@ -1,0 +1,21 @@
+<p class="lead">Chart the folders you work in. Keep their agents close to home.</p>
+<h2 id="roots-and-single-folders">Roots and single folders</h2>
+<p>A <strong>sector root</strong> is a folder containing projects. Open <kbd>V</kbd> and press <kbd>n</kbd> to add one. Each addition keeps your existing roots. Discovery walks beneath the roots, stops inside repositories, and skips hidden directories, symlink directories, <code>node_modules</code>, <code>target</code> and <code>vendor</code>.</p>
+<p>A <strong>manual planet</strong> is one folder you add with <kbd>n</kbd> from the galaxy or Home. It can be outside your roots and does not need Git. Adding a planet does not launch an agent.</p>
+<p>With no saved root, Empire uses <code>/home/code</code> or <code>~/code</code> when one exists. On Home, uppercase <kbd>R</kbd> rescans all roots; lowercase <kbd>r</kbd> opens the folder manager. Discovery reads directory entries. It does not clone, pull or edit repositories.</p>
+<h2 id="find-your-way-home">Find your way Home</h2>
+<p>Press <kbd>H</kbd> from the galaxy. Home puts projects needing your input or review first, then groups other projects by their parent folder. The selected project's full path appears in the footer.</p>
+<p><kbd>Enter</kbd> opens a project, <kbd>e</kbd> launches an agent there, and <kbd>r</kbd> manages folders. In the galaxy, use <kbd>z</kbd> to fit the map and <kbd>f</kbd> to focus the selection. <kbd>o</kbd> toggles the outliner.</p>
+<h2 id="worktree-stations">Worktree stations</h2>
+<p>A Git worktree appears as a small <strong>▣ space station</strong> around its project planet. It has a core, a truss and two solar wings, with amber lights while an agent is aboard. It is separate from the ring-shaped GitHub station.</p>
+<p>Empire checks each repository's worktree registry about every eight seconds while the galaxy is open. Worktrees made by your agent can appear even in hidden folders or outside sector roots. Missing worktrees are skipped; stations you explicitly hide stay hidden.</p>
+<p>Create and merge worktrees with Git or your agent's normal tools. Empire discovers existing worktrees; it does not manage their creation or merging for you.</p>
+<h3>Moving an agent's work</h3>
+<p>Ask the agent to create the worktree <em>and execute its work there</em>. For Codex, Empire follows working directories in completed-command session records. Claude and Grok hooks can also report a changed native working directory.</p>
+<p>The ship keeps its identity and conversation. Unfinished missions assigned to it move with it; unassigned project tasks stay on the original planet. Empire only follows another checkout of the same repository. A shell-internal <code>cd</code> or a command using only <code>git -C</code> may not report the change; use the worktree as the command's working directory.</p>
+<h2 id="remove-from-the-map">Remove from the map</h2>
+<p>Select a project on Home or the galaxy and press <kbd>x</kbd> or <kbd>Delete</kbd>. In the folder manager, the same controls remove a selected root or manual folder.</p>
+<p>This hides the project from the map. It does <strong>not</strong> delete its files or stop its sessions. Worlds with sessions remain visible until those sessions are dismissed. Adding the folder again restores it. Removing a root keeps projects covered by another root or added individually.</p>
+<h2 id="project-resources">Project resources</h2>
+<p>Open a project's resources to inspect instruction files, skills, commands, subagents, hooks and MCP configuration. <kbd>Enter</kbd> or <kbd>e</kbd> opens a file in your editor: <code>$VISUAL</code>, <code>$EDITOR</code>, or an available terminal editor.</p>
+<p>On an empty resource plot, <kbd>Enter</kbd> or <kbd>n</kbd> creates a first draft and opens it. Existing files are not overwritten. Uppercase <kbd>B</kbd> prepares a task for an agent to build or renovate that resource. Review the brief before sending. <kbd>Ctrl</kbd>+<kbd>R</kbd> rereads the files.</p>

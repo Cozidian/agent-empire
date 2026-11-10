@@ -178,6 +178,13 @@ struct Agent {
     refit: Option<RefitState>,
     /// The command a shell session runs instead of the shell (an editor on a file).
     run: Vec<String>,
+    /// Advisor's (or the keyword scan's) read of the turn that just finished: transient, gone when the
+    /// ship leaves Done. `outcome_gen` counts turns so a late answer for an old one is dropped,
+    /// `outcome_due` is when to read the settled output, `outcome_from` (unix) when the turn began.
+    outcome: Option<Outcome>,
+    outcome_gen: u32,
+    outcome_due: Option<Instant>,
+    outcome_from: Option<u64>,
     /// Screen generation, bumped on every change, and the signal waiting viewers sleep on.
     version: u64,
     changed: Arc<Condvar>,
@@ -306,7 +313,10 @@ impl Agent {
             options = vec![Choice { key: "y\r".into(), label: "Yes".into() }, Choice { key: "n\r".into(), label: "No".into() }];
         }
         let question = lines[qi].clone();
-        Some(Ask { question, context, options, detail })
+        let mut ask = Ask { question, context, options, detail, risk: None };
+        // advice only: a badge for the player. Nothing here ever answers, and launches still never skip permissions
+        ask.risk = crate::triage::assess(&ask, &crate::game::base_name(&self.cwd), &self.kind);
+        Some(ask)
     }
 
     /// A path as the agent named it, made absolute against its world.
@@ -436,9 +446,11 @@ impl Agent {
             report: self.report.clone(),
             ask: if self.status == Status::Blocked { self.ask() } else { None },
             war: Vec::new(),
+            overlap: Vec::new(),
             spec: self.spec.clone(),
             refit: self.refit.clone(),
             run: self.run.clone(),
+            outcome: self.outcome.clone(),
         }
     }
 
@@ -547,6 +559,8 @@ struct Hub {
     /// When a galaxy last asked for the agent list: while one is open, it does the alerting.
     watched: Option<Instant>,
     missions: Vec<Mission>,
+    /// What Advisor (or the word-overlap fallback) said about pairs of ships on one world.
+    overlap: OverlapBook,
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -634,6 +648,10 @@ fn new_agent(id: u32, kind: &str, cwd: &str, writer: Pty, rows: u16, cols: u16) 
         spec: ShipSpec::default(),
         refit: None,
         run: Vec::new(),
+        outcome: None,
+        outcome_gen: 0,
+        outcome_due: None,
+        outcome_from: None,
         version: 1,
         changed: Arc::default(),
         status: Status::Booting,
@@ -838,7 +856,7 @@ fn upgrade(hub: &Shared) -> io::Result<()> {
         });
     }
     let file = dirs_state().join("handoff.json");
-    std::fs::write(&file, serde_json::to_string(&(h.next, out))?)?;
+    crate::state::private_write(&file, serde_json::to_string(&(h.next, out))?)?;
     let _ = std::fs::remove_file(socket_path());
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(exe_path()).arg("daemon").env("EMPIRE_HANDOFF", &file).exec();
@@ -919,6 +937,11 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
         let g = a.lock().unwrap();
         (g.refit_is("pending") || g.refit_is("applying")).then_some(g.id)
     }).collect();
+    // Advisor's read of each ship's finished turn, and when that turn began
+    let outcomes: HashMap<u32, (Outcome, u64)> = agents.iter().filter_map(|a| {
+        let g = a.lock().unwrap();
+        Some((g.id, (g.outcome.clone()?, g.outcome_from?)))
+    }).collect();
     let mut h = hub.lock().unwrap();
     let busy: HashSet<u32> = h.missions.iter().filter(|m| matches!(m.state.as_str(), "sent" | "active")).filter_map(|m| m.agent).collect();
     let mut taken = HashSet::new();
@@ -954,9 +977,12 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
                 Some((_, _, Status::Done | Status::Idle, _)) if m.state == "active" => {
                     m.state = "done".into();
                     m.done_at = Some(unix_now());
+                    m.outcome = mission_outcome(m, &outcomes);
                 }
                 _ => {}
             },
+            // the read of its last turn can land a few seconds after the mission is marked done
+            "done" if m.outcome.is_none() => m.outcome = mission_outcome(m, &outcomes),
             _ => {}
         }
     }
@@ -976,6 +1002,199 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
     if h.missions != *logged {
         if crate::state::edit(&missions_file(), |saved: &mut Vec<Mission>| *saved = h.missions.clone()).is_ok() { *logged = h.missions.clone(); }
     }
+}
+
+// ───────────────────────── overlapping work ─────────────────────────
+
+/// Set to 1 to flag two Working ships on one world whose tasks look like the same job or like
+/// edits to the same files: earlier than the border-conflict detector, which waits for an edit.
+/// Advisor answers one yes/no question per pair (needs `PROVIDER_API_KEY`); with no key, or if Advisor
+/// fails, word and file-path overlap in the task text stands in. It only ever adds a dim badge.
+const OVERLAP_FLAG: &str = "EMPIRE_ADVISOR_OVERLAP";
+/// Advisor is asked about a world at most this often.
+const OVERLAP_DEBOUNCE: Duration = Duration::from_secs(30);
+/// Ships considered per world; the rest are left out.
+const OVERLAP_SHIPS: usize = 6;
+const OVERLAP_TASK: usize = 300;
+const OVERLAP_BOOK: usize = 1024;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum OverlapMode {
+    Off,
+    /// Flag on, no key: the word-overlap fallback only.
+    Words,
+    Advisor,
+}
+
+fn overlap_mode_of(flag: bool, key: bool) -> OverlapMode {
+    match (flag, key) {
+        (false, _) => OverlapMode::Off,
+        (true, false) => OverlapMode::Words,
+        (true, true) => OverlapMode::Advisor,
+    }
+}
+
+fn overlap_mode() -> OverlapMode {
+    let flag = std::env::var(OVERLAP_FLAG).ok();
+    overlap_mode_of(advisor::enabled_with(Some("x"), flag.as_deref()), advisor::enabled(OVERLAP_FLAG))
+}
+
+/// A Working ship's id, species, world and task.
+type OverlapShip = (u32, String, String, String);
+
+/// A ship that can overlap: Working, not a terminal, with a task.
+fn overlap_ship(a: &Agent) -> Option<OverlapShip> {
+    (a.kind != "shell" && a.exited.is_none() && a.status == Status::Working && !a.task.is_empty()).then(|| (a.id, a.kind.clone(), a.cwd.clone(), a.task.clone()))
+}
+
+#[derive(Default)]
+struct OverlapBook {
+    /// P(same work) of a pair and the tasks they have now, by `pair_key`.
+    pairs: HashMap<u64, f32>,
+    /// Per world: the hash of the sorted (id, task) pairs last settled, and when Advisor was last asked.
+    seen: HashMap<String, (u64, Option<Instant>)>,
+    /// A request is in flight (one at a time).
+    busy: bool,
+}
+
+/// Ships by world, two or more, fewest ids first and at most `OVERLAP_SHIPS` each.
+fn overlap_groups(ships: &[OverlapShip]) -> Vec<(String, Vec<OverlapShip>)> {
+    let mut by: std::collections::BTreeMap<&str, Vec<OverlapShip>> = Default::default();
+    for s in ships {
+        by.entry(s.2.as_str()).or_default().push(s.clone());
+    }
+    by.into_iter().filter(|(_, v)| v.len() >= 2).map(|(k, mut v)| { v.sort_by_key(|s| s.0); v.truncate(OVERLAP_SHIPS); (k.to_string(), v) }).collect()
+}
+
+/// A world's group as the cache sees it: the sorted (id, task) pairs.
+fn group_hash(ships: &[OverlapShip]) -> u64 {
+    let mut v: Vec<(u32, &str)> = ships.iter().map(|s| (s.0, s.3.as_str())).collect();
+    v.sort();
+    crate::advisor::digest(&serde_json::json!(v))
+}
+
+/// A pair and their tasks. `a` has the lower id.
+fn pair_key(a: &OverlapShip, b: &OverlapShip) -> u64 {
+    crate::advisor::digest(&serde_json::json!([a.0, a.3, b.0, b.3]))
+}
+
+fn pair_name(a: &OverlapShip, b: &OverlapShip) -> String {
+    format!("pair_{}_{}", a.0, b.0)
+}
+
+fn overlap_req(world: &str, ships: &[OverlapShip], pairs: &[(usize, usize)]) -> serde_json::Value {
+    let fleet: serde_json::Map<String, serde_json::Value> = ships.iter().map(|s| (format!("ship_{}", s.0), serde_json::json!({ "species": s.1, "task": s.3.chars().take(OVERLAP_TASK).collect::<String>() }))).collect();
+    let questions = pairs.iter().map(|&(i, j)| {
+        let (a, b) = (&ships[i], &ships[j]);
+        (pair_name(a, b), advisor::noul_q(&format!("Do the tasks of `ships.ship_{}` and `ships.ship_{}` ask for the same work, or for work likely to edit the same files?", a.0, b.0)))
+    }).collect::<Vec<_>>();
+    advisor::request(serde_json::json!({ "world": crate::game::base_name(world), "ships": fleet }), questions.iter().map(|(k, v)| (k.as_str(), v.clone())).collect())
+}
+
+fn path_like(t: &str) -> bool {
+    if t.contains('/') {
+        return t.chars().any(char::is_alphanumeric);
+    }
+    t.rsplit_once('.').is_some_and(|(stem, ext)| stem.chars().count() >= 2 && (2..=5).contains(&ext.chars().count()) && ext.chars().all(char::is_alphanumeric) && ext.chars().any(char::is_alphabetic))
+}
+
+fn task_paths(t: &str) -> HashSet<String> {
+    t.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~'))).trim_start_matches("./").trim_end_matches('.'))
+        .filter(|w| path_like(w))
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn task_words(t: &str) -> HashSet<String> {
+    const SKIP: [&str; 36] = [
+        "this", "that", "with", "from", "into", "then", "there", "their", "them", "they", "about", "also", "just", "only", "some", "more",
+        "when", "what", "which", "your", "each", "every", "other", "please", "make", "sure", "need", "want", "should", "would", "could",
+        "have", "will", "code", "file", "files",
+    ];
+    t.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 4 && !SKIP.contains(w)).map(String::from).collect()
+}
+
+/// The stand-in for Advisor: the same file named in both tasks is a likely yes; so is most of the
+/// (few) meaningful words being shared. Anything less is a no.
+fn overlap_fallback(a: &str, b: &str) -> f32 {
+    let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let (pa, pb) = (task_paths(a), task_paths(b));
+    let file = pa.iter().any(|p| pb.iter().any(|q| p == q || (base(p) == base(q) && base(p).contains('.'))));
+    if file {
+        return 0.8;
+    }
+    let (wa, wb) = (task_words(a), task_words(b));
+    let shared = wa.intersection(&wb).count();
+    if shared >= 3 && shared * 10 >= wa.len().min(wb.len()) * 6 { 0.7 } else { 0.0 }
+}
+
+/// Work out which pairs of Working ships on each world overlap, when the set of tasks changes.
+/// Advisor is asked about a world's new pairs on a spawned thread, at most once in 30 s, one request
+/// at a time; the fallback answers at once.
+fn overlap_tick(hub: &Shared, now: Instant, mode: OverlapMode) {
+    if mode == OverlapMode::Off {
+        return;
+    }
+    let ships: Vec<OverlapShip> = {
+        let agents: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
+        agents.iter().filter_map(|a| overlap_ship(&a.lock().unwrap())).collect()
+    };
+    let mut h = hub.lock().unwrap();
+    if h.overlap.pairs.len() > OVERLAP_BOOK {
+        h.overlap.pairs.clear();
+        h.overlap.seen.clear();
+    }
+    for (world, group) in overlap_groups(&ships) {
+        let sig = group_hash(&group);
+        if h.overlap.seen.get(&world).is_some_and(|s| s.0 == sig) {
+            continue;
+        }
+        let todo: Vec<(usize, usize)> = (0..group.len()).flat_map(|i| (i + 1..group.len()).map(move |j| (i, j))).filter(|&(i, j)| !h.overlap.pairs.contains_key(&pair_key(&group[i], &group[j]))).collect();
+        let last = h.overlap.seen.get(&world).and_then(|s| s.1);
+        if mode == OverlapMode::Words || todo.is_empty() {
+            for &(i, j) in &todo {
+                h.overlap.pairs.insert(pair_key(&group[i], &group[j]), overlap_fallback(&group[i].3, &group[j].3));
+            }
+            h.overlap.seen.insert(world, (sig, last));
+            continue;
+        }
+        if h.overlap.busy || last.is_some_and(|t| now - t < OVERLAP_DEBOUNCE) {
+            continue;
+        }
+        h.overlap.busy = true;
+        h.overlap.seen.insert(world.clone(), (sig, Some(now)));
+        let (hub, req) = (hub.clone(), overlap_req(&world, &group, &todo));
+        thread::spawn(move || {
+            let answer = advisor::post(&req).ok();
+            let mut h = hub.lock().unwrap();
+            for &(i, j) in &todo {
+                let p = answer.as_ref().and_then(|v| advisor::noul(v, &pair_name(&group[i], &group[j]))).unwrap_or_else(|| overlap_fallback(&group[i].3, &group[j].3));
+                h.overlap.pairs.insert(pair_key(&group[i], &group[j]), p);
+            }
+            h.overlap.busy = false;
+        });
+        break;
+    }
+}
+
+/// Each ship's overlaps now: the pairs on one world that were answered for the tasks they
+/// have now and came out at `Overlap::SHOW` or more. A task that changed, or a ship that
+/// stopped Working, drops out by itself.
+fn overlaps(ships: &[OverlapShip], pairs: &HashMap<u64, f32>) -> HashMap<u32, Vec<Overlap>> {
+    let mut out: HashMap<u32, Vec<Overlap>> = HashMap::new();
+    for (_, group) in overlap_groups(ships) {
+        for i in 0..group.len() {
+            for j in i + 1..group.len() {
+                let Some(&p) = pairs.get(&pair_key(&group[i], &group[j])) else { continue };
+                if p >= Overlap::SHOW {
+                    out.entry(group[i].0).or_default().push(Overlap { rival: group[j].0, p });
+                    out.entry(group[j].0).or_default().push(Overlap { rival: group[i].0, p });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Found a dedicated campaign worktree; never adopt an unrelated directory or branch.
@@ -1313,7 +1532,7 @@ fn save_registry(hub: &Shared, last: &mut Vec<Saved>) {
     let now: Vec<Saved> = now.into_iter().map(|(_, s)| s).collect();
     if now != *last {
         let _ = std::fs::create_dir_all(dirs_state());
-        let _ = std::fs::write(registry_file(), serde_json::to_string(&now).unwrap_or_default());
+        let _ = crate::state::private_write(&registry_file(), serde_json::to_string(&now).unwrap_or_default());
         *last = now;
     }
 }
@@ -1603,6 +1822,13 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                     }
                 }
             }
+            // overlapping work: ships on one world whose tasks look like the same job (not yet a file conflict)
+            let ships: Vec<OverlapShip> = list.iter().filter_map(|a| overlap_ship(&a.lock().unwrap())).collect();
+            let found = overlaps(&ships, &hub.lock().unwrap().overlap.pairs);
+            for v in agents.iter_mut() {
+                let war: Vec<u32> = v.war.iter().map(|w| w.rival).collect();
+                v.overlap = found.get(&v.id).map(|o| o.iter().filter(|o| !war.contains(&o.rival)).cloned().collect()).unwrap_or_default();
+            }
             let missions = hub.lock().unwrap().missions.clone();
             Resp::Agents { agents, missions }
         }
@@ -1620,7 +1846,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             if let Err(msg) = crate::screenshots::validate(&attachments) { return Resp::Err { msg }; }
             let id = hub.lock().unwrap().missions.iter().map(|m| m.id).max().unwrap_or(0) + 1;
             let prompt = crate::screenshots::prompt(&text, &attachments);
-            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: to.filter(|_| !launch), at: unix_now(), done_at: None, fleet: None, campaign, campaign_job: String::new() };
+            let mut m = Mission { id, cwd: cwd.clone(), text: text.clone(), attachments, state: "queued".into(), agent: to.filter(|_| !launch), at: unix_now(), done_at: None, fleet: None, campaign, campaign_job: String::new(), outcome: None };
             if launch {
                 match spawn(hub, &kind, &cwd, None, Some(&prompt), Role::parse(&role), &spec, &[]) {
                     Ok(aid) => {
@@ -1649,7 +1875,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                     g.note_task(&text);
                     g.cwd.clone()
                 };
-                h.missions.push(Mission { id: next, cwd, text: text.clone(), attachments: Vec::new(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet), campaign: None, campaign_job: String::new() });
+                h.missions.push(Mission { id: next, cwd, text: text.clone(), attachments: Vec::new(), state: "sent".into(), agent: Some(id), at: unix_now(), done_at: None, fleet: Some(fleet), campaign: None, campaign_job: String::new(), outcome: None });
                 next += 1;
                 sent += 1;
                 order(a, text.clone());
@@ -1782,6 +2008,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
             Some(a) => {
                 let mut g = a.lock().unwrap();
                 let before = g.question();
+                if let Some(ask) = g.ask() { crate::triage::record_choice(&ask, &key); }
                 g.answered = before.clone();
                 if g.hook == Some(Status::Blocked) {
                     g.hook = None;
@@ -1895,6 +2122,7 @@ fn handle(hub: &Shared, req: Req) -> Resp {
 }
 
 fn serve(hub: Shared, s: UnixStream) -> io::Result<()> {
+    same_user(&s)?;
     let mut w = s.try_clone()?;
     for line in BufReader::new(s).lines() {
         let line = line?;
@@ -1910,13 +2138,22 @@ fn serve(hub: Shared, s: UnixStream) -> io::Result<()> {
 }
 
 pub fn run() -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     let path = socket_path();
-    if UnixStream::connect(&path).is_ok() {
+    if let Ok(s) = UnixStream::connect(&path) {
+        same_user(&s)?;
         eprintln!("empire daemon already running at {}", path.display());
         return Ok(());
     }
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "refusing to replace an unowned or non-socket daemon path"));
+        }
+    }
+    crate::state::private_dir(&dirs_state())?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let hub: Shared = Arc::default();
     let _ = BUILD.set(build_id());
     if let Ok(s) = std::fs::read_to_string(missions_file()) {
@@ -1970,6 +2207,7 @@ pub fn run() -> io::Result<()> {
                 save_registry(&h, &mut saved);
             }
             dispatch(&h, &mut logged);
+            overlap_tick(&h, Instant::now(), overlap_mode());
             // legacy campaign records remain on disk; the workspace no longer dispatches them.
             let now = Instant::now();
             let list: Vec<(u32, Arc<Mutex<Agent>>)> = h.lock().unwrap().agents.iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -1982,10 +2220,12 @@ pub fn run() -> io::Result<()> {
                 if g.status != g.told {
                     g.told = g.status;
                     let long = g.worked_at.is_some_and(|w| now - w > Duration::from_secs(DESKTOP_TURN));
+                    outcome_turn(&mut g, long, now);
                     if !watched && (g.status == Status::Blocked || (g.status == Status::Done && long)) {
                         alert(&h, &g);
                     }
                 }
+                outcome_tick(&a, &mut g, now, outcome_gate());
                 if g.exited.is_some_and(|e| now - e > Duration::from_secs(6)) {
                     dead.push(id);
                 }
@@ -2032,7 +2272,7 @@ pub fn statusline() {
         let file = crate::survey::claude_limits_file();
         let _ = std::fs::create_dir_all(dirs_state());
         let tmp = file.with_extension("tmp");
-        if std::fs::write(&tmp, rl.to_string()).is_ok() {
+        if crate::state::private_write(&tmp, rl.to_string()).is_ok() {
             let _ = std::fs::rename(tmp, file);
         }
     }
@@ -2099,6 +2339,200 @@ fn alert(hub: &Shared, a: &Agent) {
     });
 }
 
+// ───────────────────────── how a finished turn looks ─────────────────────────
+
+/// Set to 1 (with `PROVIDER_API_KEY`) to have Advisor read how a long turn ended; with the flag but
+/// no key (or when Advisor fails) a keyword scan stands in. Either way it only ever adds a warning.
+const OUTCOME_FLAG: &str = "EMPIRE_ADVISOR_OUTCOME";
+/// Seconds the final output gets to settle after the turn is Done.
+const OUTCOME_WAIT: u64 = 2;
+const OUTCOME_LABELS: [&str; 4] = ["completed", "partial", "failed", "needs_review"];
+/// Confidence given to a keyword-scan verdict.
+const SCAN_CONF: f32 = 0.5;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Gate {
+    Off,
+    /// Flag on, nothing to ask: keyword scan only.
+    Scan,
+    Advisor,
+}
+
+fn gate_of(flag: bool, key: bool) -> Gate {
+    match (flag, key) {
+        (false, _) => Gate::Off,
+        (true, false) => Gate::Scan,
+        (true, true) => Gate::Advisor,
+    }
+}
+
+fn outcome_gate() -> Gate {
+    let flag = std::env::var(OUTCOME_FLAG).ok();
+    // `enabled_with` wants a key, so ask it about the flag alone with a stand-in one
+    let on = advisor::enabled_with(Some("x"), flag.as_deref());
+    gate_of(on, advisor::enabled(OUTCOME_FLAG))
+}
+
+/// A turn is worth reading when it was long enough to matter and ended in Done.
+fn wants_outcome(gate: Gate, kind: &str, status: Status, long: bool) -> bool {
+    gate != Gate::Off && kind != "shell" && status == Status::Done && long
+}
+
+/// The status changed: forget the last turn's outcome, and line up a read of this one if it's due.
+fn outcome_turn(g: &mut Agent, long: bool, now: Instant) {
+    g.outcome = None;
+    g.outcome_due = None;
+    g.outcome_from = None;
+    g.outcome_gen = g.outcome_gen.wrapping_add(1);
+    if wants_outcome(outcome_gate(), &g.kind, g.status, long) {
+        g.outcome_due = Some(now + Duration::from_secs(OUTCOME_WAIT));
+        g.outcome_from = g.worked_at.map(|w| unix_now().saturating_sub(w.elapsed().as_secs()));
+    }
+}
+
+/// Screen lines worth reading as a result: no box drawing, rules, bare prompts or key hints.
+fn strip_chrome(screen: &str) -> String {
+    const HINTS: [&str; 14] = [
+        "esc to interrupt", "ctrl+c to", "ctrl-c to", "? for shortcuts", "shift+tab", "bypass permissions", "auto-accept",
+        "accept edits", "press enter to", "tab to queue", "for newline", "context left", "% context", "ctrl+t to",
+    ];
+    screen
+        .lines()
+        .map(unbox)
+        .filter(|l| l.chars().any(char::is_alphanumeric) && !matches!(*l, ">" | "❯" | "›" | "$"))
+        .filter(|l| {
+            let low = l.to_lowercase();
+            !HINTS.iter().any(|h| low.contains(h))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The last ~1500 chars of what's on screen, with chrome and secrets taken out.
+fn final_output(screen: &str) -> String {
+    crate::redact::tail(&crate::redact::redact(&strip_chrome(screen)), 1500)
+}
+
+fn outcome_req(kind: &str, mission: &str, output: &str) -> serde_json::Value {
+    let state = serde_json::json!({ "agent": kind, "mission": crate::redact::clip(&crate::redact::redact(mission), 300), "final_output": output });
+    advisor::request(state, vec![
+        ("has_summary", advisor::noul_q("Does `final_output` contain the agent's own summary of what it did or found in this turn (as opposed to only tool output, a prompt, or a screen that is still in progress)?")),
+        ("outcome", advisor::choice_q("Judging from the agent's own words in `final_output`, how did its work on `mission` end? Say completed only when the agent reports the job done with nothing outstanding.", &[
+            ("completed", "the agent reports the work done, with nothing left over"),
+            ("partial", "the agent did part of it and says something remains, was skipped, or is left as a TODO"),
+            ("failed", "the agent reports errors, failures or that it could not do it"),
+            ("needs_review", "the agent finished but asks the user to review, decide or check something"),
+        ])),
+    ])
+}
+
+/// A Noul at or above this is a yes.
+const OUTCOME_YES: f32 = 0.7;
+
+/// Advisor's reading: `None` is a failure (fall back); `Some(None)` is "nothing to say", because the
+/// output holds no summary to judge or Advisor wasn't sure it did.
+fn read_outcome(v: &serde_json::Value) -> Option<Option<Outcome>> {
+    if advisor::noul(v, "has_summary")? < OUTCOME_YES {
+        return Some(None);
+    }
+    let c = advisor::choice(v, "outcome", &OUTCOME_LABELS)?;
+    Some(Some(Outcome { label: c.label, conf: c.confidence }))
+}
+
+/// What to record for a turn: Advisor's reading, or the keyword scan when Advisor gave none.
+fn outcome_of(answer: Option<&serde_json::Value>, output: &str) -> Option<Outcome> {
+    answer.and_then(read_outcome).unwrap_or_else(|| scan_outcome(output))
+}
+
+/// Only one outcome request is in flight at a time.
+static OUTCOME_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask Advisor on a spawned thread (like `alert`) and hand `done` the answer, or `None` on any
+/// failure. False when a request is already in flight; nothing was started.
+fn outcome_ask(req: serde_json::Value, done: impl FnOnce(Option<serde_json::Value>) + Send + 'static) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if OUTCOME_BUSY.swap(true, SeqCst) {
+        return false;
+    }
+    thread::spawn(move || {
+        let answer = advisor::post(&req).ok();
+        OUTCOME_BUSY.store(false, SeqCst);
+        done(answer);
+    });
+    true
+}
+
+/// `kw` in `t` as a word, not as "0 failed", "no errors:" or "failed: 0".
+fn mentions(t: &str, kw: &str) -> bool {
+    t.match_indices(kw).any(|(i, _)| {
+        let (before, after) = (&t[..i], &t[i + kw.len()..]);
+        let word = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+        let zero = ["0 ", "no ", "zero ", "without ", "not "].iter().any(|z| before.ends_with(z)) || [": 0", "=0", ": none"].iter().any(|z| after.starts_with(z));
+        word(before.chars().next_back()) && (kw.ends_with(':') || word(after.chars().next())) && !zero
+    })
+}
+
+/// The keyword stand-in for Advisor: errors mean failed, leftovers partial, a request to look
+/// needs_review. When several match, the worse one wins.
+fn scan_outcome(output: &str) -> Option<Outcome> {
+    let low = output.to_lowercase();
+    let label = if ["error:", "failed", "panicked"].iter().any(|k| mentions(&low, k)) {
+        "failed"
+    } else if ["remaining", "skipped"].iter().any(|k| mentions(&low, k)) || mentions(output, "TODO") {
+        "partial"
+    } else if mentions(&low, "please review") {
+        "needs_review"
+    } else {
+        return None;
+    };
+    Some(Outcome { label: label.into(), conf: SCAN_CONF })
+}
+
+/// Read how a ship's finished turn went, once its output has settled.
+fn outcome_tick(a: &Arc<Mutex<Agent>>, g: &mut Agent, now: Instant, gate: Gate) {
+    let Some(due) = g.outcome_due else { return };
+    if gate == Gate::Off || g.status != Status::Done {
+        g.outcome_due = None;
+        return;
+    }
+    // like `settled` in `update`: wait for the final output to stop moving (some TUIs never do)
+    let settled = g.animated() || now - g.last_out > Duration::from_secs(OUTCOME_WAIT);
+    if now < due || (!settled && now < due + Duration::from_secs(8)) {
+        return;
+    }
+    let output = final_output(&g.parser.screen().contents());
+    if output.trim().is_empty() {
+        g.outcome_due = None;
+        return;
+    }
+    if gate == Gate::Scan {
+        g.outcome = scan_outcome(&output);
+        g.outcome_due = None;
+        return;
+    }
+    let (turn, fallback, a) = (g.outcome_gen, output.clone(), a.clone());
+    let started = outcome_ask(outcome_req(&g.kind, &g.task, &output), move |answer| {
+        let read = outcome_of(answer.as_ref(), &fallback);
+        let mut g = a.lock().unwrap();
+        if g.outcome_gen == turn && g.status == Status::Done {
+            g.outcome = read;
+        }
+    });
+    if started {
+        g.outcome_due = None;
+    } else if now > due + Duration::from_secs(30) {
+        // Advisor has been busy too long: don't leave the turn unread
+        g.outcome = scan_outcome(&output);
+        g.outcome_due = None;
+    }
+}
+
+/// The outcome to log on a finished mission: that of the ship's turn that ended it.
+fn mission_outcome(m: &Mission, outcomes: &HashMap<u32, (Outcome, u64)>) -> Option<Outcome> {
+    let (o, from) = outcomes.get(&m.agent?)?;
+    (m.done_at? >= *from).then(|| o.clone())
+}
+
 /// `empire status`: one line for a status bar (`--json`: waybar-style JSON).
 pub fn status(json: bool) {
     let agents = match call(&Req::Peek) {
@@ -2162,9 +2596,11 @@ pub fn ensure_running() -> io::Result<()> {
         return Ok(());
     }
     use std::os::unix::process::CommandExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let log_dir = dirs_state();
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join("daemon.log"))?;
+    crate::state::private_dir(&log_dir)?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(log_dir.join("daemon.log"))?;
+    log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("daemon").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     unsafe {
@@ -2899,5 +3335,400 @@ mod pulse_tests {
         assert_eq!(w("progressing", 1.0), None);
         assert_eq!(w("waiting_on_tool", 1.0), None);
         assert_eq!(w("healthy", 1.0), None);
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ship(id: u32, status: Status) -> Arc<Mutex<Agent>> {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let mut a = new_agent(id, "claude", "/world", Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80);
+        a.status = status;
+        Arc::new(Mutex::new(a))
+    }
+
+    fn answer(summary: f64, label: &str, conf: f64) -> serde_json::Value {
+        json!({ "answers": {
+            "has_summary": { "type": "noul", "noul": summary },
+            "outcome": { "type": "choice", "choice": label, "confidence": conf, "probabilities": { label: 0.8 } },
+        }})
+    }
+
+    #[test]
+    fn only_a_long_finished_turn_of_an_agent_is_read_and_only_with_the_flag() {
+        assert_eq!(gate_of(false, true), Gate::Off);
+        assert_eq!(gate_of(true, false), Gate::Scan, "the keyword scan runs without a key");
+        assert_eq!(gate_of(true, true), Gate::Advisor);
+        assert!(wants_outcome(Gate::Scan, "claude", Status::Done, true));
+        assert!(!wants_outcome(Gate::Off, "claude", Status::Done, true));
+        assert!(!wants_outcome(Gate::Advisor, "claude", Status::Done, false), "short turns are not worth it");
+        assert!(!wants_outcome(Gate::Advisor, "claude", Status::Idle, true));
+        assert!(!wants_outcome(Gate::Advisor, "claude", Status::Blocked, true));
+        assert!(!wants_outcome(Gate::Advisor, "shell", Status::Done, true));
+    }
+
+    #[test]
+    fn the_request_asks_two_questions_and_keeps_the_state_small_and_clean() {
+        let long = "x".repeat(900);
+        let r = outcome_req("claude", &format!("{long} sk-abcdefghijklmnop"), "all done");
+        assert_eq!(r["model"], advisor::model());
+        assert_eq!(r["state"]["agent"], "claude");
+        assert_eq!(r["state"]["final_output"], "all done");
+        assert_eq!(r["state"]["mission"].as_str().unwrap().chars().count(), 300);
+        assert_eq!(r["questions"]["has_summary"]["type"], "noul");
+        assert_eq!(r["questions"]["outcome"]["type"], "choice");
+        let labels: HashSet<_> = r["questions"]["outcome"]["criteria"].as_object().unwrap().keys().cloned().collect();
+        assert_eq!(labels, OUTCOME_LABELS.iter().map(|s| s.to_string()).collect());
+        let r = outcome_req("claude", "fix it with sk-abcdefghijklmnop", "ok");
+        assert!(!r.to_string().contains("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn the_outcome_is_read_only_when_advisor_says_there_is_a_summary() {
+        let o = |v: &serde_json::Value| read_outcome(v);
+        assert_eq!(o(&answer(0.9, "failed", 0.8)), Some(Some(Outcome { label: "failed".into(), conf: 0.8 })));
+        assert_eq!(o(&answer(0.7, "partial", 0.5)).flatten().map(|o| o.label), Some("partial".into()));
+        assert_eq!(o(&answer(0.69, "failed", 0.9)), Some(None), "unsure there is a summary: say nothing");
+        assert_eq!(o(&answer(0.1, "failed", 0.9)), Some(None));
+        // anything odd is a failure, which falls back to the scan
+        assert_eq!(o(&answer(0.9, "exploded", 0.9)), None);
+        assert_eq!(o(&json!({ "answers": { "outcome": { "type": "choice", "choice": "failed", "confidence": 0.9, "probabilities": { "failed": 1.0 } } } })), None);
+        assert_eq!(o(&json!({ "answers": { "has_summary": { "type": "noul", "noul": 0.9 } } })), None);
+        assert_eq!(o(&json!({ "answers": { "has_summary": { "type": "score", "score": 1.0 }, "outcome": {} } })), None);
+        assert_eq!(o(&json!({ "detail": "nope" })), None);
+    }
+
+    #[test]
+    fn an_error_or_a_missing_answer_falls_back_to_the_keyword_scan() {
+        let output = "FAILED: 2 tests. error: build broke";
+        assert_eq!(outcome_of(None, output).map(|o| o.label), Some("failed".into()));
+        assert_eq!(outcome_of(Some(&json!({ "answers": {} })), output).map(|o| o.label), Some("failed".into()));
+        // an answer of "nothing to say" is not an error: the scan does not second-guess it
+        assert_eq!(outcome_of(Some(&answer(0.1, "completed", 0.9)), output), None);
+        assert_eq!(outcome_of(None, "All good, nothing to add."), None);
+    }
+
+    #[test]
+    fn the_scan_reads_failure_leftovers_and_requests_for_review() {
+        let label = |t: &str| scan_outcome(t).map(|o| o.label);
+        assert_eq!(label("error: could not compile"), Some("failed".into()));
+        assert_eq!(label("2 tests failed"), Some("failed".into()));
+        assert_eq!(label("thread 'main' panicked at src/x.rs"), Some("failed".into()));
+        assert_eq!(label("Three files remaining"), Some("partial".into()));
+        assert_eq!(label("skipped the flaky test"), Some("partial".into()));
+        assert_eq!(label("left a TODO in the parser"), Some("partial".into()));
+        assert_eq!(label("Please review the migration"), Some("needs_review".into()));
+        assert_eq!(label("skipped one test, error: boom"), Some("failed".into()), "the worse reading wins");
+        assert_eq!(scan_outcome("error: x").unwrap().conf, SCAN_CONF);
+        // green runs and lookalikes are not warnings
+        assert_eq!(label("test result: ok. 116 passed; 0 failed; 0 ignored"), None);
+        assert_eq!(label("no errors: all clear, failed: 0"), None);
+        assert_eq!(label("Update Todos: wrote todolist, remainders"), None);
+        assert_eq!(label("a todo in lowercase, unfailed, errors"), None);
+        assert_eq!(label(""), None);
+    }
+
+    #[test]
+    fn terminal_chrome_and_secrets_stay_out_of_the_final_output() {
+        let screen = "╭────────────╮\n│ > │\n╰────────────╯\n● Fixed the parser and added tests.\n  Set OPENAI_API_KEY=sk-abcdefghijklmnop for the run\n? for shortcuts\n  esc to interrupt\n❯\n> \n─────────\n".replace("\\n", "\n");
+        let out = final_output(&screen);
+        assert_eq!(out, "● Fixed the parser and added tests.\nSet OPENAI_API_KEY=[redacted] for the run");
+        let many = (0..400).map(|i| format!("line number {i} of the output")).collect::<Vec<_>>().join("\n");
+        let out = final_output(&many);
+        assert_eq!(out.chars().count(), 1500);
+        assert!(out.ends_with("line number 399 of the output"));
+    }
+
+    #[test]
+    fn an_old_missions_file_still_loads_and_a_new_one_round_trips() {
+        let old = r#"[{"id":3,"cwd":"/w","text":"Fix it","state":"done","agent":2,"at":100,"done_at":160}]"#;
+        let ms: Vec<Mission> = serde_json::from_str(old).expect("old missions.json must keep loading");
+        assert_eq!((ms.len(), ms[0].id, ms[0].outcome.clone()), (1, 3, None));
+        // the way `run` loads it: a schema mismatch here would silently empty the log
+        assert_eq!(serde_json::from_str::<Vec<Mission>>(old).unwrap_or_default().len(), 1);
+        let mut m = ms[0].clone();
+        m.outcome = Some(Outcome { label: "partial".into(), conf: 0.6 });
+        let back: Vec<Mission> = serde_json::from_str(&serde_json::to_string(&vec![m.clone()]).unwrap()).unwrap();
+        assert_eq!(back, vec![m]);
+        // and a newer file read by a build that has the field but not Outcome's own fields
+        let v: Vec<Mission> = serde_json::from_str(r#"[{"id":1,"cwd":"/w","text":"t","state":"done","agent":null,"at":1,"done_at":2,"outcome":{}}]"#).unwrap();
+        assert_eq!(v[0].outcome, Some(Outcome::default()));
+        assert_eq!(v[0].outcome.as_ref().and_then(Outcome::warn), None);
+    }
+
+    #[test]
+    fn a_done_mission_takes_the_outcome_of_the_turn_that_finished_it() {
+        let hub = Shared::default();
+        let a = ship(2, Status::Working);
+        hub.lock().unwrap().agents.insert(2, a.clone());
+        hub.lock().unwrap().missions.push(Mission { id: 1, cwd: "/world".into(), text: "job".into(), state: "active".into(), agent: Some(2), at: 1, ..Mission::default() });
+        let mut logged = Vec::new();
+        a.lock().unwrap().status = Status::Done;
+        a.lock().unwrap().outcome_from = Some(unix_now() - 20);
+        // the turn is done but not yet read: the mission is done, with no tag
+        dispatch(&hub, &mut logged);
+        assert_eq!(hub.lock().unwrap().missions[0].state, "done");
+        assert_eq!(hub.lock().unwrap().missions[0].outcome, None);
+        // the read lands a little later and is carried over
+        a.lock().unwrap().outcome = Some(Outcome { label: "failed".into(), conf: 0.7 });
+        dispatch(&hub, &mut logged);
+        assert_eq!(hub.lock().unwrap().missions[0].outcome, Some(Outcome { label: "failed".into(), conf: 0.7 }));
+        assert_eq!(logged[0].outcome, hub.lock().unwrap().missions[0].outcome, "and is saved with the log");
+        // a mission finished before that turn began does not take it
+        hub.lock().unwrap().missions.push(Mission { id: 2, cwd: "/world".into(), text: "older".into(), state: "done".into(), agent: Some(2), at: 1, done_at: Some(unix_now() - 500), ..Mission::default() });
+        dispatch(&hub, &mut logged);
+        assert_eq!(hub.lock().unwrap().missions[1].outcome, None);
+    }
+
+    #[test]
+    fn a_settled_long_turn_is_scanned_and_then_forgotten_when_the_ship_moves_on() {
+        let a = ship(1, Status::Done);
+        let now = Instant::now();
+        {
+            let mut g = a.lock().unwrap();
+            g.parser.process(b"Ran the build.\r\nerror: linking failed\r\n");
+            g.last_out = now - Duration::from_secs(5);
+            g.outcome_due = Some(now - Duration::from_secs(1));
+            outcome_tick(&a, &mut g, now, Gate::Scan);
+            assert_eq!(g.outcome.as_ref().map(|o| o.label.as_str()), Some("failed"));
+            assert!(g.outcome_due.is_none());
+            assert_eq!(g.view(now).outcome, g.outcome);
+            // the next turn starts: nothing carries over
+            g.status = Status::Working;
+            outcome_turn(&mut g, true, now);
+            assert!(g.outcome.is_none() && g.view(now).outcome.is_none());
+        }
+        // output still moving: wait for it; off: never read
+        let b = ship(2, Status::Done);
+        let mut g = b.lock().unwrap();
+        g.parser.process(b"error: not yet\r\n");
+        g.last_out = now;
+        g.outcome_due = Some(now);
+        outcome_tick(&b, &mut g, now, Gate::Scan);
+        assert!(g.outcome.is_none() && g.outcome_due.is_some());
+        outcome_tick(&b, &mut g, now + Duration::from_secs(3), Gate::Off);
+        assert!(g.outcome.is_none() && g.outcome_due.is_none());
+    }
+
+    #[test]
+    fn agent_views_from_an_older_daemon_have_no_outcome() {
+        let v: AgentView = serde_json::from_str(r#"{"id":1,"kind":"claude","cwd":"/w","title":"","status":"done","age":0.5}"#).unwrap();
+        assert!(v.outcome.is_none());
+        let mut v = v;
+        v.outcome = Some(Outcome { label: "failed".into(), conf: 0.9 });
+        let back: AgentView = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back.outcome, v.outcome);
+    }
+
+    #[test]
+    fn only_warnings_above_the_confidence_floor_are_ever_shown() {
+        let w = |l: &str, c: f32| Outcome { label: l.into(), conf: c }.warn();
+        assert!(w("failed", 0.4).is_some_and(|w| w.red && w.text == "Looks failed"));
+        assert_eq!(w("partial", 0.4).map(|w| w.text), Some("Partly done"));
+        assert_eq!(w("needs_review", 1.0).map(|w| w.text), Some("Needs review"));
+        assert_eq!(w("failed", 0.39), None);
+        assert_eq!(w("completed", 1.0), None);
+        assert_eq!(w("healthy", 1.0), None);
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ship(id: u32, cwd: &str, task: &str) -> OverlapShip { (id, "claude".into(), cwd.into(), task.into()) }
+
+    fn agent(hub: &Shared, id: u32, kind: &str, cwd: &str, task: &str, status: Status) -> Arc<Mutex<Agent>> {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let mut a = new_agent(id, kind, cwd, Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80);
+        a.status = status;
+        a.task = task.into();
+        let a = Arc::new(Mutex::new(a));
+        hub.lock().unwrap().agents.insert(id, a.clone());
+        a
+    }
+
+    fn views(hub: &Shared) -> Vec<AgentView> {
+        match handle(hub, Req::Peek) {
+            Resp::Agents { agents, .. } => agents,
+            _ => panic!("agents"),
+        }
+    }
+
+    const A: &str = "Refactor the outliner rendering in src/draw.rs to use the new badge colours";
+    const B: &str = "Update the outliner rendering so badges use the new colours, mostly src/draw.rs";
+
+    #[test]
+    fn it_runs_only_with_its_flag_and_works_without_a_key() {
+        assert_eq!(overlap_mode_of(false, true), OverlapMode::Off);
+        assert_eq!(overlap_mode_of(true, false), OverlapMode::Words);
+        assert_eq!(overlap_mode_of(true, true), OverlapMode::Advisor);
+        let hub = Shared::default();
+        agent(&hub, 1, "claude", "/w", A, Status::Working);
+        agent(&hub, 2, "codex", "/w", B, Status::Working);
+        overlap_tick(&hub, Instant::now(), OverlapMode::Off);
+        assert!(hub.lock().unwrap().overlap.pairs.is_empty());
+    }
+
+    #[test]
+    fn only_working_ships_with_a_task_on_a_shared_world_are_compared_and_six_at_most() {
+        let hub = Shared::default();
+        let a = agent(&hub, 1, "claude", "/w", A, Status::Working);
+        let ships = |hub: &Shared| -> Vec<OverlapShip> { hub.lock().unwrap().agents.values().filter_map(|a| overlap_ship(&a.lock().unwrap())).collect() };
+        assert_eq!(overlap_groups(&ships(&hub)).len(), 0, "one ship has nobody to overlap with");
+        agent(&hub, 2, "claude", "/w", B, Status::Working);
+        agent(&hub, 3, "claude", "/w", B, Status::Blocked);
+        agent(&hub, 4, "claude", "/w", B, Status::Done);
+        agent(&hub, 5, "shell", "/w", B, Status::Working);
+        agent(&hub, 6, "claude", "/w", "", Status::Working);
+        agent(&hub, 7, "claude", "/elsewhere", B, Status::Working);
+        let g = overlap_groups(&ships(&hub));
+        assert_eq!(g.len(), 1);
+        assert_eq!((g[0].0.as_str(), g[0].1.iter().map(|s| s.0).collect::<Vec<_>>()), ("/w", vec![1, 2]));
+        a.lock().unwrap().exited = Some(Instant::now());
+        assert!(overlap_groups(&ships(&hub)).is_empty());
+        let many: Vec<_> = (1..=9).map(|i| ship(10 - i, "/w", "x")).collect();
+        assert_eq!(overlap_groups(&many)[0].1.iter().map(|s| s.0).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn the_cache_key_is_the_sorted_id_and_task_pairs() {
+        let (a, b) = (ship(1, "/w", "one"), ship(2, "/w", "two"));
+        assert_eq!(group_hash(&[a.clone(), b.clone()]), group_hash(&[b.clone(), a.clone()]));
+        assert_ne!(group_hash(&[a.clone(), b.clone()]), group_hash(&[a.clone(), ship(2, "/w", "two, differently")]));
+        assert_ne!(pair_key(&a, &b), pair_key(&a, &ship(2, "/w", "other")));
+        assert_eq!(pair_key(&a, &b), pair_key(&a, &ship(2, "/elsewhere", "two")), "the world is not part of a pair");
+    }
+
+    #[test]
+    fn the_request_asks_one_noul_per_pair_and_sends_no_terminal_text() {
+        let long = "y".repeat(500);
+        let ships = [ship(3, "/home/me/code/web", "first"), ship(5, "/home/me/code/web", &long), ship(8, "/home/me/code/web", "third")];
+        let pairs = [(0, 1), (0, 2), (1, 2)];
+        let r = overlap_req("/home/me/code/web", &ships, &pairs);
+        assert_eq!(r["model"], advisor::model());
+        assert_eq!(r["state"]["world"], "web");
+        let fleet = r["state"]["ships"].as_object().unwrap();
+        assert_eq!(fleet.keys().collect::<Vec<_>>(), ["ship_3", "ship_5", "ship_8"]);
+        assert_eq!(fleet["ship_3"], json!({ "species": "claude", "task": "first" }));
+        assert_eq!(fleet["ship_5"]["task"].as_str().unwrap().chars().count(), 300);
+        assert_eq!(r["state"].as_object().unwrap().len(), 2, "world and ships, nothing else");
+        let q = r["questions"].as_object().unwrap();
+        assert_eq!(q.keys().collect::<Vec<_>>(), ["pair_3_5", "pair_3_8", "pair_5_8"]);
+        assert!(q.values().all(|q| q["type"] == "noul" && q["instructions"].as_str().unwrap().contains("same work")));
+        assert!(q["pair_3_8"]["instructions"].as_str().unwrap().contains("ship_3") && q["pair_3_8"]["instructions"].as_str().unwrap().contains("ship_8"));
+    }
+
+    #[test]
+    fn the_fallback_reads_shared_files_and_shared_words() {
+        // the same file named in both
+        assert_eq!(overlap_fallback("fix the crash in src/daemon.rs", "add logging to src/daemon.rs"), 0.8);
+        assert_eq!(overlap_fallback("fix the crash in src/daemon.rs", "add logging to daemon.rs please"), 0.8, "a bare file name matches its path");
+        assert_eq!(overlap_fallback("edit ./Cargo.toml", "bump versions in cargo.toml."), 0.8);
+        assert_eq!(overlap_fallback(A, B), 0.8, "both name src/draw.rs");
+        // mostly the same words
+        assert_eq!(overlap_fallback("Refactor the outliner rendering to use the new badge colours", "Update the outliner rendering so badges use the new colours"), 0.7);
+        // different jobs, different files
+        assert_eq!(overlap_fallback("fix the crash in src/daemon.rs", "restyle the title in src/draw.rs"), 0.0);
+        assert_eq!(overlap_fallback("write the release notes", "tune the music score"), 0.0);
+        // too little to go on, version numbers and "e.g." are not files
+        assert_eq!(overlap_fallback("fix tests", "fix tests"), 0.0);
+        assert_eq!(overlap_fallback("use v1.2 e.g. here", "bump to v1.2 e.g. there"), 0.0);
+        assert_eq!(overlap_fallback("", ""), 0.0);
+    }
+
+    #[test]
+    fn answered_pairs_show_from_0_7_and_vanish_when_a_task_changes() {
+        let (a, b, c) = (ship(1, "/w", "one"), ship(2, "/w", "two"), ship(3, "/w", "three"));
+        let mut pairs = HashMap::new();
+        pairs.insert(pair_key(&a, &b), 0.7);
+        pairs.insert(pair_key(&a, &c), 0.69);
+        let found = overlaps(&[a.clone(), b.clone(), c.clone()], &pairs);
+        assert_eq!(found[&1], vec![Overlap { rival: 2, p: 0.7 }]);
+        assert_eq!(found[&2], vec![Overlap { rival: 1, p: 0.7 }]);
+        assert!(!found.contains_key(&3), "unsure is shown as nothing");
+        assert!(overlaps(&[a.clone(), ship(2, "/w", "two, now different"), c.clone()], &pairs).is_empty());
+        assert!(overlaps(&[a.clone(), ship(2, "/other", "two")], &pairs).is_empty(), "not on the same world");
+        assert!(overlaps(&[a], &pairs).is_empty());
+    }
+
+    #[test]
+    fn without_a_key_the_fallback_flags_the_pair_and_the_views_carry_it_until_one_stops_working() {
+        let hub = Shared::default();
+        let a = agent(&hub, 1, "claude", "/w", A, Status::Working);
+        let b = agent(&hub, 2, "codex", "/w", B, Status::Working);
+        agent(&hub, 3, "claude", "/w", "restyle something unrelated in the music", Status::Working);
+        overlap_tick(&hub, Instant::now(), OverlapMode::Words);
+        let v = views(&hub);
+        assert_eq!(v[0].overlap, vec![Overlap { rival: 2, p: 0.8 }]);
+        assert_eq!(v[1].overlap, vec![Overlap { rival: 1, p: 0.8 }]);
+        assert!(v[2].overlap.is_empty());
+        // a task changes: that pair is read again, and this one is different work
+        b.lock().unwrap().task = "write the release notes for the changelog".into();
+        assert!(views(&hub)[0].overlap.is_empty());
+        overlap_tick(&hub, Instant::now(), OverlapMode::Words);
+        assert!(views(&hub)[0].overlap.is_empty());
+        b.lock().unwrap().task = B.into();
+        assert_eq!(views(&hub)[0].overlap.len(), 1, "an answered pair is remembered, not asked again");
+        // it stops working: the badge goes
+        a.lock().unwrap().status = Status::Done;
+        assert!(views(&hub).iter().all(|v| v.overlap.is_empty()));
+    }
+
+    #[test]
+    fn a_file_conflict_is_left_to_the_red_border_marker() {
+        let hub = Shared::default();
+        let a = agent(&hub, 1, "claude", "/w", A, Status::Working);
+        let b = agent(&hub, 2, "codex", "/w", B, Status::Working);
+        overlap_tick(&hub, Instant::now(), OverlapMode::Words);
+        for x in [&a, &b] { x.lock().unwrap().touched.insert("/w/src/draw.rs".into(), Instant::now()); }
+        let v = views(&hub);
+        assert_eq!(v[0].war.len(), 1);
+        assert!(v.iter().all(|v| v.overlap.is_empty()));
+    }
+
+    #[test]
+    fn advisor_is_asked_once_in_the_background_debounced_and_a_failure_falls_back() {
+        if advisor::enabled("EMPIRE_ADVISOR_OVERLAP_TEST_NEVER") || std::env::var_os("PROVIDER_API_KEY").is_some() {
+            return; // a real key in the environment would make this a live call
+        }
+        let hub = Shared::default();
+        let b = agent(&hub, 2, "codex", "/w", B, Status::Working);
+        agent(&hub, 1, "claude", "/w", A, Status::Working);
+        let now = Instant::now();
+        overlap_tick(&hub, now, OverlapMode::Advisor);
+        assert!(hub.lock().unwrap().overlap.seen.contains_key("/w"));
+        for _ in 0..200 {
+            if !hub.lock().unwrap().overlap.busy { break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // no key: the request failed, so the words answered
+        assert_eq!(hub.lock().unwrap().overlap.pairs.len(), 1);
+        assert_eq!(views(&hub)[0].overlap.len(), 1);
+        // a new task inside the debounce window waits
+        b.lock().unwrap().task = "something else entirely about audio".into();
+        overlap_tick(&hub, now + Duration::from_secs(5), OverlapMode::Advisor);
+        assert!(!hub.lock().unwrap().overlap.busy);
+        assert_eq!(hub.lock().unwrap().overlap.pairs.len(), 1);
+        overlap_tick(&hub, now + Duration::from_secs(31), OverlapMode::Advisor);
+        for _ in 0..200 {
+            if !hub.lock().unwrap().overlap.busy { break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(hub.lock().unwrap().overlap.pairs.len(), 2);
+    }
+
+    #[test]
+    fn views_from_an_older_daemon_have_no_overlap() {
+        let v: AgentView = serde_json::from_str(r#"{"id":1,"kind":"claude","cwd":"/w","title":"","status":"working","age":0.5}"#).unwrap();
+        assert!(v.overlap.is_empty());
+        let mut v = v;
+        v.overlap = vec![Overlap { rival: 7, p: 0.8 }];
+        let back: AgentView = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back.overlap, v.overlap);
     }
 }

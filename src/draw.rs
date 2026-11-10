@@ -1507,6 +1507,9 @@ fn ship_rows(app: &App, w: &World, a: &Agent, t: f32) -> Rows {
     if let Some(row) = pulse_row(a) {
         rows.push(("pulse", row));
     }
+    for o in a.overlap.iter().take(3) {
+        rows.push(("overlap", overlap_row(app, o)));
+    }
     fleet_row(&mut rows, app, &[a]);
     // its own orders: what it's on now first, then what it finished
     let mut ms: Vec<&crate::proto::Mission> = app.missions.iter().filter(|m| m.agent == Some(a.id)).collect();
@@ -1609,6 +1612,15 @@ fn transmission(fb: &mut Fb, app: &App, l: &Lay, t: f32) {
     let mut rest: Vec<(String, V3)> = lines(&q.question, 2, TEXT).collect();
     for d in &q.detail {
         rest.extend(if commandish(d) { lines(d, 8, cmd).collect::<Vec<_>>() } else { lines(d, 3, TEXT * 0.8).collect() });
+    }
+    if let Some(risk) = &q.risk {
+        // Advisor's read (or the denylist's): advice for you, never an answer
+        let c = match risk.level {
+            crate::proto::RiskLevel::Calm => v3(0.45, 0.9, 0.55),
+            crate::proto::RiskLevel::Care => v3(1.0, 0.8, 0.3),
+            crate::proto::RiskLevel::NeedsYou => Status::Blocked.color(),
+        };
+        rest.push((trunc(&format!("⚑ {}", risk.line()), inner), c));
     }
     rest.push((String::new(), DIM));
     // on a short terminal the oldest context gives way first
@@ -1789,12 +1801,14 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 if a.role != Role::None {
                     x = seg(fb, x, row, a.role.name(), 9, a.role.color(), Some(bg)) + 1;
                 }
-                // an amber ↻ (looping) or ✖? (erroring) once Advisor, or the repeat check, thinks so
                 let pulse = a.pulse.as_ref().filter(|_| a.status == Status::Working).and_then(|p| p.warn()).map_or("", |w| w.0);
                 let pulse_w = if pulse.is_empty() { 0 } else { pulse.chars().count() as i32 + 1 };
-                let room = (x0 + pw - 2 - el.len() as i32 - x - pulse_w).max(0);
+                let same = overlap_tag(a);
+                let tag_w = if same.is_empty() { 0 } else { same.chars().count() as i32 + 1 };
+                let room = (x0 + pw - 2 - el.len() as i32 - x - pulse_w - tag_w).max(0);
                 seg(fb, x, row, &pad(&a.title, room as usize), room, if me { TEXT } else { DIM }, Some(bg));
                 if pulse_w > 0 { seg(fb, x + room, row, pulse, pulse_w - 1, PULSE_AMBER, Some(bg)); }
+                if tag_w > 0 { seg(fb, x + room + pulse_w + 1, row, &same, tag_w - 1, DIM * 0.9, Some(bg)); }
                 seg(fb, x0 + pw - 1 - el.len() as i32, row, &el, 8, DIM, Some(bg));
             }
         }
@@ -1853,12 +1867,12 @@ fn centered(l: &Lay, w: i32, h: i32) -> (i32, i32, i32, i32) {
     ((l.cols - w) / 2, (l.rows - h) / 2, w, h)
 }
 
-fn species(fb: &mut Fb, app: &App, x: i32, y: i32, kind: usize) {
+fn species(fb: &mut Fb, app: &App, x: i32, y: i32, kind: usize, vertical: bool) {
     let k = app.kinds.get(kind).map_or("?", String::as_str);
     let mut c = seg(fb, x, y, "species   ", 10, DIM, Some(BOX));
-    c = seg(fb, c, y, "◀ ", 2, DIM, Some(BOX));
+    c = seg(fb, c, y, if vertical { "↑ " } else { "◀ " }, 2, DIM, Some(BOX));
     c = seg(fb, c, y, k, 16, kind_color(k), Some(BOX));
-    seg(fb, c, y, " ▶", 2, DIM, Some(BOX));
+    seg(fb, c, y, if vertical { " ↓" } else { " ▶" }, 2, DIM, Some(BOX));
 }
 
 fn colonize(fb: &mut Fb, _app: &App, c: &Colonize, l: &Lay, t: f32) {
@@ -1911,7 +1925,7 @@ fn deploy(fb: &mut Fb, app: &App, planet: &str, kind: usize, l: &Lay) {
     let accent = v3(0.45, 0.85, 1.0);
     frame_box(fb, x, y, w, h, &format!("◆ HOME → {}", base_name(planet).to_uppercase()), accent);
     seg(fb, x + 3, y + 2, &trunc(&tilde(planet), (w - 6) as usize), w - 6, DIM, Some(BOX));
-    species(fb, app, x + 3, y + 4, kind);
+    species(fb, app, x + 3, y + 4, kind, false);
     seg(fb, x + 3, y + h - 2, "⏎ deploy · ←→ species · esc cancel", w - 6, DIM, Some(BOX));
 }
 
@@ -2099,8 +2113,9 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
         seg(fb, 2, y, if i == sel { "›" } else { " " }, 1, accent, Some(bg));
         if home {
             let need = if let WorkAct::Project(p) = action { app.home_need(p) } else { None };
-            let label = need.map_or_else(|| if matches!(action, WorkAct::Project(_)) { note.as_str() } else { "" }, |a| if a.status == Status::Blocked { "Needs input" } else { "Ready to check" });
-            let color = need.map_or(DIM, |a| a.status.color());
+            let warn = need.filter(|a| a.status == Status::Done).and_then(|a| a.outcome.as_ref()).and_then(|o| o.warn());
+            let label = need.map_or_else(|| if matches!(action, WorkAct::Project(_)) { note.as_str() } else { "" }, |a| if a.status == Status::Blocked { "Needs input" } else { warn.map_or("Ready to check", |w| w.text) });
+            let color = warn.map_or_else(|| need.map_or(DIM, |a| a.status.color()), |w| warn_color(w.red));
             let size = (label.chars().count() as i32).min((width - 10) / 2).max(0);
             seg(fb, 4, y, title, width - 7 - if size > 0 { size + 2 } else { 0 }, if i == sel { accent } else { TEXT }, Some(bg));
             seg(fb, width - 3 - size, y, label, size, color, Some(bg));
@@ -2266,6 +2281,9 @@ fn mission_log(fb: &mut Fb, app: &App, world: &str, sel: usize, open: &HashSet<u
             if let Some(d) = m.done_at {
                 info.push(format!("done {} ago", ago(now.saturating_sub(d) as f32)));
             }
+            if let Some(w) = m.outcome.as_ref().and_then(|o| o.warn()) {
+                info.push(w.text.to_lowercase());
+            }
             lines.push(Ln::More(i, info.join(" · "), DIM * 0.8));
         }
     }
@@ -2328,11 +2346,16 @@ fn mission_log(fb: &mut Fb, app: &App, world: &str, sel: usize, open: &HashSet<u
                     _ => ago(now.saturating_sub(m.at) as f32),
                 };
                 let right = format!("{who} · {when}");
-                let tw = (w - 8 - (c - x) - right.chars().count() as i32).max(4);
+                // a done mission whose turn looked failed or half done wears a warning, never a good-news badge
+                let warn = m.outcome.as_ref().and_then(|o| o.warn()).filter(|_| m.state == "done");
+                let flag = warn.map_or(String::new(), |w| format!("{} {} · ", w.glyph, w.text.to_lowercase()));
+                let right_w = right.chars().count() as i32 + flag.chars().count() as i32;
+                let tw = (w - 8 - (c - x) - right_w).max(4);
                 // an open mission's text is spelled out below
                 let text = if open.contains(&m.id) { String::new() } else { clip(&m.text, tw as usize) };
                 seg(fb, c, r, &text, tw, if m.state == "done" { DIM } else { TEXT }, Some(bg));
                 seg(fb, x + w - 3 - right.chars().count() as i32, r, &right, 30, DIM, Some(bg));
+                if let Some(wn) = warn { seg(fb, x + w - 3 - right_w, r, &flag, flag.chars().count() as i32, warn_color(wn.red), Some(bg)); }
             }
         }
     }
@@ -2406,7 +2429,15 @@ pub fn brief_hit(l: &Lay, text: &Line, images: usize, ships: usize, c: i32, r: i
     }
 }
 
-/// What Advisor suggests for the mission, under its text.
+/// What Advisor suggests for the mission, under its text: a species and its probability. Only a
+/// suggestion at 0.5 confidence or more is shown, and only where a species is being chosen.
+fn advisor_hint(fb: &mut Fb, app: &App, x: i32, y: i32, w: i32) {
+    if let Some(s) = app.route.suggestion.as_ref()
+        && let Some(line) = s.line()
+    {
+        seg(fb, x, y, &line, w, kind_color(&s.kind), Some(BOX));
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch: bool, attachments: &[crate::screenshots::Attachment], sending: bool, l: &Lay, t: f32) {
@@ -2420,7 +2451,10 @@ fn brief(fb: &mut Fb, app: &App, planet: &str, text: &Line, kind: usize, launch:
     }
     seg(fb, x + 3, r, if launch { "○ Next available agent on this planet" } else { "● Next available agent on this planet" }, w - 6, if launch { DIM } else { TEXT }, Some(BOX));
     seg(fb, x + 3, r + 1, if launch { "● Launch from Home" } else { "○ Launch from Home" }, w - 6, if launch { TEXT } else { DIM }, Some(BOX));
-    if launch { species(fb, app, x + 5, r + 2, kind); }
+    if launch {
+        advisor_hint(fb, app, x + 3, r - 1, w - 6);
+        species(fb, app, x + 5, r + 2, kind, true);
+    }
     let queue = app.missions.iter().filter(|m| m.cwd == planet && m.state == "queued").count();
     seg(fb, x + 3, r + 3, &format!("{queue} queued · working agents finish before taking another task"), w - 6, DIM, Some(BOX));
     seg(fb, x + 3, y + h - 3, "Ctrl+V image · Ctrl+O attach path · Ctrl+X remove image", w - 6, DIM, Some(BOX));
@@ -2473,7 +2507,7 @@ fn area(fb: &mut Fb, (x, y, width, rows): (i32, i32, i32, i32), text: &Line, acc
 
 /// The ship card's frame: five lines about the ship, then its menu.
 /// The ship card's info rows: a refit ordered for it gets a row of its own.
-fn card_rows(app: &App, id: u32) -> i32 { 5 + app.agent(id).is_some_and(|a| a.refit.is_some()) as i32 + app.agent(id).is_some_and(|a| pulse_row(a).is_some()) as i32 }
+fn card_rows(app: &App, id: u32) -> i32 { 5 + app.agent(id).is_some_and(|a| a.refit.is_some()) as i32 + app.agent(id).is_some_and(|a| pulse_row(a).is_some()) as i32 + app.agent(id).map_or(0, |a| a.overlap.len().min(3)) as i32 }
 
 const PULSE_AMBER: V3 = v3(1.0, 0.75, 0.3);
 
@@ -2483,6 +2517,17 @@ fn pulse_row(a: &Agent) -> Option<Vec<(String, V3)>> {
     let (glyph, word) = p.warn()?;
     let what = if word == "looping" { "seems to repeat itself" } else { "keeps hitting errors" };
     Some(vec![(format!("{glyph} {word} "), PULSE_AMBER), (format!("{what} · {:.0}% sure", p.conf * 100.0), DIM)])
+}
+
+/// `≈#7` for the ships doing probably the same job as `a`, "" for none.
+fn overlap_tag(a: &Agent) -> String {
+    a.overlap.iter().filter(|o| o.p >= crate::proto::Overlap::SHOW).map(|o| format!("≈#{}", o.rival)).collect::<Vec<_>>().join(" ")
+}
+
+/// The ship card's `overlap` row: dim, and not a warning that anything is wrong yet.
+fn overlap_row(app: &App, o: &crate::proto::Overlap) -> Vec<(String, V3)> {
+    let rival = app.agent(o.rival).map_or(format!("#{}", o.rival), |r| format!("{} #{}", r.kind, r.id));
+    vec![(format!("≈ {rival} "), DIM * 1.2), ("looks like the same work".into(), DIM)]
 }
 
 fn ship_box(app: &App, id: u32, l: &Lay) -> (i32, i32, i32, i32) {
@@ -2532,6 +2577,10 @@ fn ship_card(fb: &mut Fb, app: &App, id: u32, sel: usize, l: &Lay, t: f32) {
     }
     if let Some(row) = pulse_row(a) {
         lines.push(("pulse", row.iter().map(|(s, _)| s.as_str()).collect::<String>(), PULSE_AMBER));
+    }
+    for o in a.overlap.iter().take(3) {
+        let rival = app.agent(o.rival).map_or(format!("#{}", o.rival), |r| format!("{} #{}", r.kind, r.id));
+        lines.push(("overlap", format!("≈ {rival} · looks like the same work or the same files"), DIM * 1.2));
     }
     for (i, (k, v, col)) in lines.iter().enumerate() {
         let r = y + 3 + i as i32;

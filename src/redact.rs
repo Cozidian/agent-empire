@@ -1,5 +1,5 @@
-//! Text made safe to send to Advisor: terminal output goes out only after secrets are blanked and
-//! it is cut to size. Shared by every Advisor feature that sends screen text.
+//! Common secret patterns removed from bounded advisor excerpts. This is best-effort redaction,
+//! not a guarantee that arbitrary terminal text contains no secrets.
 
 /// The first `n` chars.
 pub fn clip(t: &str, n: usize) -> String {
@@ -54,7 +54,7 @@ fn assignment(w: &str) -> Option<usize> {
     (env || secret).then_some(eq)
 }
 
-/// Terminal text made safe to send: `sk-…`, `ghp_…`, `github_pat_…`, `Bearer …` and anything
+/// Common patterns removed from terminal text: `sk-…`, `ghp_…`, `github_pat_…`, `Bearer …` and anything
 /// shaped like `KEY=value` are blanked.
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

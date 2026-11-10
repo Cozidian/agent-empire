@@ -1,0 +1,37 @@
+<p class="lead">Spend your attention where it helps the fleet move.</p>
+<h2 id="find-who-needs-you">Find who needs you</h2>
+<p>On the galaxy, <kbd>Tab</kbd> selects the next agent needing you. Uppercase <kbd>C</kbd> opens the attention list across projects. Home also prioritizes projects with input or review waiting.</p>
+<p>Permission questions appear as incoming transmissions with the requested command highlighted. Use a displayed number key to answer, or <kbd>c</kbd> to open comms and inspect the conversation. Read the request before approving it. When the galaxy is closed, desktop notifications can report questions and completed turns.</p>
+<h2 id="inspect-a-finding">Inspect a finding</h2>
+<p>Uppercase <kbd>A</kbd> opens anomalies across the galaxy; lowercase <kbd>a</kbd> inside a project filters to that world. Findings include detected Git conflicts and failing CI, plus reported bugs, unclear behavior, documentation gaps and improvement ideas.</p>
+<p>Each finding keeps its source and evidence. Reported findings are labelled as not independently verified. Select one and press <kbd>t</kbd> to prepare an investigation task. Read and edit the brief before sending; its request for a read-only investigation does not replace the agent's permission controls.</p>
+<h2 id="manage-the-list">Manage the list</h2>
+<table><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody><tr><td><kbd>x</kbd> / <kbd>d</kbd></td><td>Dismiss / defer a finding</td></tr><tr><td><kbd>r</kbd> / <kbd>o</kbd></td><td>Resolve / reopen a finding</td></tr><tr><td><kbd>v</kbd></td><td>Include resolved and dismissed history</td></tr><tr><td><kbd>f</kbd> / <kbd>/</kbd></td><td>Filter kinds / search</td></tr><tr><td><kbd>Backspace</kbd></td><td>Reset filters</td></tr></tbody></table>
+<p>Automatic findings resolve when a fresh survey confirms recovery. An agent finishing an investigation is not proof that the original issue is fixed.</p>
+<h2 id="report-from-a-terminal">Report from a terminal</h2>
+<p>You or an agent can record a discovery without starting the daemon:</p>
+<pre><code>empire anomaly /path/to/project 'Confusing login flow' \
+  'The callback discards the destination; see src/auth.rs.' 'agent report'</code></pre>
+<p>Use concrete evidence and a useful source label. Keep secrets and personal data out of report text if you plan to share it.</p>
+
+<h2 id="advisor">Optional report severity</h2>
+<p>With <code>EMPIRE_ADVISOR_SEVERITY=1</code>, <code>PROVIDER_API_KEY</code> and an explicit
+<code>PROVIDER_BASE_URL</code>, a compatible typed-decision service can score reports to order
+the attention list. Report titles, evidence and project basenames leave your machine.
+This is off by default; failures and uncertain answers preserve the normal ordering.
+The service must implement <code>POST /v1/advice</code>, and <code>PROVIDER_DEFAULT_MODEL</code>
+selects its model. This is not a generic chat API.</p>
+
+<h2 id="overlap">Overlapping missions</h2>
+<p><code>EMPIRE_ADVISOR_OVERLAP=1</code> adds a dim ≈ badge when working ships on the same
+world appear to share a task. Without advisor configuration this compares task words and file
+paths locally. With a configured advisor it sends project basenames, species and task snippets
+(up to 300 characters per ship). Failures fall back to the local comparison. This does not stop
+ships or replace the red badge for actual file conflicts.</p>
+
+<h2 id="approval-advice">Optional approval advice</h2>
+<p>With advisor configuration and <code>EMPIRE_ADVISOR_TRIAGE=1</code>, approval prompts show
+an advisory risk label. The configured service receives the question, command details, context
+and choices, with common secret patterns removed. Recognized destructive commands and credential
+requests receive a local “needs you” label instead. You still decide every approval; these labels
+are not a security boundary and never change an agent’s native permissions.</p>
