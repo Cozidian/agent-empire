@@ -94,7 +94,7 @@ mod tests {
     fn names_are_validated_and_failed_edits_preserve_the_book() {
         let mut b = Book::default();
         let id = b.create("Orion").unwrap();
-        for name in ["", "   ", "orion", "bad\nname"] { assert!(b.create(name).is_err()); }
+        for name in ["", "   ", "oRiOn", "bad\nname"] { assert!(b.create(name).is_err()); }
         let other = b.create("Research").unwrap();
         let before = b.clone();
         assert!(b.rename(other, " Orion ").is_err());

@@ -131,7 +131,7 @@ impl Input {
     pub fn new(ask: &Ask, project: &str, agent: &str) -> Input {
         Input {
             question: ask.question.clone(),
-            context: ask.context.clone(),
+            context: ask.context.iter().chain(&ask.detail).cloned().collect(),
             options: ask.options.iter().map(|o| o.label.clone()).collect(),
             project: project.into(),
             agent: agent.into(),
@@ -149,7 +149,7 @@ impl Input {
     }
 
     pub fn request(&self) -> Value {
-        let state = json!({ "agent": self.agent, "project": self.project, "context": advisor::clip(&self.context.join("\n")), "question": advisor::clip(&self.question), "options": self.options });
+        let state = json!({ "agent": self.agent, "project": self.project, "context": advisor::clip(&crate::redact::redact(&self.context.join("\n"))), "question": advisor::clip(&crate::redact::redact(&self.question)), "options": self.options.iter().map(|s| advisor::clip(&crate::redact::redact(s))).collect::<Vec<_>>() });
         advisor::request(state, vec![("risk", advisor::choice_q(RISK_INSTRUCTIONS, &LABELS)), ("outside", advisor::noul_q(OUTSIDE_INSTRUCTIONS))])
     }
 }
@@ -288,6 +288,7 @@ mod tests {
             question: question.into(),
             context: context.iter().map(|s| s.to_string()).collect(),
             options: vec![Choice { key: "1".into(), label: "Yes, proceed".into() }, Choice { key: "3".into(), label: "No, and tell it what to do differently".into() }],
+            detail: Vec::new(),
             risk: None,
         }
     }
@@ -371,6 +372,18 @@ mod tests {
         assert!(req["questions"]["outside"]["instructions"].as_str().unwrap().contains("outside the project"));
         assert_eq!(req["state"]["project"], "agent-empire");
         assert!(req["state"]["context"].as_str().unwrap().contains("cargo test"));
+    }
+
+    #[test]
+    fn command_details_are_checked_before_any_request() {
+        let mut prompt = ask("Allow this command?", &[]);
+        prompt.detail = vec!["$ rm -rf build".into()];
+        let i = Input::new(&prompt, "project", "codex");
+        assert!(i.request()["state"]["context"].as_str().unwrap().contains("rm -rf"));
+        let badge = Engine::default().assess(&i, |_| unreachable!("blocked detail stays local")).unwrap();
+        assert_eq!(badge.level, RiskLevel::NeedsYou);
+        prompt.detail = vec!["echo ghp_ABCDEFGH12345678".into()];
+        assert!(!Input::new(&prompt, "project", "codex").request().to_string().contains("ABCDEFGH12345678"));
     }
 
     #[test]

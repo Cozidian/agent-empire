@@ -1,13 +1,86 @@
-# AGENT EMPIRE
+# Agent Empire
 
-A persistent galaxy for your coding projects. Projects are **planets**, agents are **ships**,
-and ordinary terminals live alongside them. Launch Claude, Codex or Grok, give it work,
-run the project yourself, and return whenever it needs you.
+**Your projects are planets. Your coding agents are ships. You run the galaxy.**
+
+Give Claude, Codex or Grok a task, open a terminal beside it, and move on to another world.
+Empire keeps the sessions alive and shows you who is working, who needs an answer, and what is
+ready to review. Come back to the same fleet when you reopen your terminal.
+
+![Agent Empire's galaxy: fictional projects orbit a star while coding agents work](docs/images/galaxy.png)
+
+*A real render with fictional projects. Planets, ships, nebulae and sound are generated in code.*
+
+[User guide](docs/guide/README.md) · [Get started](#get-started) · [Daily workflow](#your-first-flight) · [Controls](#galaxy-controls-and-atmosphere) · [Full manual](#home-and-your-projects) · [Contributing](CONTRIBUTING.md)
+
+## A place for the work you have in flight
+
+- **One map for many projects.** Folders become worlds, parent folders become systems, and Git
+  worktrees orbit their projects as stations.
+- **Your agents, in their native terminals.** Launch installed coding CLIs and keep their normal
+  tools and permission prompts. Ordinary shells live alongside them for servers, tests and Git.
+- **Tasks that wait their turn.** Queue a prompt for a project's next available agent, or launch
+  a new ship. Jump to the next agent that needs your attention.
+- **A workspace that stays put.** Close the galaxy without stopping your agents or development
+  servers. Reopen it to reconnect.
+- **Progress you can see.** Git changes, pull requests, project findings and agent resources have
+  a place on the map. Procedural worlds and an ambient soundtrack make it feel like somewhere.
+
+![A project workspace with its task menu, working Claude agent and procedural planet](docs/images/workspace.png)
+
+## Get started
+
+Empire is early-stage software developed on **Linux**. It needs a recent stable Rust toolchain,
+a C toolchain, `pkg-config`, ALSA development headers, Git, and a true-color terminal. A font with
+Unicode 16 octant glyphs gives the intended graphics. Other operating systems are not currently
+supported. Audio is optional at runtime; the build still needs the ALSA headers.
+
+On Debian/Ubuntu, install the native build packages:
 
 ```sh
-cargo build --release
+sudo apt install build-essential pkg-config libasound2-dev git
+```
+
+On Arch Linux:
+
+```sh
+sudo pacman -S --needed base-devel alsa-lib git
+```
+
+Install and authenticate at least one supported agent CLI (`claude`, `codex` or `grok`) separately.
+Empire uses the executables on your `PATH`; it does not include model access or an AI subscription.
+The GitHub station additionally uses an authenticated `gh` CLI. You can explore projects and use
+ordinary terminals without an agent installed.
+
+```sh
+git clone https://github.com/Cozidian/agent-empire.git
+cd agent-empire
+cargo build --release --locked
 ./target/release/empire
 ```
+
+To launch with `empire` from any terminal, link the release build into your user command directory
+(which must be on your `PATH`). Run this from the repository root after building:
+
+```sh
+mkdir -p ~/.local/bin
+ln -s "$PWD/target/release/empire" ~/.local/bin/empire
+empire
+```
+
+The link uses this checkout's release build, so `cargo build --release` updates the command too.
+Keep the checkout in place while using the link.
+
+## Your first flight
+
+1. Press **V**, then **n**, to add a folder containing your projects. Empire discovers repositories
+   beneath it. Use **n** on the galaxy to add just one folder instead.
+2. Select a planet and press **Enter**. Press **t** to give it a task or **e** to launch an agent.
+3. Open the agent's native terminal to talk to it. **F12** or **Ctrl-]** returns to Empire.
+4. Press **b** in the project to open a shell and run your tests or development server.
+5. Press **q** from the galaxy when you're done looking around. Your sessions keep running.
+
+New here? Press **?** on the galaxy for help. Closing the UI keeps sessions alive;
+`empire stop` deliberately stops the daemon **and every session**.
 
 ## Home and your projects
 
@@ -101,11 +174,24 @@ current task or question. On wider terminals, selecting an agent with a handoff 
 recent terminal output, including testing instructions when the agent provided them. This is an
 excerpt, not an independently verified summary. Open the native terminal for the full conversation.
 
+**Overlapping work (optional, automatic).** With `EMPIRE_ADVISOR_OVERLAP=1`, when two or more ships are
+Working on one world, a configured advisor is asked, once per pair, whether
+their tasks ask for the same work or work likely to edit the same files. At 0.7 or more both ships
+get a dim `≈#7` in the outliner and an `overlap` row on the ship card. This comes earlier than
+the red `⚔` border conflict, which still means files were really edited by both. It is only a
+hint: nothing is asked of you or done for you. With the flag but no advisor configuration (or if Advisor fails), shared file paths or mostly shared words in
+the two tasks stand in. Only the project basename, species and each task snippet (up to 300 characters)
+are sent, never terminal text; a world is asked about at most once every 30 seconds. The model
+(`advisor-1.14.0`) and endpoint can be overridden with `PROVIDER_DEFAULT_MODEL` and `PROVIDER_BASE_URL`.
+
 ## Native terminals and quick tasks
 
 Every key in a native terminal, including **Esc** and **Ctrl+C**, goes to that session.
 **Ctrl-]** or **F12** returns to the project or galaxy. Scrolling uses the application's own mouse
 support when available, otherwise Empire's terminal history. Drag to select and copy text.
+**Shift+Enter** is forwarded as a distinct key for agents' multiline prompts on terminals that
+support enhanced keyboard input. **Enter** still sends; **Alt+Enter** and **Ctrl+J** are also
+forwarded for agents that use those newline shortcuts.
 
 The galaxy and terminal status bar adapts to the window width. Smaller windows shorten the
 fleet summary and usage display, keeping connection status visible. Compact usage shows each
@@ -114,6 +200,8 @@ allows. At the narrowest sizes, usage and quiet ship tallies give way to agents 
 
 In the planet task composer, **Enter** sends; **Alt+Enter**, **Shift+Enter** or **Ctrl+J** adds a
 line. Pasted line breaks are preserved. **Ctrl+V** pastes clipboard text or attaches a screenshot.
+**Tab** switches destination. **Up/Down** moves through prompt lines and selects the previous/next
+species at the first/last line, matching the species picker's **↑/↓** arrows.
 Drop image paths, or type an image path and use **Ctrl+O**. **Ctrl+X** removes the last attachment.
 Up to eight images, 20 MiB each, are copied to Empire's private screenshot directory so queued
 tasks still work if the originals move. Failed delivery keeps the draft. Cancelling removes
@@ -130,6 +218,19 @@ galaxy selects the next agent needing you; **C** opens the attention list across
 Permission questions remain incoming transmissions, with the command the agent wants to run shown
 in full and highlighted; number keys answer the displayed choices and **c** opens comms with the ship.
 When the galaxy is closed, desktop notifications report questions and completed longer turns.
+
+**Outcome tags (optional, automatic).** "Done" only means a turn ended. With
+`EMPIRE_ADVISOR_OUTCOME=1`, a turn longer than 15 seconds is read once its output settles. If the
+output holds the agent's own summary, the configured advisor judges whether
+the work looks failed, partial or needs review. A confident warning (0.4 or more) shows as "Looks
+failed" or "Partly done" instead of "Ready to check" on Home, in the needs list, higher in the
+attention list and on the mission log row, and is saved with the mission. It never shows a good-news
+badge and never acts for you. Low confidence or no summary shows nothing. With the flag
+but no advisor configuration (or if Advisor fails) a keyword scan stands in (`error:`, `failed`,
+`panicked`; `remaining`, `skipped`, `TODO`; `please review`). The last 1500 characters of the
+screen and up to 300 characters of mission text are sent to the configured service, with common
+secret patterns removed. Redaction cannot detect every secret. `PROVIDER_DEFAULT_MODEL` and `PROVIDER_BASE_URL`
+override the model (`advisor-1.14.0`) and endpoint.
 
 **A** opens anomalies across the galaxy; a planet's **a** action filters to that project.
 Anomalies include failing CI and unresolved Git conflicts, plus findings reported by you or an
@@ -250,6 +351,21 @@ To make a local build available on PATH:
 mkdir -p "$HOME/.local/bin"
 ln -s "$PWD/target/release/empire" "$HOME/.local/bin/empire"
 ```
+
+## User guide site
+
+The [user guide](docs/guide/README.md) provides eleven chapters for setup and daily use, with
+chapter navigation, keyboard reference and local search. It builds into static HTML for GitHub
+Pages, with no extra package dependencies:
+
+```sh
+python3 tools/build-docs.py
+python3 -m http.server 8765 --bind 127.0.0.1 --directory target/docs
+```
+
+Open `http://127.0.0.1:8765/`. The [guide README](docs/guide/README.md) explains editing and Pages
+setup. The deployment workflow stays disabled until `PAGES_ENABLED=true` is configured after
+release cleanup. Keep the guide and this manual in step when behavior changes.
 
 ## Development
 
@@ -387,3 +503,44 @@ For scripted starts, `empire research start REQUEST.json` accepts:
 need the research environment: `PATH/TO/research/venv/bin/python -m unittest discover -s research -v`.
 They include the actual Harness² schedule with a clearly marked model test double; no paid model
 calls are made by the unit tests.
+
+## Privacy and trust
+
+Empire is a local, single-user controller for processes running as your Linux user. The daemon
+checks the user ID of both ends of its Unix-socket connection. The socket is mode `0600`, and the
+daemon's state directory is mode `0700`. This is not a sandbox against other processes running
+as you. Agent permissions and isolation are provided by each agent's own harness.
+
+Task text, agent output, screenshots and project paths can be saved in the state directory.
+Native agent CLIs keep their own histories and send requests to their configured providers.
+GitHub features use `gh`; optional Research Station setup downloads its own tools and research
+runs invoke model clients. Review screenshots, logs and study traces before sharing them.
+See [SECURITY.md](SECURITY.md) for reporting and scope.
+
+## License
+
+[MIT](LICENSE) © 2026 Cozidian and contributors. Agent CLIs and optional research tools are
+separate projects with their own licenses and terms.
+
+### Optional advisor
+
+Advisor features are off by default. They require `curl`, `PROVIDER_API_KEY`, an explicit
+`PROVIDER_BASE_URL` for a compatible typed-decision API (`POST /v1/advice`), and a feature flag.
+This is a specialized API, not an OpenAI-compatible chat endpoint. `PROVIDER_DEFAULT_MODEL`
+selects the model (default `advisor-1.14.0`); set it to one your service supports.
+
+`EMPIRE_ADVISOR_SEVERITY=1` sends report titles, evidence and project basenames to that service
+to order reported anomalies by severity. Other finding kinds keep their fixed priorities.
+Errors and uncertain answers leave the existing behavior intact. Treat report text as potentially
+sensitive before enabling this. `EMPIRE_ADVISOR_LOG=1` records decision labels in a private
+`advisor.log` in the state directory. No advisor is needed to play or run agents.
+
+`EMPIRE_ADVISOR_ROUTE=1` suggests an installed species while you compose a task. After the
+text pauses for one second, it sends the project basename and up to 4,000 characters of task
+text. A confident answer can preselect a species, but a species you choose manually wins.
+It never sends the mission; press Enter when you are ready.
+
+`EMPIRE_ADVISOR_TRIAGE=1` adds advisory risk labels to approval prompts. It sends the question,
+command details, nearby context and choices to the configured advisor after removing common
+secret patterns. Recognized destructive commands and credential requests get a local “needs you”
+label without a network request. Labels never approve anything or change native permissions.

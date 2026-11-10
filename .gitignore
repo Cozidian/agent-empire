@@ -1,2 +1,15 @@
 /target
 /demo/*.mp4
+
+# Local agent/editor state and credentials
+/.serena/
+/.codex/
+/.claude/
+/.aws/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+__pycache__/
+*.py[cod]

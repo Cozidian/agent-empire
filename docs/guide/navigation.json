@@ -1,0 +1,13 @@
+[
+  {"slug":"index","title":"Welcome aboard","group":"Start here","description":"A practical field guide to your galaxy of projects, coding agents and terminals."},
+  {"slug":"getting-started","title":"Your first flight","group":"Start here","description":"Install Empire, chart a project and launch your first agent."},
+  {"slug":"projects","title":"Projects & worktrees","group":"Daily operations","description":"Organize folders into worlds and find the work happening around them."},
+  {"slug":"agents","title":"Agents & terminals","group":"Daily operations","description":"Work with your native coding agents and keep ordinary shells alongside them."},
+  {"slug":"tasks","title":"Tasks & screenshots","group":"Daily operations","description":"Write a brief, attach context and queue work for the right project."},
+  {"slug":"attention","title":"Attention & discoveries","group":"Daily operations","description":"Find the agents waiting for you and follow up on project findings."},
+  {"slug":"github","title":"The GitHub station","group":"Daily operations","description":"See pull requests and CI signals without losing your place in the galaxy."},
+  {"slug":"research","title":"Research Station","group":"Go further","description":"Run bounded experiments on agent instructions, then review the evidence."},
+  {"slug":"controls","title":"Keyboard reference","group":"Reference","description":"The controls for the galaxy, project workspaces and native terminals."},
+  {"slug":"persistence","title":"Sessions, updates & privacy","group":"Reference","description":"Understand what stays running, where data lives and how to update safely."},
+  {"slug":"troubleshooting","title":"Troubleshooting","group":"Reference","description":"Recover from common setup, keyboard, graphics and connection problems."}
+]
