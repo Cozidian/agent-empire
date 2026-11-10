@@ -24,6 +24,12 @@ summaries live in `navigation.json`; the shared layout is in `tools/build-docs.p
 small search/navigation enhancement live under `assets/`. The complete chapters and navigation
 remain readable without JavaScript. There are no remote fonts, analytics or third-party scripts.
 
+The theme follows the reader's system light/dark preference; the topbar toggle (or <kbd>t</kbd>)
+overrides it and is remembered in `localStorage`. The starfield is CSS gradients, not images.
+Keyboard shortcuts (press <kbd>?</kbd> on any page): `/` search, `n`/`p` chapters, `j`/`k`
+sections, `g`/`G` top/bottom, `h` home, `m` menu, `t` theme, `Esc` close. Keep the `SHORTCUTS`
+table in `guide.js` in step with the `KEYS` map.
+
 When changing behavior, update the relevant chapter and README.md together. The README remains
 the detailed repository manual; this guide provides a task-oriented introduction and reference.
 Do not publish generated source listings, audit reports, local state or private screenshots.
