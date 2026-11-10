@@ -1504,6 +1504,9 @@ fn ship_rows(app: &App, w: &World, a: &Agent, t: f32) -> Rows {
         let rival = app.agent(war.rival).map_or(format!("#{}", war.rival), |r| format!("{} #{}", r.kind, r.id));
         rows.push(("conflict", vec![(format!("⚔ vs {rival} "), v3(1.0, 0.45, 0.3)), (war.files.join(", "), TEXT)]));
     }
+    for o in a.overlap.iter().take(3) {
+        rows.push(("overlap", overlap_row(app, o)));
+    }
     fleet_row(&mut rows, app, &[a]);
     // its own orders: what it's on now first, then what it finished
     let mut ms: Vec<&crate::proto::Mission> = app.missions.iter().filter(|m| m.agent == Some(a.id)).collect();
@@ -1786,8 +1789,12 @@ fn outliner(fb: &mut Fb, app: &App, w: &World, l: &Lay, t: f32) {
                 if a.role != Role::None {
                     x = seg(fb, x, row, a.role.name(), 9, a.role.color(), Some(bg)) + 1;
                 }
-                let room = (x0 + pw - 2 - el.len() as i32 - x).max(0);
+                // a dim ≈#7: that ship is probably doing the same job (the red ⚔ stays for real file conflicts)
+                let same = overlap_tag(a);
+                let tag_w = if same.is_empty() { 0 } else { same.chars().count() as i32 + 1 };
+                let room = (x0 + pw - 2 - el.len() as i32 - x - tag_w).max(0);
                 seg(fb, x, row, &pad(&a.title, room as usize), room, if me { TEXT } else { DIM }, Some(bg));
+                if tag_w > 0 { seg(fb, x + room + 1, row, &same, tag_w - 1, DIM * 0.9, Some(bg)); }
                 seg(fb, x0 + pw - 1 - el.len() as i32, row, &el, 8, DIM, Some(bg));
             }
         }
@@ -2466,7 +2473,18 @@ fn area(fb: &mut Fb, (x, y, width, rows): (i32, i32, i32, i32), text: &Line, acc
 
 /// The ship card's frame: five lines about the ship, then its menu.
 /// The ship card's info rows: a refit ordered for it gets a row of its own.
-fn card_rows(app: &App, id: u32) -> i32 { 5 + app.agent(id).is_some_and(|a| a.refit.is_some()) as i32 }
+fn card_rows(app: &App, id: u32) -> i32 { 5 + app.agent(id).is_some_and(|a| a.refit.is_some()) as i32 + app.agent(id).map_or(0, |a| a.overlap.len().min(3)) as i32 }
+
+/// `≈#7` for the ships doing probably the same job as `a`, "" for none.
+fn overlap_tag(a: &Agent) -> String {
+    a.overlap.iter().filter(|o| o.p >= crate::proto::Overlap::SHOW).map(|o| format!("≈#{}", o.rival)).collect::<Vec<_>>().join(" ")
+}
+
+/// The ship card's `overlap` row: dim, and not a warning that anything is wrong yet.
+fn overlap_row(app: &App, o: &crate::proto::Overlap) -> Vec<(String, V3)> {
+    let rival = app.agent(o.rival).map_or(format!("#{}", o.rival), |r| format!("{} #{}", r.kind, r.id));
+    vec![(format!("≈ {rival} "), DIM * 1.2), ("looks like the same work".into(), DIM)]
+}
 
 fn ship_box(app: &App, id: u32, l: &Lay) -> (i32, i32, i32, i32) {
     centered(l, 84, app.ship_acts(id).len() as i32 + card_rows(app, id) + 7)
@@ -2512,6 +2530,10 @@ fn ship_card(fb: &mut Fb, app: &App, id: u32, sel: usize, l: &Lay, t: f32) {
     if let Some(r) = &a.refit {
         let (label, col) = refit_label(r);
         lines.push(("refit", label, col));
+    }
+    for o in a.overlap.iter().take(3) {
+        let rival = app.agent(o.rival).map_or(format!("#{}", o.rival), |r| format!("{} #{}", r.kind, r.id));
+        lines.push(("overlap", format!("≈ {rival} · looks like the same work or the same files"), DIM * 1.2));
     }
     for (i, (k, v, col)) in lines.iter().enumerate() {
         let r = y + 3 + i as i32;

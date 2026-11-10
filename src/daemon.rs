@@ -4,6 +4,7 @@
 
 use crate::role::Role;
 use crate::proto::*;
+use crate::advisor;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -429,6 +430,7 @@ impl Agent {
             report: self.report.clone(),
             ask: if self.status == Status::Blocked { self.ask() } else { None },
             war: Vec::new(),
+            overlap: Vec::new(),
             spec: self.spec.clone(),
             refit: self.refit.clone(),
             run: self.run.clone(),
@@ -540,6 +542,8 @@ struct Hub {
     /// When a galaxy last asked for the agent list: while one is open, it does the alerting.
     watched: Option<Instant>,
     missions: Vec<Mission>,
+    /// What Advisor (or the word-overlap fallback) said about pairs of ships on one world.
+    overlap: OverlapBook,
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -966,6 +970,199 @@ fn dispatch(hub: &Shared, logged: &mut Vec<Mission>) {
     if h.missions != *logged {
         if crate::state::edit(&missions_file(), |saved: &mut Vec<Mission>| *saved = h.missions.clone()).is_ok() { *logged = h.missions.clone(); }
     }
+}
+
+// ───────────────────────── overlapping work ─────────────────────────
+
+/// Set to 1 to flag two Working ships on one world whose tasks look like the same job or like
+/// edits to the same files: earlier than the border-conflict detector, which waits for an edit.
+/// Advisor answers one yes/no question per pair (needs `PROVIDER_API_KEY`); with no key, or if Advisor
+/// fails, word and file-path overlap in the task text stands in. It only ever adds a dim badge.
+const OVERLAP_FLAG: &str = "EMPIRE_ADVISOR_OVERLAP";
+/// Advisor is asked about a world at most this often.
+const OVERLAP_DEBOUNCE: Duration = Duration::from_secs(30);
+/// Ships considered per world; the rest are left out.
+const OVERLAP_SHIPS: usize = 6;
+const OVERLAP_TASK: usize = 300;
+const OVERLAP_BOOK: usize = 1024;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum OverlapMode {
+    Off,
+    /// Flag on, no key: the word-overlap fallback only.
+    Words,
+    Advisor,
+}
+
+fn overlap_mode_of(flag: bool, key: bool) -> OverlapMode {
+    match (flag, key) {
+        (false, _) => OverlapMode::Off,
+        (true, false) => OverlapMode::Words,
+        (true, true) => OverlapMode::Advisor,
+    }
+}
+
+fn overlap_mode() -> OverlapMode {
+    let flag = std::env::var(OVERLAP_FLAG).ok();
+    overlap_mode_of(advisor::enabled_with(Some("x"), flag.as_deref()), advisor::enabled(OVERLAP_FLAG))
+}
+
+/// A Working ship's id, species, world and task.
+type OverlapShip = (u32, String, String, String);
+
+/// A ship that can overlap: Working, not a terminal, with a task.
+fn overlap_ship(a: &Agent) -> Option<OverlapShip> {
+    (a.kind != "shell" && a.exited.is_none() && a.status == Status::Working && !a.task.is_empty()).then(|| (a.id, a.kind.clone(), a.cwd.clone(), a.task.clone()))
+}
+
+#[derive(Default)]
+struct OverlapBook {
+    /// P(same work) of a pair and the tasks they have now, by `pair_key`.
+    pairs: HashMap<u64, f32>,
+    /// Per world: the hash of the sorted (id, task) pairs last settled, and when Advisor was last asked.
+    seen: HashMap<String, (u64, Option<Instant>)>,
+    /// A request is in flight (one at a time).
+    busy: bool,
+}
+
+/// Ships by world, two or more, fewest ids first and at most `OVERLAP_SHIPS` each.
+fn overlap_groups(ships: &[OverlapShip]) -> Vec<(String, Vec<OverlapShip>)> {
+    let mut by: std::collections::BTreeMap<&str, Vec<OverlapShip>> = Default::default();
+    for s in ships {
+        by.entry(s.2.as_str()).or_default().push(s.clone());
+    }
+    by.into_iter().filter(|(_, v)| v.len() >= 2).map(|(k, mut v)| { v.sort_by_key(|s| s.0); v.truncate(OVERLAP_SHIPS); (k.to_string(), v) }).collect()
+}
+
+/// A world's group as the cache sees it: the sorted (id, task) pairs.
+fn group_hash(ships: &[OverlapShip]) -> u64 {
+    let mut v: Vec<(u32, &str)> = ships.iter().map(|s| (s.0, s.3.as_str())).collect();
+    v.sort();
+    crate::advisor::digest(&serde_json::json!(v))
+}
+
+/// A pair and their tasks. `a` has the lower id.
+fn pair_key(a: &OverlapShip, b: &OverlapShip) -> u64 {
+    crate::advisor::digest(&serde_json::json!([a.0, a.3, b.0, b.3]))
+}
+
+fn pair_name(a: &OverlapShip, b: &OverlapShip) -> String {
+    format!("pair_{}_{}", a.0, b.0)
+}
+
+fn overlap_req(world: &str, ships: &[OverlapShip], pairs: &[(usize, usize)]) -> serde_json::Value {
+    let fleet: serde_json::Map<String, serde_json::Value> = ships.iter().map(|s| (format!("ship_{}", s.0), serde_json::json!({ "species": s.1, "task": s.3.chars().take(OVERLAP_TASK).collect::<String>() }))).collect();
+    let questions = pairs.iter().map(|&(i, j)| {
+        let (a, b) = (&ships[i], &ships[j]);
+        (pair_name(a, b), advisor::noul_q(&format!("Do the tasks of `ships.ship_{}` and `ships.ship_{}` ask for the same work, or for work likely to edit the same files?", a.0, b.0)))
+    }).collect::<Vec<_>>();
+    advisor::request(serde_json::json!({ "world": crate::game::base_name(world), "ships": fleet }), questions.iter().map(|(k, v)| (k.as_str(), v.clone())).collect())
+}
+
+fn path_like(t: &str) -> bool {
+    if t.contains('/') {
+        return t.chars().any(char::is_alphanumeric);
+    }
+    t.rsplit_once('.').is_some_and(|(stem, ext)| stem.chars().count() >= 2 && (2..=5).contains(&ext.chars().count()) && ext.chars().all(char::is_alphanumeric) && ext.chars().any(char::is_alphabetic))
+}
+
+fn task_paths(t: &str) -> HashSet<String> {
+    t.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~'))).trim_start_matches("./").trim_end_matches('.'))
+        .filter(|w| path_like(w))
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn task_words(t: &str) -> HashSet<String> {
+    const SKIP: [&str; 36] = [
+        "this", "that", "with", "from", "into", "then", "there", "their", "them", "they", "about", "also", "just", "only", "some", "more",
+        "when", "what", "which", "your", "each", "every", "other", "please", "make", "sure", "need", "want", "should", "would", "could",
+        "have", "will", "code", "file", "files",
+    ];
+    t.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 4 && !SKIP.contains(w)).map(String::from).collect()
+}
+
+/// The stand-in for Advisor: the same file named in both tasks is a likely yes; so is most of the
+/// (few) meaningful words being shared. Anything less is a no.
+fn overlap_fallback(a: &str, b: &str) -> f32 {
+    let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let (pa, pb) = (task_paths(a), task_paths(b));
+    let file = pa.iter().any(|p| pb.iter().any(|q| p == q || (base(p) == base(q) && base(p).contains('.'))));
+    if file {
+        return 0.8;
+    }
+    let (wa, wb) = (task_words(a), task_words(b));
+    let shared = wa.intersection(&wb).count();
+    if shared >= 3 && shared * 10 >= wa.len().min(wb.len()) * 6 { 0.7 } else { 0.0 }
+}
+
+/// Work out which pairs of Working ships on each world overlap, when the set of tasks changes.
+/// Advisor is asked about a world's new pairs on a spawned thread, at most once in 30 s, one request
+/// at a time; the fallback answers at once.
+fn overlap_tick(hub: &Shared, now: Instant, mode: OverlapMode) {
+    if mode == OverlapMode::Off {
+        return;
+    }
+    let ships: Vec<OverlapShip> = {
+        let agents: Vec<Arc<Mutex<Agent>>> = hub.lock().unwrap().agents.values().cloned().collect();
+        agents.iter().filter_map(|a| overlap_ship(&a.lock().unwrap())).collect()
+    };
+    let mut h = hub.lock().unwrap();
+    if h.overlap.pairs.len() > OVERLAP_BOOK {
+        h.overlap.pairs.clear();
+        h.overlap.seen.clear();
+    }
+    for (world, group) in overlap_groups(&ships) {
+        let sig = group_hash(&group);
+        if h.overlap.seen.get(&world).is_some_and(|s| s.0 == sig) {
+            continue;
+        }
+        let todo: Vec<(usize, usize)> = (0..group.len()).flat_map(|i| (i + 1..group.len()).map(move |j| (i, j))).filter(|&(i, j)| !h.overlap.pairs.contains_key(&pair_key(&group[i], &group[j]))).collect();
+        let last = h.overlap.seen.get(&world).and_then(|s| s.1);
+        if mode == OverlapMode::Words || todo.is_empty() {
+            for &(i, j) in &todo {
+                h.overlap.pairs.insert(pair_key(&group[i], &group[j]), overlap_fallback(&group[i].3, &group[j].3));
+            }
+            h.overlap.seen.insert(world, (sig, last));
+            continue;
+        }
+        if h.overlap.busy || last.is_some_and(|t| now - t < OVERLAP_DEBOUNCE) {
+            continue;
+        }
+        h.overlap.busy = true;
+        h.overlap.seen.insert(world.clone(), (sig, Some(now)));
+        let (hub, req) = (hub.clone(), overlap_req(&world, &group, &todo));
+        thread::spawn(move || {
+            let answer = advisor::post(&req).ok();
+            let mut h = hub.lock().unwrap();
+            for &(i, j) in &todo {
+                let p = answer.as_ref().and_then(|v| advisor::noul(v, &pair_name(&group[i], &group[j]))).unwrap_or_else(|| overlap_fallback(&group[i].3, &group[j].3));
+                h.overlap.pairs.insert(pair_key(&group[i], &group[j]), p);
+            }
+            h.overlap.busy = false;
+        });
+        break;
+    }
+}
+
+/// Each ship's overlaps now: the pairs on one world that were answered for the tasks they
+/// have now and came out at `Overlap::SHOW` or more. A task that changed, or a ship that
+/// stopped Working, drops out by itself.
+fn overlaps(ships: &[OverlapShip], pairs: &HashMap<u64, f32>) -> HashMap<u32, Vec<Overlap>> {
+    let mut out: HashMap<u32, Vec<Overlap>> = HashMap::new();
+    for (_, group) in overlap_groups(ships) {
+        for i in 0..group.len() {
+            for j in i + 1..group.len() {
+                let Some(&p) = pairs.get(&pair_key(&group[i], &group[j])) else { continue };
+                if p >= Overlap::SHOW {
+                    out.entry(group[i].0).or_default().push(Overlap { rival: group[j].0, p });
+                    out.entry(group[j].0).or_default().push(Overlap { rival: group[i].0, p });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Found a dedicated campaign worktree; never adopt an unrelated directory or branch.
@@ -1438,6 +1635,13 @@ fn handle(hub: &Shared, req: Req) -> Resp {
                     }
                 }
             }
+            // overlapping work: ships on one world whose tasks look like the same job (not yet a file conflict)
+            let ships: Vec<OverlapShip> = list.iter().filter_map(|a| overlap_ship(&a.lock().unwrap())).collect();
+            let found = overlaps(&ships, &hub.lock().unwrap().overlap.pairs);
+            for v in agents.iter_mut() {
+                let war: Vec<u32> = v.war.iter().map(|w| w.rival).collect();
+                v.overlap = found.get(&v.id).map(|o| o.iter().filter(|o| !war.contains(&o.rival)).cloned().collect()).unwrap_or_default();
+            }
             let missions = hub.lock().unwrap().missions.clone();
             Resp::Agents { agents, missions }
         }
@@ -1815,6 +2019,7 @@ pub fn run() -> io::Result<()> {
                 save_registry(&h, &mut saved);
             }
             dispatch(&h, &mut logged);
+            overlap_tick(&h, Instant::now(), overlap_mode());
             // legacy campaign records remain on disk; the workspace no longer dispatches them.
             let now = Instant::now();
             let list: Vec<(u32, Arc<Mutex<Agent>>)> = h.lock().unwrap().agents.iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -2567,5 +2772,203 @@ mod refit_tests {
         back.lock().unwrap().writer.kill();
         STAND_IN.with(|s| *s.borrow_mut() = None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ship(id: u32, cwd: &str, task: &str) -> OverlapShip { (id, "claude".into(), cwd.into(), task.into()) }
+
+    fn agent(hub: &Shared, id: u32, kind: &str, cwd: &str, task: &str, status: Status) -> Arc<Mutex<Agent>> {
+        let (tx, _rx) = UnixStream::pair().unwrap();
+        let mut a = new_agent(id, kind, cwd, Pty { master: File::from(std::os::fd::OwnedFd::from(tx)), pid: 0 }, 24, 80);
+        a.status = status;
+        a.task = task.into();
+        let a = Arc::new(Mutex::new(a));
+        hub.lock().unwrap().agents.insert(id, a.clone());
+        a
+    }
+
+    fn views(hub: &Shared) -> Vec<AgentView> {
+        match handle(hub, Req::Peek) {
+            Resp::Agents { agents, .. } => agents,
+            _ => panic!("agents"),
+        }
+    }
+
+    const A: &str = "Refactor the outliner rendering in src/draw.rs to use the new badge colours";
+    const B: &str = "Update the outliner rendering so badges use the new colours, mostly src/draw.rs";
+
+    #[test]
+    fn it_runs_only_with_its_flag_and_works_without_a_key() {
+        assert_eq!(overlap_mode_of(false, true), OverlapMode::Off);
+        assert_eq!(overlap_mode_of(true, false), OverlapMode::Words);
+        assert_eq!(overlap_mode_of(true, true), OverlapMode::Advisor);
+        let hub = Shared::default();
+        agent(&hub, 1, "claude", "/w", A, Status::Working);
+        agent(&hub, 2, "codex", "/w", B, Status::Working);
+        overlap_tick(&hub, Instant::now(), OverlapMode::Off);
+        assert!(hub.lock().unwrap().overlap.pairs.is_empty());
+    }
+
+    #[test]
+    fn only_working_ships_with_a_task_on_a_shared_world_are_compared_and_six_at_most() {
+        let hub = Shared::default();
+        let a = agent(&hub, 1, "claude", "/w", A, Status::Working);
+        let ships = |hub: &Shared| -> Vec<OverlapShip> { hub.lock().unwrap().agents.values().filter_map(|a| overlap_ship(&a.lock().unwrap())).collect() };
+        assert_eq!(overlap_groups(&ships(&hub)).len(), 0, "one ship has nobody to overlap with");
+        agent(&hub, 2, "claude", "/w", B, Status::Working);
+        agent(&hub, 3, "claude", "/w", B, Status::Blocked);
+        agent(&hub, 4, "claude", "/w", B, Status::Done);
+        agent(&hub, 5, "shell", "/w", B, Status::Working);
+        agent(&hub, 6, "claude", "/w", "", Status::Working);
+        agent(&hub, 7, "claude", "/elsewhere", B, Status::Working);
+        let g = overlap_groups(&ships(&hub));
+        assert_eq!(g.len(), 1);
+        assert_eq!((g[0].0.as_str(), g[0].1.iter().map(|s| s.0).collect::<Vec<_>>()), ("/w", vec![1, 2]));
+        a.lock().unwrap().exited = Some(Instant::now());
+        assert!(overlap_groups(&ships(&hub)).is_empty());
+        let many: Vec<_> = (1..=9).map(|i| ship(10 - i, "/w", "x")).collect();
+        assert_eq!(overlap_groups(&many)[0].1.iter().map(|s| s.0).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn the_cache_key_is_the_sorted_id_and_task_pairs() {
+        let (a, b) = (ship(1, "/w", "one"), ship(2, "/w", "two"));
+        assert_eq!(group_hash(&[a.clone(), b.clone()]), group_hash(&[b.clone(), a.clone()]));
+        assert_ne!(group_hash(&[a.clone(), b.clone()]), group_hash(&[a.clone(), ship(2, "/w", "two, differently")]));
+        assert_ne!(pair_key(&a, &b), pair_key(&a, &ship(2, "/w", "other")));
+        assert_eq!(pair_key(&a, &b), pair_key(&a, &ship(2, "/elsewhere", "two")), "the world is not part of a pair");
+    }
+
+    #[test]
+    fn the_request_asks_one_noul_per_pair_and_sends_no_terminal_text() {
+        let long = "y".repeat(500);
+        let ships = [ship(3, "/home/me/code/web", "first"), ship(5, "/home/me/code/web", &long), ship(8, "/home/me/code/web", "third")];
+        let pairs = [(0, 1), (0, 2), (1, 2)];
+        let r = overlap_req("/home/me/code/web", &ships, &pairs);
+        assert_eq!(r["model"], advisor::model());
+        assert_eq!(r["state"]["world"], "web");
+        let fleet = r["state"]["ships"].as_object().unwrap();
+        assert_eq!(fleet.keys().collect::<Vec<_>>(), ["ship_3", "ship_5", "ship_8"]);
+        assert_eq!(fleet["ship_3"], json!({ "species": "claude", "task": "first" }));
+        assert_eq!(fleet["ship_5"]["task"].as_str().unwrap().chars().count(), 300);
+        assert_eq!(r["state"].as_object().unwrap().len(), 2, "world and ships, nothing else");
+        let q = r["questions"].as_object().unwrap();
+        assert_eq!(q.keys().collect::<Vec<_>>(), ["pair_3_5", "pair_3_8", "pair_5_8"]);
+        assert!(q.values().all(|q| q["type"] == "noul" && q["instructions"].as_str().unwrap().contains("same work")));
+        assert!(q["pair_3_8"]["instructions"].as_str().unwrap().contains("ship_3") && q["pair_3_8"]["instructions"].as_str().unwrap().contains("ship_8"));
+    }
+
+    #[test]
+    fn the_fallback_reads_shared_files_and_shared_words() {
+        // the same file named in both
+        assert_eq!(overlap_fallback("fix the crash in src/daemon.rs", "add logging to src/daemon.rs"), 0.8);
+        assert_eq!(overlap_fallback("fix the crash in src/daemon.rs", "add logging to daemon.rs please"), 0.8, "a bare file name matches its path");
+        assert_eq!(overlap_fallback("edit ./Cargo.toml", "bump versions in cargo.toml."), 0.8);
+        assert_eq!(overlap_fallback(A, B), 0.8, "both name src/draw.rs");
+        // mostly the same words
+        assert_eq!(overlap_fallback("Refactor the outliner rendering to use the new badge colours", "Update the outliner rendering so badges use the new colours"), 0.7);
+        // different jobs, different files
+        assert_eq!(overlap_fallback("fix the crash in src/daemon.rs", "restyle the title in src/draw.rs"), 0.0);
+        assert_eq!(overlap_fallback("write the release notes", "tune the music score"), 0.0);
+        // too little to go on, version numbers and "e.g." are not files
+        assert_eq!(overlap_fallback("fix tests", "fix tests"), 0.0);
+        assert_eq!(overlap_fallback("use v1.2 e.g. here", "bump to v1.2 e.g. there"), 0.0);
+        assert_eq!(overlap_fallback("", ""), 0.0);
+    }
+
+    #[test]
+    fn answered_pairs_show_from_0_7_and_vanish_when_a_task_changes() {
+        let (a, b, c) = (ship(1, "/w", "one"), ship(2, "/w", "two"), ship(3, "/w", "three"));
+        let mut pairs = HashMap::new();
+        pairs.insert(pair_key(&a, &b), 0.7);
+        pairs.insert(pair_key(&a, &c), 0.69);
+        let found = overlaps(&[a.clone(), b.clone(), c.clone()], &pairs);
+        assert_eq!(found[&1], vec![Overlap { rival: 2, p: 0.7 }]);
+        assert_eq!(found[&2], vec![Overlap { rival: 1, p: 0.7 }]);
+        assert!(!found.contains_key(&3), "unsure is shown as nothing");
+        assert!(overlaps(&[a.clone(), ship(2, "/w", "two, now different"), c.clone()], &pairs).is_empty());
+        assert!(overlaps(&[a.clone(), ship(2, "/other", "two")], &pairs).is_empty(), "not on the same world");
+        assert!(overlaps(&[a], &pairs).is_empty());
+    }
+
+    #[test]
+    fn without_a_key_the_fallback_flags_the_pair_and_the_views_carry_it_until_one_stops_working() {
+        let hub = Shared::default();
+        let a = agent(&hub, 1, "claude", "/w", A, Status::Working);
+        let b = agent(&hub, 2, "codex", "/w", B, Status::Working);
+        agent(&hub, 3, "claude", "/w", "restyle something unrelated in the music", Status::Working);
+        overlap_tick(&hub, Instant::now(), OverlapMode::Words);
+        let v = views(&hub);
+        assert_eq!(v[0].overlap, vec![Overlap { rival: 2, p: 0.8 }]);
+        assert_eq!(v[1].overlap, vec![Overlap { rival: 1, p: 0.8 }]);
+        assert!(v[2].overlap.is_empty());
+        // a task changes: that pair is read again, and this one is different work
+        b.lock().unwrap().task = "write the release notes for the changelog".into();
+        assert!(views(&hub)[0].overlap.is_empty());
+        overlap_tick(&hub, Instant::now(), OverlapMode::Words);
+        assert!(views(&hub)[0].overlap.is_empty());
+        b.lock().unwrap().task = B.into();
+        assert_eq!(views(&hub)[0].overlap.len(), 1, "an answered pair is remembered, not asked again");
+        // it stops working: the badge goes
+        a.lock().unwrap().status = Status::Done;
+        assert!(views(&hub).iter().all(|v| v.overlap.is_empty()));
+    }
+
+    #[test]
+    fn a_file_conflict_is_left_to_the_red_border_marker() {
+        let hub = Shared::default();
+        let a = agent(&hub, 1, "claude", "/w", A, Status::Working);
+        let b = agent(&hub, 2, "codex", "/w", B, Status::Working);
+        overlap_tick(&hub, Instant::now(), OverlapMode::Words);
+        for x in [&a, &b] { x.lock().unwrap().touched.insert("/w/src/draw.rs".into(), Instant::now()); }
+        let v = views(&hub);
+        assert_eq!(v[0].war.len(), 1);
+        assert!(v.iter().all(|v| v.overlap.is_empty()));
+    }
+
+    #[test]
+    fn advisor_is_asked_once_in_the_background_debounced_and_a_failure_falls_back() {
+        if advisor::enabled("EMPIRE_ADVISOR_OVERLAP_TEST_NEVER") || std::env::var_os("PROVIDER_API_KEY").is_some() {
+            return; // a real key in the environment would make this a live call
+        }
+        let hub = Shared::default();
+        let b = agent(&hub, 2, "codex", "/w", B, Status::Working);
+        agent(&hub, 1, "claude", "/w", A, Status::Working);
+        let now = Instant::now();
+        overlap_tick(&hub, now, OverlapMode::Advisor);
+        assert!(hub.lock().unwrap().overlap.seen.contains_key("/w"));
+        for _ in 0..200 {
+            if !hub.lock().unwrap().overlap.busy { break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // no key: the request failed, so the words answered
+        assert_eq!(hub.lock().unwrap().overlap.pairs.len(), 1);
+        assert_eq!(views(&hub)[0].overlap.len(), 1);
+        // a new task inside the debounce window waits
+        b.lock().unwrap().task = "something else entirely about audio".into();
+        overlap_tick(&hub, now + Duration::from_secs(5), OverlapMode::Advisor);
+        assert!(!hub.lock().unwrap().overlap.busy);
+        assert_eq!(hub.lock().unwrap().overlap.pairs.len(), 1);
+        overlap_tick(&hub, now + Duration::from_secs(31), OverlapMode::Advisor);
+        for _ in 0..200 {
+            if !hub.lock().unwrap().overlap.busy { break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(hub.lock().unwrap().overlap.pairs.len(), 2);
+    }
+
+    #[test]
+    fn views_from_an_older_daemon_have_no_overlap() {
+        let v: AgentView = serde_json::from_str(r#"{"id":1,"kind":"claude","cwd":"/w","title":"","status":"working","age":0.5}"#).unwrap();
+        assert!(v.overlap.is_empty());
+        let mut v = v;
+        v.overlap = vec![Overlap { rival: 7, p: 0.8 }];
+        let back: AgentView = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back.overlap, v.overlap);
     }
 }

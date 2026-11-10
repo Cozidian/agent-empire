@@ -21,3 +21,10 @@ the attention list. Report titles, evidence and project basenames leave your mac
 This is off by default; failures and uncertain answers preserve the normal ordering.
 The service must implement <code>POST /v1/advice</code>, and <code>PROVIDER_DEFAULT_MODEL</code>
 selects its model. This is not a generic chat API.</p>
+
+<h2 id="overlap">Overlapping missions</h2>
+<p><code>EMPIRE_ADVISOR_OVERLAP=1</code> adds a dim ≈ badge when working ships on the same
+world appear to share a task. Without advisor configuration this compares task words and file
+paths locally. With a configured advisor it sends project basenames, species and task snippets
+(up to 300 characters per ship). Failures fall back to the local comparison. This does not stop
+ships or replace the red badge for actual file conflicts.</p>
