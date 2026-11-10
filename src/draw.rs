@@ -2099,8 +2099,9 @@ fn workspace(fb: &mut Fb, app: &App, w: &World, key: &str, sel: usize, l: &Lay, 
         seg(fb, 2, y, if i == sel { "›" } else { " " }, 1, accent, Some(bg));
         if home {
             let need = if let WorkAct::Project(p) = action { app.home_need(p) } else { None };
-            let label = need.map_or_else(|| if matches!(action, WorkAct::Project(_)) { note.as_str() } else { "" }, |a| if a.status == Status::Blocked { "Needs input" } else { "Ready to check" });
-            let color = need.map_or(DIM, |a| a.status.color());
+            let warn = need.filter(|a| a.status == Status::Done).and_then(|a| a.outcome.as_ref()).and_then(|o| o.warn());
+            let label = need.map_or_else(|| if matches!(action, WorkAct::Project(_)) { note.as_str() } else { "" }, |a| if a.status == Status::Blocked { "Needs input" } else { warn.map_or("Ready to check", |w| w.text) });
+            let color = warn.map_or_else(|| need.map_or(DIM, |a| a.status.color()), |w| warn_color(w.red));
             let size = (label.chars().count() as i32).min((width - 10) / 2).max(0);
             seg(fb, 4, y, title, width - 7 - if size > 0 { size + 2 } else { 0 }, if i == sel { accent } else { TEXT }, Some(bg));
             seg(fb, width - 3 - size, y, label, size, color, Some(bg));
@@ -2266,6 +2267,9 @@ fn mission_log(fb: &mut Fb, app: &App, world: &str, sel: usize, open: &HashSet<u
             if let Some(d) = m.done_at {
                 info.push(format!("done {} ago", ago(now.saturating_sub(d) as f32)));
             }
+            if let Some(w) = m.outcome.as_ref().and_then(|o| o.warn()) {
+                info.push(w.text.to_lowercase());
+            }
             lines.push(Ln::More(i, info.join(" · "), DIM * 0.8));
         }
     }
@@ -2328,11 +2332,16 @@ fn mission_log(fb: &mut Fb, app: &App, world: &str, sel: usize, open: &HashSet<u
                     _ => ago(now.saturating_sub(m.at) as f32),
                 };
                 let right = format!("{who} · {when}");
-                let tw = (w - 8 - (c - x) - right.chars().count() as i32).max(4);
+                // a done mission whose turn looked failed or half done wears a warning, never a good-news badge
+                let warn = m.outcome.as_ref().and_then(|o| o.warn()).filter(|_| m.state == "done");
+                let flag = warn.map_or(String::new(), |w| format!("{} {} · ", w.glyph, w.text.to_lowercase()));
+                let right_w = right.chars().count() as i32 + flag.chars().count() as i32;
+                let tw = (w - 8 - (c - x) - right_w).max(4);
                 // an open mission's text is spelled out below
                 let text = if open.contains(&m.id) { String::new() } else { clip(&m.text, tw as usize) };
                 seg(fb, c, r, &text, tw, if m.state == "done" { DIM } else { TEXT }, Some(bg));
                 seg(fb, x + w - 3 - right.chars().count() as i32, r, &right, 30, DIM, Some(bg));
+                if let Some(wn) = warn { seg(fb, x + w - 3 - right_w, r, &flag, flag.chars().count() as i32, warn_color(wn.red), Some(bg)); }
             }
         }
     }

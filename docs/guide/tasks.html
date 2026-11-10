@@ -20,3 +20,10 @@
 an installed species after a one-second typing pause. It sends the project basename and up to
 4,000 characters of task text to the configured service. A confident result can preselect the
 species; choosing one yourself takes precedence. Nothing is launched until you send the task.</p>
+
+<h2 id="outcomes">Reviewing finished missions</h2>
+<p><code>EMPIRE_ADVISOR_OUTCOME=1</code> adds “Looks failed”, “Partly done” or “Needs review”
+warnings to finished turns and the mission log. Without advisor configuration it scans for
+explicit failure phrases locally. With configuration it sends a bounded mission excerpt and
+terminal output with common secret patterns removed. Redaction cannot detect every secret.
+A warning is a prompt to inspect the work; a quiet result does not verify success.</p>

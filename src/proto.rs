@@ -149,6 +149,46 @@ pub struct AgentView {
     /// The command a shell session runs instead of the shell (an editor on a file); empty for none.
     #[serde(default)]
     pub run: Vec<String>,
+    /// How Advisor reads the turn it just finished, when it has; only for a Done ship, and transient.
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
+}
+
+/// How a finished turn looks: `completed | partial | failed | needs_review`, and how sure.
+/// Only a warning (failed, partial or needs_review, at `Outcome::SHOW` or more) is ever shown.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Outcome {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub conf: f32,
+}
+
+/// What to say about a turn that doesn't look done.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Warn {
+    pub glyph: &'static str,
+    /// "Looks failed", "Partly done", "Needs review".
+    pub text: &'static str,
+    pub red: bool,
+}
+
+impl Outcome {
+    /// The least confidence that's worth a badge.
+    pub const SHOW: f32 = 0.4;
+
+    /// The warning to show, if any. A completed turn, an unknown label or a shaky guess shows nothing.
+    pub fn warn(&self) -> Option<Warn> {
+        if self.conf < Self::SHOW {
+            return None;
+        }
+        match self.label.as_str() {
+            "failed" => Some(Warn { glyph: "✖", text: "Looks failed", red: true }),
+            "partial" => Some(Warn { glyph: "◐", text: "Partly done", red: false }),
+            "needs_review" => Some(Warn { glyph: "?", text: "Needs review", red: false }),
+            _ => None,
+        }
+    }
 }
 
 /// A refit ordered for a deployed ship: the outfit it's to get, and where that stands.
@@ -227,6 +267,10 @@ pub struct Mission {
     #[serde(default)]
     pub campaign: Option<CampaignRef>,
     #[serde(default)] pub campaign_job: String,
+    /// How the turn that finished it looked, if Advisor or the keyword scan could tell.
+    /// `#[serde(default)]` keeps older `missions.json` files loading: a mismatch wipes the log.
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
 }
 
 /// A question read off an agent's screen, answerable from the galaxy.
