@@ -8,13 +8,13 @@ use crate::draw;
 use crate::gfx::*;
 use crate::role::Role;
 use crate::structure::{Built, KINDS, Kind};
-use crate::proto::{AgentView, Ask, Mission, RefitState, Report, ScreenView, ShipSpec, War};
+use crate::proto::{AgentView, Ask, Mission, Overlap, RefitState, Report, ScreenView, ShipSpec, War};
 use crate::survey;
 use crate::sound::{Cue, Sound};
 use crate::screenshots::{self, Attachment};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::{cursor, execute, style, terminal};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -188,6 +188,8 @@ pub struct Agent {
     pub report: Report,
     pub ask: Option<Ask>,
     pub war: Vec<War>,
+    /// Working ships on its world doing what looks like the same job.
+    pub overlap: Vec<Overlap>,
     pub role: Role,
     /// The design it was launched from, by name ("" for none).
     pub design: String,
@@ -640,6 +642,8 @@ pub struct App {
     pub sectors: crate::sector::Book,
     pub sector_focus: Option<u64>,
     pub anomalies: crate::anomaly::Book,
+    /// Fills in report severities in the background when Advisor is on.
+    pub severity: crate::severity::Scorer,
     pub anomaly_filter: crate::anomaly::Filter,
     pub anomaly_detail: usize,
     pub anomaly_error: String,
@@ -934,6 +938,7 @@ impl App {
             sectors: Default::default(),
             sector_focus: None,
             anomalies: Default::default(),
+            severity: crate::severity::Scorer::new(),
             anomaly_filter: Default::default(),
             anomaly_detail: 0,
             anomaly_error: String::new(),
@@ -1337,6 +1342,7 @@ impl App {
                 }
                 let a = &mut self.agents[i];
                 a.war = v.war.clone();
+                a.overlap = v.overlap.clone();
                 if !title.is_empty() {
                     a.title = title;
                 }
@@ -1366,6 +1372,7 @@ impl App {
                     report: v.report.clone(),
                     ask: v.ask.clone(),
                     war: v.war.clone(),
+                    overlap: v.overlap.clone(),
                     role: Role::parse(&v.role),
                     design: v.design.clone(),
                     spec: v.spec.clone(),
@@ -1937,6 +1944,11 @@ impl App {
 fn key_bytes(k: &KeyEvent) -> Option<String> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
+    // preserve shifted Enter for the agent's multiline prompt instead of submitting it
+    if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::SHIFT) {
+        let mods = 2 + if alt { 2 } else { 0 } + if ctrl { 4 } else { 0 };
+        return Some(format!("\x1b[13;{mods}u"));
+    }
     let s = match k.code {
         KeyCode::Char(c) if ctrl => {
             let b = (c.to_ascii_lowercase() as u8) & 0x1f;
@@ -2031,7 +2043,7 @@ impl App {
             }
         }
         for f in self.anomalies.findings.iter().filter(|f| f.state == crate::anomaly::State::Open && f.kind != "CI") {
-            rows.push(Attention { id: format!("anomaly:{}", f.id), world: f.world.clone(), kind: "Anomaly", title: f.title.clone(), detail: f.evidence.clone(), target: AttentionTarget::Anomaly(f.id), rank: 4 });
+            rows.push(Attention { id: format!("anomaly:{}", f.id), world: f.world.clone(), kind: "Anomaly", title: f.title.clone(), detail: f.evidence.clone(), target: AttentionTarget::Anomaly(f.id), rank: f.rank() });
         }
         rows.sort_by(|a, b| (a.rank, &a.world, &a.id).cmp(&(b.rank, &b.world, &b.id)));
         rows
@@ -2063,6 +2075,15 @@ impl App {
                 if self.anomaly_error != msg { self.say(Ev::Error, msg.clone(), RED); }
                 self.anomaly_error = msg;
             }
+        }
+    }
+
+    /// Reports get a severity from Advisor, a couple at a time, without waiting on it.
+    fn score_reports(&mut self) {
+        if !self.severity.enabled { return; }
+        let scores = self.severity.step(&self.anomalies.findings, crate::severity::ask_advisor);
+        if !scores.is_empty() {
+            self.edit_anomalies(|book| crate::severity::apply(book, &scores));
         }
     }
 
@@ -2489,7 +2510,8 @@ pub fn run() -> io::Result<()> {
 
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
-    execute!(out, terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture, EnableBracketedPaste, terminal::Clear(terminal::ClearType::All))?;
+    execute!(out, terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture, EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES), terminal::Clear(terminal::ClearType::All))?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore();
@@ -2502,7 +2524,7 @@ pub fn run() -> io::Result<()> {
 
 fn restore() {
     let mut o = io::stdout();
-    let _ = execute!(o, DisableBracketedPaste, DisableMouseCapture, style::ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
+    let _ = execute!(o, PopKeyboardEnhancementFlags, DisableBracketedPaste, DisableMouseCapture, style::ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
 }
 
@@ -2679,6 +2701,7 @@ fn game_loop(o: &mut io::Stdout, client: &Client, sound: Option<&Sound>, stale: 
             }
             surveyed = Instant::now();
         }
+        app.score_reports();
         // quitting the editor hands you straight back to the file
         if app.editor_quit() {
             app.close_comms(client, &world);
@@ -4656,6 +4679,7 @@ mod ship_card_tests {
             report: Default::default(),
             ask: None,
             war: if war { vec![crate::proto::War { rival: 9, files: vec!["src/a.rs".into()] }] } else { vec![] },
+            overlap: vec![],
             role: Role::None,
             design: String::new(),
             spec: ShipSpec::default(),
@@ -4939,6 +4963,37 @@ mod situation_tests {
 #[cfg(test)]
 mod multiline_tests {
     use super::*;
+
+    #[test]
+    fn task_species_arrows_match_vertical_keys() {
+        let mut app = App::new();
+        app.kinds = vec!["claude".into(), "codex".into()];
+        let w = World { systems: vec![], planets: vec![], lanes: vec![], station: None };
+        for cols in [40, 80, 140] {
+            let mut fb = Fb::new(cols, 30);
+            let l = Lay::new(&fb, false);
+            app.mode = Mode::Brief { planet: "/world".into(), text: Line::default(), kind: 0, launch: true, attachments: vec![], sending: false };
+            handle(&mut app, &w, &l, &Client::isolated(), None, Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), 1.0, &mut None);
+            draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+            let rows: Vec<String> = fb.txt.chunks(cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect()).collect();
+            let row = rows.iter().find(|r| r.contains("species")).unwrap();
+            assert!(row.contains("↑ codex ↓"), "{cols} cols: |{row}|");
+        }
+    }
+
+    #[test]
+    fn agent_enter_preserves_newline_shortcuts() {
+        for (code, mods, bytes) in [
+            (KeyCode::Enter, KeyModifiers::NONE, "\r"),
+            (KeyCode::Enter, KeyModifiers::SHIFT, "\x1b[13;2u"),
+            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT, "\x1b[13;4u"),
+            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::CONTROL, "\x1b[13;6u"),
+            (KeyCode::Enter, KeyModifiers::ALT, "\x1b\r"),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL, "\n"),
+        ] {
+            assert_eq!(key_bytes(&KeyEvent::new(code, mods)).as_deref(), Some(bytes));
+        }
+    }
 
     #[test]
     fn mission_text_moves_between_lines_keeping_the_column() {
@@ -5300,6 +5355,26 @@ mod anomaly_tests {
         key(&mut app, &w, &l, KeyCode::Char('o'));
         assert_eq!(app.anomalies.findings[0].state, State::Open);
         assert!(text(&mut app, &w, 80, 24).contains("ANOMALIES"));
+    }
+
+    #[test]
+    fn a_reports_severity_orders_the_attention_list_and_unscored_ones_rank_as_before() {
+        let (mut app, w, _l) = fixture();
+        for (i, title) in ["quiet note", "disk is full", "unscored"].iter().enumerate() {
+            app.anomalies.observe(Observation { key: format!("report:{i}"), world: "/alpha/api".into(), host: "/alpha/api".into(), kind: "Report".into(),
+                title: (*title).into(), evidence: "e".into(), at: 100, present: true });
+        }
+        let id = |app: &App, title: &str| app.anomalies.findings.iter().find(|f| f.title == title).unwrap().id;
+        let (quiet, full) = (id(&app, "quiet note"), id(&app, "disk is full"));
+        for f in &mut app.anomalies.findings {
+            if f.id == quiet { f.severity = Some(0.2); }
+            if f.id == full { f.severity = Some(2.8); }
+        }
+        let rows = app.attention(&w);
+        let rank = |t: &str| rows.iter().find(|r| r.title == t).map(|r| r.rank).unwrap();
+        assert_eq!((rank("disk is full"), rank("unscored"), rank("Unresolved merge conflicts"), rank("quiet note")), (2, 4, 4, 5));
+        let order: Vec<&str> = rows.iter().filter(|r| r.kind == "Anomaly").map(|r| r.title.as_str()).collect();
+        assert_eq!(order, ["disk is full", "Unresolved merge conflicts", "unscored", "quiet note"]);
     }
 
     #[test]
@@ -5909,6 +5984,78 @@ mod editor_tests {
 }
 
 #[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use crate::proto::Overlap;
+
+    fn fleet(p: f32) -> App {
+        let mut app = App::new();
+        app.history.clear();
+        app.online = true;
+        for (id, rival) in [(1, 2), (2, 1)] {
+            let mut a = ship_card_tests::ship(id, false);
+            a.cwd = "/code/web".into();
+            a.status = Status::Working;
+            a.title = format!("task of ship {id}");
+            a.overlap = vec![Overlap { rival, p }];
+            app.agents.push(a);
+        }
+        app
+    }
+
+    fn render(app: &mut App, mode: Mode) -> String {
+        let w = app.world(0.0, 0.0);
+        let mut fb = Fb::new(140, 50);
+        let l = Lay::new(&fb, true);
+        app.sel = Some(Sel::Planet("/code/web".into()));
+        app.mode = mode;
+        draw::frame(&mut fb, app, &w, &l, 1.0, None);
+        fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn both_outliner_rows_wear_a_dim_badge_for_the_other_ship() {
+        let mut app = fleet(0.8);
+        let text = render(&mut app, Mode::Galaxy);
+        let row = |id: u32| text.lines().find(|l| l.contains(&format!("task of ship {id}"))).unwrap_or_else(|| panic!("no row for {id}\n{text}")).to_string();
+        assert!(row(1).contains("≈#2"), "{}", row(1));
+        assert!(row(2).contains("≈#1"), "{}", row(2));
+        assert!(!text.contains('⚔'), "an overlap is not a file conflict");
+        let mut quiet = fleet(0.8);
+        for a in &mut quiet.agents { a.overlap.clear(); }
+        assert!(!render(&mut quiet, Mode::Galaxy).contains('≈'));
+    }
+
+    #[test]
+    fn the_ship_card_gets_an_overlap_row_only_when_there_is_one() {
+        let mut app = fleet(0.9);
+        let text = render(&mut app, Mode::Ship { id: 1, sel: 0 });
+        let row = text.lines().find(|l| l.contains("overlap")).unwrap_or_else(|| panic!("no overlap row\n{text}"));
+        assert!(row.contains("≈ claude #2"), "{row}");
+        // the card grows by a row, and its menu is still where the clicks land
+        let l = Lay::new(&Fb::new(140, 50), false);
+        let comms = text.lines().position(|r| r.contains("open comms")).unwrap() as i32;
+        let col = text.lines().nth(comms as usize).unwrap().chars().position(|c| c == 'o').unwrap() as i32;
+        assert_eq!(crate::draw::ship_hit(&app, 1, &l, col, comms), Some(Some(0)));
+        app.agents[0].overlap.clear();
+        assert!(!render(&mut app, Mode::Ship { id: 1, sel: 0 }).lines().any(|l| l.contains("overlap")));
+    }
+
+    #[test]
+    fn a_red_conflict_keeps_its_own_row_beside_an_overlap() {
+        let mut app = fleet(0.9);
+        app.agents[0].war = vec![War { rival: 9, files: vec!["src/a.rs".into()] }];
+        let w = app.world(0.0, 0.0);
+        let mut fb = Fb::new(140, 50);
+        let l = Lay::new(&fb, true);
+        app.sel = Some(Sel::Agent(1));
+        draw::frame(&mut fb, &mut app, &w, &l, 1.0, None);
+        let text: String = fb.txt.chunks(fb.cols).map(|r| r.iter().map(|c| c.map_or(' ', |c| c.ch)).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("⚔ vs #9") && text.contains("≈ claude #2"), "{text}");
+    }
+}
+
+#[cfg(test)]
 mod research_tests {
     use super::*;
     #[test] fn research_is_an_independent_destination_at_every_zoom() {
@@ -5923,5 +6070,46 @@ mod research_tests {
         let mut fb = Fb::new(140, 48); draw::frame(&mut fb, &mut app, &w, &l, 0.0, None);
         let text: String = fb.txt.iter().map(|c| c.as_ref().map_or(' ', |c| c.ch)).collect();
         assert!(text.contains("RESEARCH STATION"));
+    }
+}
+
+#[cfg(test)]
+mod release_images {
+    use super::*;
+
+    /// Render fictional projects through the real UI, without a daemon or saved user state.
+    #[test]
+    #[ignore = "writes documentation captures; run explicitly with EMPIRE_CAPTURE_DIR"]
+    fn capture_release_images() {
+        let dir = PathBuf::from(std::env::var("EMPIRE_CAPTURE_DIR").expect("set EMPIRE_CAPTURE_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new();
+        app.online = true; app.loaded = true; app.panel = false;
+        app.kinds = vec!["claude".into(), "codex".into(), "grok".into()];
+        app.projects = ["/demo/observatory", "/demo/star-chart", "/demo/flight-deck"].map(String::from).to_vec();
+        for (i, (kind, status, title)) in [
+            ("claude", Status::Working, "Build the observation timeline"),
+            ("codex", Status::Done, "Chart labels are ready to review"),
+            ("grok", Status::Working, "Test the launch checklist"),
+        ].into_iter().enumerate() {
+            let mut a = ship_card_tests::ship(i as u32 + 1, false);
+            a.cwd = app.projects[i].clone(); a.kind = kind.into(); a.status = status; a.title = title.into();
+            app.survey.worlds.insert(a.cwd.clone(), survey::World { git: true, branch: "main".into(), lang: "Rust".into(), ..Default::default() });
+            app.agents.push(a);
+        }
+        let world = app.world(12.0, 0.0);
+        let mut fb = Fb::new(140, 44);
+        let l = Lay::new(&fb, false);
+        app.sel = Some(Sel::Planet(app.projects[0].clone()));
+        app.fit(&world, &l);
+        let system = world.systems.iter().find(|s| s.name == "demo").unwrap();
+        (app.cam.x, app.cam.y, app.cam.z) = (system.wpos.0, system.wpos.1, 0.75);
+        app.sel = None;
+        for name in ["galaxy", "workspace"] {
+            if name == "workspace" { app.mode = Mode::Workspace { key: app.projects[0].clone(), sel: 0 }; }
+            draw::frame(&mut fb, &mut app, &world, &l, 12.0, None);
+            let mut file = std::fs::File::create(dir.join(format!("{name}.ansi"))).unwrap();
+            Out::new(fb.cols * fb.rows).present(&fb, &mut file).unwrap();
+        }
     }
 }

@@ -1,0 +1,17 @@
+<p class="lead">Keep your agents' native tools. Give their sessions a place to live.</p>
+<h2 id="launch-a-ship">Launch a ship</h2>
+<p>Open a project and press <kbd>e</kbd>, or choose <strong>Launch an agent from Home</strong>. Select an installed species and launch it in that folder. Agents remain at their projects between tasks until you dismiss them.</p>
+<p>Empire uses the agent's normal launch defaults and permission controls. It does not grant blanket approval or replace the harness's sandbox. Authenticate the CLI in a normal terminal before launching it from Empire.</p>
+<h2 id="talk-in-the-native-terminal">Talk in the native terminal</h2>
+<p>Open an agent row with <kbd>Enter</kbd>. Keys including <kbd>Esc</kbd> and <kbd>Ctrl</kbd>+<kbd>C</kbd> go to the agent. Use <kbd>F12</kbd> or <kbd>Ctrl</kbd>+<kbd>]</kbd> to return to the project or galaxy.</p>
+<p><kbd>Shift</kbd>+<kbd>Enter</kbd> is forwarded as a distinct key on terminals with enhanced keyboard input. The agent decides how to interpret it. <kbd>Alt</kbd>+<kbd>Enter</kbd> and <kbd>Ctrl</kbd>+<kbd>J</kbd> also reach the agent for CLIs that use those newline shortcuts.</p>
+<p>The mouse wheel uses the application's own scrolling support when available, otherwise Empire's terminal history. Drag to select and copy text. <kbd>Shift</kbd>+<kbd>Page Up</kbd> and <kbd>Shift</kbd>+<kbd>Page Down</kbd> move through Empire's history.</p>
+<h2 id="ordinary-terminals">Ordinary terminals</h2>
+<p>Press <kbd>b</kbd> inside a project to open your normal shell in its folder. Open as many as you need for a development server, logs, Git commands or tests. Shells are listed separately from agents and keep stable labels such as <strong>Terminal #4</strong>.</p>
+<p>Ordinary shells never take queued agent tasks or generate agent permission/completion alerts. Shell keystrokes and window titles do not become task labels or project-list previews.</p>
+<aside class="note"><strong>A terminal can outlive the UI.</strong> Leaving Empire keeps its shell commands running. Closing that terminal with <kbd>x</kbd> stops its commands after confirmation. A reboot cannot preserve a running development server.</aside>
+<h2 id="check-finished-work">Check finished work</h2>
+<p>A finished agent is ready for your review. Open the native terminal for the full conversation. Wider project views may show an excerpt of recent output, including testing instructions; that excerpt is not an independently verified summary.</p>
+<p>Use a shell to run your checks, inspect the changes and decide what to commit. Multiple agents may share a folder, so consider separate worktrees when tasks need independent branches.</p>
+<h2 id="dismiss-a-session">Dismiss a session</h2>
+<p>Select an agent or terminal and press <kbd>x</kbd>. Empire asks before closing it. To leave the view while keeping the session, use <kbd>F12</kbd> or <kbd>Ctrl</kbd>+<kbd>]</kbd> instead.</p>

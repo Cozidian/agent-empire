@@ -1,0 +1,58 @@
+name: Fleet checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Select stable Rust
+        run: rustup update stable && rustup default stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+  research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install the pinned research runtime
+        run: |
+          python3 -m venv /tmp/empire-research-tests
+          /tmp/empire-research-tests/bin/pip install 'git+https://github.com/google-research/harness2.git@6868817518876de8fd170c6a8354daca273b6191'
+      - name: Test research without model calls
+        run: /tmp/empire-research-tests/bin/python -m unittest discover -s research -v
+
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-verified Gitleaks
+        run: |
+          curl --fail --silent --show-error --location https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz' | sha256sum --check
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      - name: Scan history and the current committed tree
+        run: |
+          /tmp/gitleaks git --redact --log-opts=--all .
+          mkdir /tmp/empire-source
+          git archive HEAD | tar -x -C /tmp/empire-source
+          /tmp/gitleaks dir --redact /tmp/empire-source

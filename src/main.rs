@@ -15,6 +15,7 @@ mod proto;
 mod role;
 mod route;
 mod sector;
+mod severity;
 mod state;
 mod sound;
 mod structure;
