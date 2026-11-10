@@ -1,0 +1,29 @@
+<p class="lead">A task is a prompt waiting for a ship on one particular world.</p>
+<h2 id="write-a-brief">Write a brief</h2>
+<p>Select a project and press <kbd>t</kbd>. Describe the outcome, the relevant context and how you want the result checked. A useful brief might be:</p>
+<blockquote>Fix the settings panel at narrow widths. Keep all actions reachable at 390 pixels, check keyboard navigation, and show the changes before committing.</blockquote>
+<p><kbd>Enter</kbd> sends the task. <kbd>Alt</kbd>+<kbd>Enter</kbd>, <kbd>Shift</kbd>+<kbd>Enter</kbd> or <kbd>Ctrl</kbd>+<kbd>J</kbd> inserts a newline. Pasted line breaks are preserved.</p>
+<h2 id="choose-the-destination">Choose the destination</h2>
+<p><kbd>Tab</kbd> switches between the next available agent on this planet and launching a new ship. With no live agents, the composer defaults to a new launch. The species picker uses <kbd>↑</kbd>/<kbd>↓</kbd>, matching its arrows.</p>
+<p>In a multiline prompt, Up and Down first move between lines. At the first or last line, they select the previous or next species. Left and Right remain text-cursor keys.</p>
+<p>Queued tasks go to one available agent in the <strong>exact project folder</strong>. If every agent is working, the task waits. An agent waiting for permission is not free to accept another task.</p>
+<h2 id="attach-screenshots">Attach screenshots</h2>
+<table><thead><tr><th>Control</th><th>Action</th></tr></thead><tbody><tr><td><kbd>Ctrl</kbd>+<kbd>V</kbd></td><td>Paste clipboard text or attach a clipboard image</td></tr><tr><td><kbd>Ctrl</kbd>+<kbd>O</kbd></td><td>Attach an image using a path typed into the composer</td></tr><tr><td>Drop image paths</td><td>Attach the referenced images</td></tr><tr><td><kbd>Ctrl</kbd>+<kbd>X</kbd></td><td>Remove the most recent attachment</td></tr></tbody></table>
+<p>A task can include up to eight images, at most 20 MiB each. Empire copies them into its private screenshot directory so the task still works if the original files move. The receiving agent needs its own image-viewing capability.</p>
+<p>Failed delivery keeps your draft. Cancelling the composer removes unsent image copies. Submitted attachments become saved task data, so review images for private information before sharing them elsewhere.</p>
+<h2 id="follow-the-task">Follow the task</h2>
+<p>Press uppercase <kbd>L</kbd> on the galaxy to open the selected planet's task history. Open the agent's terminal to see its actual work or answer a question. Completing a turn signals that the result is ready to check, not that it passed its acceptance criteria.</p>
+<p>For a conversation already in progress, you can always type directly into the agent's native terminal instead of creating another queued task.</p>
+
+<h2 id="routing">Optional species suggestions</h2>
+<p>With advisor configuration and <code>EMPIRE_ADVISOR_ROUTE=1</code>, the composer can suggest
+an installed species after a one-second typing pause. It sends the project basename and up to
+4,000 characters of task text to the configured service. A confident result can preselect the
+species; choosing one yourself takes precedence. Nothing is launched until you send the task.</p>
+
+<h2 id="outcomes">Reviewing finished missions</h2>
+<p><code>EMPIRE_ADVISOR_OUTCOME=1</code> adds “Looks failed”, “Partly done” or “Needs review”
+warnings to finished turns and the mission log. Without advisor configuration it scans for
+explicit failure phrases locally. With configuration it sends a bounded mission excerpt and
+terminal output with common secret patterns removed. Redaction cannot detect every secret.
+A warning is a prompt to inspect the work; a quiet result does not verify success.</p>

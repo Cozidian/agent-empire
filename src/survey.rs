@@ -444,9 +444,10 @@ mod anomaly_tests {
     fn a_real_merge_conflict_is_surveyed_and_recovery_clears_it() {
         let dir = std::env::temp_dir().join(format!("empire-conflict-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| Command::new("git").arg("-C").arg(&dir)
+            .args(["-c", "user.name=Empire Test", "-c", "user.email=empire@example.invalid", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
         let run = |args: &[&str]| {
-            let out = Command::new("git").arg("-C").arg(&dir).args(["-c", "user.name=Empire Test", "-c", "user.email=empire@example.invalid", "-c", "commit.gpgsign=false"])
-                .args(args).output().unwrap();
+            let out = git(args);
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         };
         run(&["init", "-b", "main"]);
@@ -458,8 +459,8 @@ mod anomaly_tests {
         run(&["checkout", "main"]);
         std::fs::write(dir.join("file with spaces.txt"), "world\n").unwrap();
         run(&["commit", "-am", "world"]);
-        let merge = Command::new("git").arg("-C").arg(&dir).args(["merge", "moon"]).output().unwrap();
-        assert!(!merge.status.success());
+        let merge = git(&["merge", "moon"]);
+        assert_eq!(merge.status.code(), Some(1), "merge must reach the conflict: {}", String::from_utf8_lossy(&merge.stderr));
         let path = dir.to_str().unwrap();
         let mut world = World::default();
         status(path, &mut world);

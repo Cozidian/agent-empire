@@ -1,0 +1,25 @@
+<p class="lead">The galaxy is a window into your sessions. The daemon keeps them alive.</p>
+<h2 id="what-keeps-running">What keeps running</h2>
+<p>Pressing <kbd>q</kbd> on the galaxy, or closing its window, leaves the daemon, agents and ordinary shell commands running. Reopening Empire reconnects to them.</p>
+<p>After a reboot or daemon crash, supported agents resume their recorded conversations. Ordinary shells reopen in their original project folders, but commands and development servers must be started again.</p>
+<aside class="note"><strong>Stopping is different from leaving.</strong> <code>empire stop</code> closes the daemon and every session, and clears the resume registry. Use it only when you intend to recall the whole fleet.</aside>
+<h2 id="update-empire">Update Empire</h2>
+<p>After updating the checkout, build the release binary:</p><pre><code>cargo build --release --locked</code></pre>
+<p>Close and reopen only the galaxy. It can hot-upgrade the daemon in place while keeping agent PTYs. A symlink to the release binary continues to use this checkout's new build.</p>
+<p>For an explicit daemon upgrade, run <code>empire upgrade</code>. If a build reports an upgrade problem, inspect the message and daemon log before taking a disruptive action. Do not use <code>empire stop</code> as a routine update step.</p>
+<h2 id="useful-commands">Useful commands</h2>
+<pre><code>empire status          # one-line fleet summary
+empire status --json   # Waybar-compatible JSON
+empire upgrade         # hot-upgrade the daemon
+empire sounds          # preview sound cues
+empire graphics        # offline graphics comparison
+empire research        # standalone Research Station</code></pre>
+<p>In the galaxy, lowercase <kbd>m</kbd> mutes alert cues and uppercase <kbd>M</kbd> mutes music. These controls are independent. Music stops when you leave the UI.</p>
+<h2 id="where-data-lives">Where data lives</h2>
+<table><thead><tr><th>Location</th><th>Contents</th></tr></thead><tbody><tr><td><code>$XDG_STATE_HOME/empire</code></td><td>Workspace settings, session registry, tasks, findings, screenshots, progress and history</td></tr><tr><td><code>$XDG_STATE_HOME/empire/research</code></td><td>Study snapshots, trial workspaces, reports, proposed patches and model traces</td></tr><tr><td><code>$XDG_DATA_HOME/empire/research</code></td><td>Optional research runtime and Python environment</td></tr></tbody></table>
+<p>The usual defaults are <code>~/.local/state</code> for state and <code>~/.local/share</code> for data. Agent CLIs also maintain their own histories outside Empire.</p>
+<h2 id="privacy-and-trust">Privacy and trust</h2>
+<p>Empire is a local controller for your Linux account. Both ends of a daemon connection check the peer's user ID. The socket uses mode <code>0600</code>; the daemon creates or tightens its state directory to <code>0700</code>. Logs, handoffs and registry writes are private to the user.</p>
+<p>Processes running as you are inside the trust boundary. Empire does not sandbox them or replace agent permissions. Do not expose its socket through a network proxy or share a Unix account with someone who should not control your fleet.</p>
+<p>Saved tasks, screenshots and model traces can contain confidential source or pasted credentials. Native CLIs contact their configured model providers. Review saved data before sharing it, including screenshots used in bug reports.</p>
+<p>See the repository's <a href="https://github.com/Cozidian/agent-empire/blob/main/SECURITY.md">security policy</a> for reporting a vulnerability.</p>
