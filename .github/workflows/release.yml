@@ -53,7 +53,7 @@ jobs:
           bash tools/install.sh --from-dir dist --bin-dir "$RUNNER_TEMP/empire-bin"
           "$RUNNER_TEMP/empire-bin/empire" --version
           python3 tools/test-install.py
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: empire-${{ matrix.arch }}
           path: dist/empire-*.tar.gz
