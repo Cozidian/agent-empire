@@ -83,13 +83,14 @@ def build(output):
         toc = ''.join(f'<a href="#{anchor}">{html.escape(title)}</a>' for anchor, title in doc.headings)
         previous = pages[index - 1] if index else None
         following = pages[index + 1] if index + 1 < len(pages) else None
-        pagination = ''.join(f'<a href="{item["slug"]}.html"><span>{label}</span>{html.escape(item["title"])}</a>' for label, item in [('Previous chapter', previous), ('Next chapter', following)] if item)
+        pagination = ''.join(f'<a href="{item["slug"]}.html" rel="{rel}"><span>{label}</span>{html.escape(item["title"])}</a>' for label, rel, item in [('Previous chapter', 'prev', previous), ('Next chapter', 'next', following)] if item)
         title = html.escape(page['title'])
         description = html.escape(page['description'])
         document = f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} · Agent Empire</title><meta name="description" content="{description}">
-<meta name="color-scheme" content="light"><meta name="theme-color" content="#0c1720">
+<meta name="color-scheme" content="light dark"><meta name="theme-color" content="#0c1720">
+<script>try{{const t=localStorage.getItem('empire-guide-theme');if(t==='dark'||t==='light')document.documentElement.dataset.theme=t}}catch(e){{}}</script>
 <link rel="stylesheet" href="assets/guide.css"><script src="assets/guide.js" defer></script></head>
 <body><a class="skip" href="#main">Skip to content</a>
 <aside class="sidebar" id="chapter-menu"><a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">✦</span><span>AGENT<br>EMPIRE</span></a>
@@ -99,7 +100,7 @@ def build(output):
 <button class="scrim" type="button" tabindex="-1" aria-label="Close chapter menu"></button>
 <div class="shell"><header class="topbar"><button class="menu-toggle" id="menu-toggle" type="button" aria-expanded="false" aria-controls="chapter-menu">☰ Menu</button>
 <div class="breadcrumb">USER GUIDE <span>/</span> {html.escape(page['group'])}</div>
-<div class="search-wrap" hidden><div class="search-box" role="search"><span aria-hidden="true">⌕</span><input id="guide-search" type="search" placeholder="Search the guide" aria-label="Search the user guide" aria-controls="search-results" autocomplete="off"><kbd aria-hidden="true">/</kbd></div><div class="search-results" id="search-results" aria-label="Matching chapters" hidden></div></div></header>
+<div class="tools"><div class="search-wrap" hidden><div class="search-box" role="search"><span aria-hidden="true">⌕</span><input id="guide-search" type="search" placeholder="Search the guide" aria-label="Search the user guide" aria-controls="search-results" autocomplete="off"><kbd aria-hidden="true">/</kbd></div><div class="search-results" id="search-results" aria-label="Matching chapters" hidden></div></div><button class="tool-button" id="theme-toggle" type="button" hidden>☾&#xFE0E;</button><button class="tool-button" id="shortcuts-button" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)" hidden>?</button></div></header>
 <div class="layout"><main class="article" id="main"><p class="eyebrow">{index:02} / {html.escape(page['group'])}</p><h1>{title}</h1>
 {content}
 <nav class="pagination" aria-label="Adjacent chapters">{pagination}</nav>
